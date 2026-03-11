@@ -61,13 +61,13 @@ pub enum ReservationLookupError {
 
 #[derive(Debug)]
 pub struct AllocDb {
-    config: Config,
-    resources: Vec<ResourceRecord>,
-    reservations: Vec<ReservationRecord>,
-    operations: Vec<OperationRecord>,
-    wheel: Vec<Vec<ReservationId>>,
-    last_applied_lsn: Option<Lsn>,
-    last_request_slot: Option<Slot>,
+    pub(crate) config: Config,
+    pub(crate) resources: Vec<ResourceRecord>,
+    pub(crate) reservations: Vec<ReservationRecord>,
+    pub(crate) operations: Vec<OperationRecord>,
+    pub(crate) wheel: Vec<Vec<ReservationId>>,
+    pub(crate) last_applied_lsn: Option<Lsn>,
+    pub(crate) last_request_slot: Option<Slot>,
 }
 
 impl AllocDb {
@@ -691,7 +691,7 @@ impl AllocDb {
         self.operations.insert(insertion_point, record);
     }
 
-    fn assert_invariants(&self) {
+    pub(crate) fn assert_invariants(&self) {
         for resource in &self.resources {
             match resource.current_state {
                 ResourceState::Available => assert!(resource.current_reservation_id.is_none()),

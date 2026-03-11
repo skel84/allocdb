@@ -32,9 +32,11 @@ Required properties:
 Current implementation anchor:
 
 - `crates/allocdb-core/src/wal.rs`
+- `crates/allocdb-core/src/wal_file.rs`
 
 The current code covers frame encoding, decoding, checksum validation, and in-memory recovery
-scanning up to the last valid frame boundary.
+scanning up to the last valid frame boundary, plus file-backed append, sync, recovery scan, and
+truncate-to-valid-prefix behavior for one WAL file.
 
 ## Snapshots
 
@@ -54,6 +56,13 @@ Write snapshots by:
 2. fsyncing the file
 3. renaming atomically
 4. fsyncing the directory if required by the platform
+
+Current implementation anchor:
+
+- `crates/allocdb-core/src/snapshot.rs`
+
+The current code covers snapshot encode, decode, allocator-state capture, and allocator restore
+from one decoded snapshot.
 
 ## Recovery
 

@@ -2,8 +2,10 @@ pub mod command;
 pub mod config;
 pub mod ids;
 pub mod result;
+pub mod snapshot;
 pub mod state_machine;
 pub mod wal;
+pub mod wal_file;
 
 pub use command::{ClientRequest, Command, CommandContext};
 pub use config::{Config, ConfigError};
