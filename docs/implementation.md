@@ -1,0 +1,97 @@
+# AllocDB Implementation Rules
+
+## Scope
+
+This document defines the Rust trusted-core implementation discipline for v1.
+
+## Memory Policy
+
+The trusted core should target allocation-free steady-state execution after startup.
+
+Current trusted-core boundary:
+
+- `crates/allocdb-core`
+
+Everything else should be treated as outside the trusted core unless explicitly promoted into it.
+
+Design target:
+
+- fixed-capacity resource storage
+- fixed-capacity reservation storage
+- fixed-capacity operation dedupe storage
+- fixed-capacity expiration index
+- reusable IO buffers
+
+Practical Rust rules:
+
+- allocate capacity at startup from configuration
+- if `Vec` is used, reserve once and assert that capacity never grows afterward
+- prefer indexes and handles over pointer-rich object graphs
+- avoid `HashMap` with randomized seeds in the trusted core
+- if hashing is needed, use a fixed-seed deterministic table with an explicit probe bound
+- avoid per-command heap allocation in the steady-state hot path
+
+Current implementation direction:
+
+- sorted fixed-capacity `Vec` stores for resources, reservations, and operations
+- preallocated timing-wheel buckets with explicit per-bucket capacity
+
+This keeps the first version deterministic and easy to inspect while honoring the boundedness
+rules.
+
+## Dependency Policy
+
+The trusted core should stay close to `std`.
+
+Allowed by default in the core:
+
+- `std`
+- small checksum or hash crates such as `crc32c` or `blake3`, if pinned and justified
+
+Not allowed in the core by default:
+
+- async runtimes
+- networking stacks
+- macro-heavy frameworks
+- generic serialization frameworks
+- hidden-allocation helper crates
+- ORM-style abstractions
+
+Rust-specific guidance:
+
+- the executor path should avoid `Arc<Mutex<_>>`, `Rc<RefCell<_>>`, and trait-object-heavy
+  indirection
+- use explicit-width integer newtypes for important IDs if it improves clarity
+- separate the trusted core crate from ingress, CLI, observability, and networking code
+
+## Assertion Policy
+
+The implementation is not credible without invariant-heavy assertions.
+
+Rules:
+
+- use `assert!` for impossible states, corrupted persisted data, broken invariants, and violated
+  internal contracts
+- use `debug_assert!` only for checks that are too expensive for production but still valuable
+- return deterministic result codes for expected operating conditions such as `resource_busy`
+- pair assertions across boundaries when possible, for example before WAL write and after WAL read
+- prefer compile-time assertions for type sizes, field offsets, and format constraints
+
+## Required Testing
+
+- state-machine unit tests for every transition
+- WAL replay equivalence tests
+- crash recovery tests with torn WAL tails
+- idempotency tests with duplicate `operation_id`
+- contention tests where many clients race on one resource
+- TTL tests where confirm, release, and expire interleave in different orders
+- property tests asserting "at most one active owner per resource"
+- capacity tests proving failure behavior at every configured bound
+
+## Follow-Up Docs
+
+The next useful detailed docs are:
+
+1. `api.md` for wire protocol and error codes
+2. `replication.md` only after the single-node semantics are fixed
+3. `roadmap.md` and `work-breakdown.md` for execution planning

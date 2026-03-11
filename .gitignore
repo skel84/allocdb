@@ -1,0 +1,30 @@
+# Rust build outputs
+/target/
+
+# Cargo / rustc temporary files
+**/*.rs.bk
+*.pdb
+
+# Coverage and profiling outputs
+*.profraw
+*.profdata
+/coverage/
+/tarpaulin-report.html
+
+# Test and benchmark artifacts
+/criterion/
+/flamegraph.svg
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Environment and local tooling
+.direnv/
+.env
+.env.*
+
+# Project-local agent and skill material
+/.rust-skills/
+/.codex/

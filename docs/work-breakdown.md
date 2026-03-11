@@ -1,0 +1,880 @@
+# AllocDB Work Breakdown
+
+## Status
+
+Draft. This document breaks the roadmap into concrete units of work sized for implementation and
+review.
+
+## Unit-of-Work Rules
+
+Each unit should:
+
+- produce one reviewable artifact
+- be small enough for roughly 1 to 3 days of focused work
+- have explicit dependencies
+- have acceptance criteria
+- end with concrete test evidence
+
+Tracking template:
+
+- `Goal`
+- `Inputs`
+- `Changes`
+- `Blocked By`
+- `Acceptance Criteria`
+- `Test Evidence`
+- `Non-Goals`
+
+## M0: Freeze v1 Semantics
+
+### UOW-000: Approve spike list and guardrails
+
+Goal:
+
+- decide which implementation uncertainties justify spikes and which do not
+
+Blocked by:
+
+- [spikes.md](./spikes.md)
+
+Acceptance criteria:
+
+- planned spikes are listed and time-boxed
+- semantics questions are explicitly excluded from spike scope
+
+Test evidence:
+
+- docs review only
+
+### UOW-001: Define result codes
+
+Goal:
+
+- finalize deterministic result and error codes for v1 commands
+
+Blocked by:
+
+- [semantics.md](./semantics.md)
+
+Acceptance criteria:
+
+- every command has success and failure outcomes documented
+- indefinite outcomes are distinguished from state-machine results
+
+Test evidence:
+
+- docs review only
+
+### UOW-002: Define config knobs and bounds
+
+Goal:
+
+- finalize the required configuration surface for bounds and retention
+
+Acceptance criteria:
+
+- `MAX_*` and slot-window knobs are listed in one place
+- no bound affecting correctness remains implicit
+
+Test evidence:
+
+- docs review only
+
+### UOW-003: Define trusted-core crate boundaries
+
+Goal:
+
+- specify which modules belong to the trusted core and which do not
+
+Acceptance criteria:
+
+- core, ingress, tooling, and observability boundaries are documented
+- dependency policy can be checked against module boundaries
+
+Test evidence:
+
+- docs review only
+
+## M1: Pure State Machine
+
+### SPIKE-101: Fixed-capacity table experiment
+
+Goal:
+
+- compare candidate implementations for resource, reservation, and operation storage
+
+Blocked by:
+
+- UOW-000
+- UOW-001
+- UOW-002
+
+Acceptance criteria:
+
+- at least two plausible table shapes are compared
+- the experiment ends with one chosen approach and a short rationale
+- spike code is either deleted or clearly marked as non-production
+
+Test evidence:
+
+- benchmark notes or focused experiment output
+
+### SPIKE-102: Timing-wheel experiment
+
+Goal:
+
+- validate bucket shape, overflow behavior, and retirement interaction for the expiration index
+
+Blocked by:
+
+- UOW-000
+- UOW-002
+
+Acceptance criteria:
+
+- overflow behavior is explicit
+- retirement and slot advancement are tested in the spike
+- one concrete timing-wheel shape is selected
+
+Test evidence:
+
+- focused experiment output
+
+### UOW-101: Implement ID newtypes and core records
+
+Goal:
+
+- add Rust types for resource, reservation, operation, LSN, and slot identifiers
+
+Blocked by:
+
+- UOW-001
+- UOW-002
+
+Acceptance criteria:
+
+- no persistent-format field uses implicit-width integer types
+- compile-time layout checks exist where useful
+
+Test evidence:
+
+- unit tests for parsing, construction, and size assertions
+
+### UOW-102: Implement fixed-capacity resource table
+
+Goal:
+
+- create the in-memory resource store with explicit capacity
+
+Blocked by:
+
+- UOW-101
+- SPIKE-101
+
+Acceptance criteria:
+
+- insert, lookup, and update semantics are deterministic
+- capacity exhaustion fails explicitly
+
+Test evidence:
+
+- unit tests and capacity-bound tests
+
+### UOW-103: Implement fixed-capacity reservation table
+
+Goal:
+
+- create the shared active-plus-terminal reservation store
+
+Blocked by:
+
+- UOW-101
+- UOW-002
+- SPIKE-101
+
+Acceptance criteria:
+
+- supports active and terminal reservation retention
+- retirement frees slots for reuse
+
+Test evidence:
+
+- unit tests for insert, retire, reuse
+
+### UOW-104: Implement fixed-capacity operation table
+
+Goal:
+
+- add bounded idempotency storage keyed by `operation_id`
+
+Blocked by:
+
+- UOW-101
+- SPIKE-101
+
+Acceptance criteria:
+
+- duplicate same-payload lookup returns the original result
+- mismatched payload returns `operation_conflict`
+
+Test evidence:
+
+- unit tests for duplicates and conflict cases
+
+### UOW-105: Implement timing-wheel expiration index
+
+Goal:
+
+- create the fixed-capacity expiration structure keyed by `deadline_slot`
+
+Blocked by:
+
+- UOW-101
+- UOW-103
+- SPIKE-102
+
+Acceptance criteria:
+
+- bounded bucket behavior is explicit
+- overflow returns `expiration_index_full`
+
+Test evidence:
+
+- unit tests for scheduling, draining, and overflow
+
+### UOW-106: Implement `create_resource`
+
+Goal:
+
+- add the pure apply logic for resource creation
+
+Blocked by:
+
+- UOW-102
+- UOW-104
+
+Acceptance criteria:
+
+- deterministic success and `already_exists` behavior
+
+Test evidence:
+
+- state-machine unit tests
+
+### UOW-107: Implement `reserve`
+
+Goal:
+
+- add the pure apply logic for reservation creation
+
+Blocked by:
+
+- UOW-102
+- UOW-103
+- UOW-104
+- UOW-105
+
+Acceptance criteria:
+
+- only one active reservation may exist for a resource
+- deadline and reservation ID derivation are deterministic
+
+Test evidence:
+
+- state-machine tests and contention property tests
+
+### UOW-108: Implement `confirm`
+
+Goal:
+
+- add confirm transition logic
+
+Blocked by:
+
+- UOW-103
+- UOW-107
+
+Acceptance criteria:
+
+- `holder_id` is checked
+- invalid-state and retired-reservation behavior are explicit
+
+Test evidence:
+
+- transition tests and negative-path tests
+
+### UOW-109: Implement `release`
+
+Goal:
+
+- add release transition logic
+
+Blocked by:
+
+- UOW-103
+- UOW-107
+
+Acceptance criteria:
+
+- resource returns to `available`
+- terminal-state retention fields are set correctly
+
+Test evidence:
+
+- transition tests and negative-path tests
+
+### UOW-110: Implement `expire`
+
+Goal:
+
+- add internal expiration command logic
+
+Blocked by:
+
+- UOW-103
+- UOW-105
+- UOW-107
+
+Acceptance criteria:
+
+- no-op behavior is deterministic for raced cases
+- no early reuse is possible
+
+Test evidence:
+
+- interleaving tests with confirm and release
+
+### UOW-111: Add invariant assertion layer
+
+Goal:
+
+- centralize internal checks for table consistency and state agreement
+
+Blocked by:
+
+- UOW-102 through UOW-110
+
+Acceptance criteria:
+
+- resource and reservation state agreement is asserted
+- corruption paths fail closed
+
+Test evidence:
+
+- invariant tests and negative injected-state tests
+
+## M2: Durability and Recovery
+
+### SPIKE-201: WAL framing and torn-tail experiment
+
+Goal:
+
+- validate the binary framing shape and recovery boundary logic before committing to the real codec
+
+Blocked by:
+
+- UOW-000
+- UOW-101
+
+Acceptance criteria:
+
+- corrupted-frame and torn-tail cases are exercised
+- one framing shape is selected and documented
+
+Test evidence:
+
+- focused experiment output
+
+### UOW-201: Define WAL frame codec
+
+Goal:
+
+- implement binary WAL frame encode and decode with checksum verification
+
+Blocked by:
+
+- UOW-101
+- SPIKE-201
+
+Acceptance criteria:
+
+- framing is explicit and versioned
+- invalid checksum is detected
+
+Test evidence:
+
+- codec unit tests with corrupted frames
+
+### UOW-202: Implement append-only WAL writer
+
+Goal:
+
+- append validated frames to segmented WAL files
+
+Blocked by:
+
+- UOW-201
+
+Acceptance criteria:
+
+- write path honors `MAX_COMMAND_BYTES`
+- fsync failures are surfaced explicitly
+
+Test evidence:
+
+- file-backed tests with induced write failures
+
+### UOW-203: Implement recovery scanner
+
+Goal:
+
+- scan WAL segments and stop at the last valid boundary
+
+Blocked by:
+
+- UOW-201
+- UOW-202
+
+Acceptance criteria:
+
+- torn tails are truncated
+- invalid frames do not leak into replay
+
+Test evidence:
+
+- torn-tail recovery tests
+
+### UOW-204: Define snapshot format
+
+Goal:
+
+- define a snapshot representation for core tables and indexes
+
+Blocked by:
+
+- UOW-102 through UOW-105
+
+Acceptance criteria:
+
+- snapshot contains exactly the state required for replayable recovery
+- no implicit-layout serializer is used
+
+Test evidence:
+
+- round-trip snapshot tests
+
+### UOW-205: Implement snapshot writer and loader
+
+Goal:
+
+- persist and load snapshots safely
+
+Blocked by:
+
+- UOW-204
+
+Acceptance criteria:
+
+- temp-file, fsync, rename flow is implemented
+- corrupted snapshot is rejected
+
+Test evidence:
+
+- crash and corruption tests around snapshot load
+
+### UOW-206: Implement replay using the live apply path
+
+Goal:
+
+- recover allocator state by replaying WAL into the real state machine
+
+Blocked by:
+
+- UOW-202
+- UOW-203
+- UOW-205
+- UOW-111
+
+Acceptance criteria:
+
+- replay shares the same apply logic as live execution
+- live and recovered states match exactly
+
+Test evidence:
+
+- replay-equivalence tests
+
+## M3: Submission Pipeline
+
+### UOW-301: Implement command envelope validation
+
+Goal:
+
+- validate command envelope and payload before sequencing
+
+Blocked by:
+
+- UOW-001
+- UOW-206
+
+Acceptance criteria:
+
+- malformed commands fail before commit
+- validation does not mutate state
+
+Test evidence:
+
+- request validation tests
+
+### UOW-302: Implement bounded submission queue
+
+Goal:
+
+- add the ingress queue with explicit overflow behavior
+
+Blocked by:
+
+- UOW-002
+
+Acceptance criteria:
+
+- overflow returns deterministic overload behavior
+- queue growth is bounded
+
+Test evidence:
+
+- overload and backpressure tests
+
+### UOW-303: Implement sequencer
+
+Goal:
+
+- assign LSN and `request_slot` deterministically
+
+Blocked by:
+
+- UOW-202
+- UOW-301
+- UOW-302
+
+Acceptance criteria:
+
+- sequencing order is explicit
+- request-slot assignment is visible in WAL frames
+
+Test evidence:
+
+- sequencing tests
+
+### UOW-304: Implement result publication and retry lookup
+
+Goal:
+
+- publish command results and resolve duplicate `operation_id` lookups
+
+Blocked by:
+
+- UOW-104
+- UOW-303
+
+Acceptance criteria:
+
+- same `operation_id` returns original result
+- mismatch returns `operation_conflict`
+
+Test evidence:
+
+- duplicate and conflict-path tests
+
+### UOW-305: Implement strict-read fence
+
+Goal:
+
+- serve strict reads only after required LSN has been applied
+
+Blocked by:
+
+- UOW-206
+- UOW-303
+
+Acceptance criteria:
+
+- strict reads are tied to `applied_lsn`
+
+Test evidence:
+
+- read-fence tests
+
+### UOW-306: Implement indefinite-outcome retry behavior
+
+Goal:
+
+- document and test retry with the same `operation_id` after timeout or reply loss
+
+Blocked by:
+
+- UOW-304
+
+Acceptance criteria:
+
+- no duplicate execution occurs for the same `operation_id`
+- ambiguity is resolved within retention only
+
+Test evidence:
+
+- retry and retention-expiry tests
+
+## M4: Deterministic Simulation
+
+### SPIKE-401: Simulation harness experiment
+
+Goal:
+
+- prove the trusted core can run under a seeded simulated driver without forking semantics
+
+Blocked by:
+
+- UOW-000
+- UOW-303
+
+Acceptance criteria:
+
+- real state-machine code runs under simulated slot advancement
+- at least one crash/restart scenario is exercised by the spike
+- one simulator shape is selected
+
+Test evidence:
+
+- focused experiment output
+
+### UOW-401: Build simulated slot driver
+
+Goal:
+
+- run the core against a deterministic simulated clock
+
+Blocked by:
+
+- UOW-303
+- SPIKE-401
+
+Acceptance criteria:
+
+- slot advancement is deterministic and seedable
+
+Test evidence:
+
+- simulator tests with reproducible seeds
+
+### UOW-402: Inject crash points
+
+Goal:
+
+- allow seeded crashes around WAL, apply, and recovery boundaries
+
+Blocked by:
+
+- UOW-206
+- UOW-401
+
+Acceptance criteria:
+
+- crash points are reproducible
+- recovery resumes with correct replay behavior
+
+Test evidence:
+
+- crash-seed regression tests
+
+### UOW-403: Inject storage faults
+
+Goal:
+
+- simulate torn writes, checksum mismatch, and fsync failures
+
+Blocked by:
+
+- UOW-203
+- UOW-205
+- UOW-401
+
+Acceptance criteria:
+
+- fail-closed storage behavior is exercised in simulation
+
+Test evidence:
+
+- storage fault-injection tests
+
+### UOW-404: Add seeded schedule exploration
+
+Goal:
+
+- vary ingress order, expiration order, and retry timing under a reproducible seed
+
+Blocked by:
+
+- UOW-401
+
+Acceptance criteria:
+
+- failures can be reproduced from seed
+
+Test evidence:
+
+- schedule-seed regression cases
+
+## M5: Single-Node Alpha
+
+### UOW-501: Add minimal API surface
+
+Goal:
+
+- expose the single-node allocator through a stable alpha API
+
+Blocked by:
+
+- UOW-306
+
+Acceptance criteria:
+
+- API matches documented command semantics
+- indefinite-outcome behavior is documented for clients
+
+Test evidence:
+
+- API integration tests
+
+### UOW-502: Add metrics and health signals
+
+Goal:
+
+- expose core operational signals for lag, overload, and recovery
+
+Blocked by:
+
+- UOW-302
+- UOW-403
+
+Acceptance criteria:
+
+- queue pressure, expiration lag, and recovery status are visible
+
+Test evidence:
+
+- metrics integration tests
+
+### UOW-503: Add benchmark harness
+
+Goal:
+
+- measure hot-spot contention and boundedness behavior
+
+Blocked by:
+
+- UOW-501
+
+Acceptance criteria:
+
+- benchmark scenarios include one-resource-many-contenders and high retry pressure
+
+Test evidence:
+
+- documented benchmark runs
+
+### UOW-504: Write operator runbook
+
+Goal:
+
+- document startup, recovery, overload, and corruption-handling behavior
+
+Blocked by:
+
+- UOW-502
+
+Acceptance criteria:
+
+- runbook matches actual system behavior
+
+Test evidence:
+
+- docs review only
+
+## M6: Replication Design Gate
+
+### UOW-601: Expand replication protocol notes
+
+Goal:
+
+- turn [replication.md](./replication.md) into a real protocol-design draft
+
+Blocked by:
+
+- M1 through M5 exit criteria
+
+Acceptance criteria:
+
+- protocol family and invariants are explicit
+- replication does not rewrite single-node semantics
+
+Test evidence:
+
+- design review only
+
+### UOW-602: Define replicated simulation plan
+
+Goal:
+
+- specify how deterministic simulation extends to replicated execution
+
+Blocked by:
+
+- UOW-601
+
+Acceptance criteria:
+
+- partitions, leader crash, and rejoin are part of the simulation plan
+
+Test evidence:
+
+- design review only
+
+### UOW-603: Define Jepsen validation plan
+
+Goal:
+
+- specify the Jepsen workloads and properties required before any replicated release
+
+Blocked by:
+
+- UOW-601
+
+Acceptance criteria:
+
+- covers client ambiguity, failover, recovery, and linearizable behavior
+
+Test evidence:
+
+- design review only
+
+## Suggested First Slice
+
+If implementation starts immediately, the highest-value first slice is:
+
+1. UOW-000
+2. UOW-001
+3. UOW-002
+4. UOW-101
+5. SPIKE-101
+6. SPIKE-102
+7. UOW-102
+8. UOW-103
+9. UOW-104
+10. UOW-105
+11. UOW-107
+12. UOW-108
+13. UOW-109
+14. UOW-110
+15. UOW-111
+
+That sequence yields the pure allocator core before any durability or API work.

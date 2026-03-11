@@ -1,0 +1,93 @@
+use crate::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandContext {
+    pub lsn: Lsn,
+    pub request_slot: Slot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientRequest {
+    pub operation_id: OperationId,
+    pub client_id: ClientId,
+    pub command: Command,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Command {
+    CreateResource {
+        resource_id: ResourceId,
+    },
+    Reserve {
+        resource_id: ResourceId,
+        holder_id: HolderId,
+        ttl_slots: u64,
+    },
+    Confirm {
+        reservation_id: ReservationId,
+        holder_id: HolderId,
+    },
+    Release {
+        reservation_id: ReservationId,
+        holder_id: HolderId,
+    },
+    Expire {
+        reservation_id: ReservationId,
+        deadline_slot: Slot,
+    },
+}
+
+impl Command {
+    #[must_use]
+    pub fn fingerprint(self) -> u128 {
+        let mut state = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58du128;
+
+        match self {
+            Self::CreateResource { resource_id } => {
+                state = mix(state, 1);
+                mix(state, resource_id.get())
+            }
+            Self::Reserve {
+                resource_id,
+                holder_id,
+                ttl_slots,
+            } => {
+                state = mix(state, 2);
+                state = mix(state, resource_id.get());
+                state = mix(state, holder_id.get());
+                mix(state, u128::from(ttl_slots))
+            }
+            Self::Confirm {
+                reservation_id,
+                holder_id,
+            } => {
+                state = mix(state, 3);
+                state = mix(state, reservation_id.get());
+                mix(state, holder_id.get())
+            }
+            Self::Release {
+                reservation_id,
+                holder_id,
+            } => {
+                state = mix(state, 4);
+                state = mix(state, reservation_id.get());
+                mix(state, holder_id.get())
+            }
+            Self::Expire {
+                reservation_id,
+                deadline_slot,
+            } => {
+                state = mix(state, 5);
+                state = mix(state, reservation_id.get());
+                mix(state, u128::from(deadline_slot.get()))
+            }
+        }
+    }
+}
+
+fn mix(state: u128, value: u128) -> u128 {
+    let mixed = state ^ value.wrapping_add(0x9e37_79b9_7f4a_7c15_6eed_0e9d_a4d9_4a4fu128);
+    mixed
+        .rotate_left(29)
+        .wrapping_mul(0x94d0_49bb_1331_11ebu128)
+}
