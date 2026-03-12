@@ -13,7 +13,7 @@ use allocdb_core::wal::RecordType;
 use allocdb_core::wal_file::{WalFile, WalFileError};
 use allocdb_core::{ReservationState, ResourceState};
 
-use super::PersistFailurePhase;
+use super::{CrashPlan, CrashPoint, PersistFailurePhase};
 use crate::engine::{
     EngineConfig, EngineConfigError, EnqueueResult, ReadError, RecoveryStartupKind,
     SingleNodeEngine, SubmissionError, SubmissionErrorCategory,
@@ -869,6 +869,14 @@ fn submission_errors_have_explicit_indefinite_category() {
     );
     assert_eq!(
         SubmissionError::WalFile(WalFileError::Io(std::io::Error::other("boom"))).category(),
+        SubmissionErrorCategory::Indefinite
+    );
+    assert_eq!(
+        SubmissionError::CrashInjected(CrashPlan {
+            seed: 7,
+            point: CrashPoint::ClientAfterWalSync,
+        })
+        .category(),
         SubmissionErrorCategory::Indefinite
     );
     assert_eq!(

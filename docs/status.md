@@ -24,10 +24,10 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: operator-facing runbook for the single-node alpha, including startup
-    mode classification, fail-closed recovery handling, overload/backpressure guidance, expiration
-    maintenance expectations, and validation commands aligned with current engine and recovery
-    behavior
+  - current validated chunk: explicit seeded crash-point injection across submit, checkpoint, and
+    recovery boundaries, restart coverage for post-sync submit replay, snapshot-written before WAL
+    rewrite, and replay-interrupted recovery, plus operator-facing runbook guidance aligned with
+    current startup, recovery, overload, and expiration-maintenance behavior
 
 ## What Exists
 
@@ -86,21 +86,27 @@
   - explicit simulated slot advancement under test control, with no wall-clock reads in the
     exercised engine path
   - seeded same-slot ready-set scheduling with reproducible transcripts
+  - seeded one-shot crash plans over named client-submit, internal-apply, checkpoint, and
+    recovery boundaries
   - checkpoint, restart, and injected persist-failure helpers over the real `SingleNodeEngine`
+  - regression coverage for crash-selected post-sync submit replay, crash-after-snapshot-write
+    checkpoint recovery, and replay-interrupted recovery restart
 - Validation:
   - `cargo test -p allocdb-core snapshot -- --nocapture`
   - `cargo test -p allocdb-core recovery -- --nocapture`
   - `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
   - `cargo test -p allocdb-node api_reservation_reports_retired_history`
+  - `cargo test -p allocdb-node engine -- --nocapture`
+  - `cargo test -p allocdb-node simulation -- --nocapture`
   - `cargo run -p allocdb-bench -- --scenario all`
   - `scripts/preflight.sh`
 
 ## Current Focus
 
-- `M4-T02`: inject reproducible crash points around WAL, apply, snapshot, and recovery boundaries
-  on top of the promoted simulation harness
-- follow with `M4-T03` storage-fault coverage using the same deterministic driver
+- `M4-T03`: extend the same seeded simulation driver with storage-fault coverage for torn writes,
+  checksum mismatch, and sync failures
 - keep the operator runbook aligned as new simulation and storage-fault evidence lands
+- keep `M4-T02` regression coverage green while broadening the fault matrix
 
 ## How To Check Progress
 

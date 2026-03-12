@@ -154,7 +154,12 @@ impl SubmissionFailure {
                 queue_depth,
                 queue_capacity,
             },
-            SubmissionError::WalFile(_) => SubmissionFailureCode::StorageFailure,
+            // Crash-injected commit ambiguity intentionally stays on the same indefinite
+            // storage-failure wire path as real WAL faults so clients preserve retry-after-restart
+            // behavior.
+            SubmissionError::WalFile(_) | SubmissionError::CrashInjected(_) => {
+                SubmissionFailureCode::StorageFailure
+            }
         };
 
         Self { category, code }

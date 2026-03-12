@@ -16,8 +16,8 @@ use super::{
     encode_request, encode_response,
 };
 use crate::engine::{
-    EngineConfig, PersistFailurePhase, RecoveryStartupKind, SingleNodeEngine,
-    SubmissionErrorCategory,
+    CrashPlan, CrashPoint, EngineConfig, PersistFailurePhase, RecoveryStartupKind,
+    SingleNodeEngine, SubmissionErrorCategory,
 };
 
 fn test_path(name: &str) -> PathBuf {
@@ -540,6 +540,31 @@ fn api_reads_reject_when_engine_is_halted() {
 
     drop(recovered);
     let _ = fs::remove_file(&snapshot_path);
+    fs::remove_file(&wal_path).unwrap();
+}
+
+#[test]
+fn api_submit_maps_crash_injected_commit_to_indefinite_storage_failure_wire_value() {
+    let wal_path = test_path("crash-injected-wire");
+    let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+    engine.arm_next_crash(CrashPlan {
+        seed: 7,
+        point: CrashPoint::ClientAfterWalSync,
+    });
+
+    let response = engine.handle_api_request(ApiRequest::Submit(
+        SubmitRequest::from_client_request(Slot(1), create_request(11, 1)),
+    ));
+
+    assert_eq!(
+        response,
+        ApiResponse::Submit(SubmitResponse::Rejected(super::SubmissionFailure {
+            category: SubmissionErrorCategory::Indefinite,
+            code: SubmissionFailureCode::StorageFailure,
+        }))
+    );
+    assert_eq!(encode_response(&response), vec![2, 2, 5]);
+
     fs::remove_file(&wal_path).unwrap();
 }
 
