@@ -94,6 +94,19 @@ Until the repository has more human reviewers, self-merge is acceptable only aft
 
 When the team grows, switch to at least one human approval before merge.
 
+## Repository Guardrails
+
+The GitHub repository is configured so that `main`:
+
+- requires pull requests before merge
+- requires the `checks` CI job and uses strict status checks
+- requires resolved review conversations
+- requires linear history
+- disallows force pushes and branch deletion
+
+CodeRabbit still needs to be verified on the first real PR and should stay part of the review path
+once confirmed.
+
 ## Labels And Milestones
 
 Recommended milestone shape:
