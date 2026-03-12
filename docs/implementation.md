@@ -38,11 +38,17 @@ Current implementation:
 - bounded retirement queues so reservation and operation retirement drains expired fronts instead
   of scanning whole tables
 
-The next hardening steps before alpha are:
+Current observability surface:
 
-- decide whether version-guarded `conditional_confirm` belongs in v1
+- keep `confirm` keyed by `reservation_id`; defer any version-guarded confirm API until the
+  product needs read-version preconditions beyond reservation identity
 - classify torn EOF tails separately from durable-log corruption in every recovery path
-- expose logical slot lag and expiration backlog as first-class metrics outside the trusted core
+- expose logical slot lag and expiration backlog through a bounded health snapshot
+
+Next hardening steps before alpha are:
+
+- add queue-pressure metrics once the bounded submission path exists
+- surface recovery status alongside the current lag and backlog signals
 
 ## Dependency Policy
 

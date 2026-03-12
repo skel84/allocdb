@@ -6,7 +6,7 @@
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
   - `M1` pure state machine: implemented
-  - `M1H` constant-time core hardening: in progress
+  - `M1H` constant-time core hardening: complete
   - `M2` durability primitives: partially implemented
   - `M3+` submission pipeline, simulation, alpha hardening, replication design: not started
 - Latest completed implementation chunks:
@@ -15,7 +15,8 @@
   - `d87c9a7` `Add repo guardrails and status tracking`
   - `79ae34f` `Add snapshot persistence and replay recovery`
   - `1583d67` `Use fixed-capacity maps in allocator core`
-  - current validated chunk: fail-closed WAL corruption classification and recovery diagnostics
+  - `3d6ff0f` `Fail closed on WAL corruption`
+  - current validated chunk: `conditional_confirm` deferred by design, plus core health metrics
 
 ## What Exists
 
@@ -25,6 +26,7 @@
   - bounded reservation and operation retirement queues
   - bounded timing-wheel expiration index
   - `create_resource`, `reserve`, `confirm`, `release`, `expire`
+  - bounded health snapshot with logical slot lag and expiration backlog
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -40,10 +42,9 @@
 
 ## Current Focus
 
-- decide whether version-guarded `conditional_confirm` belongs in v1 or is deferred
-- define `logical_slot_lag` and expiration backlog as first-class operational signals
 - tighten WAL/snapshot checkpoint coordination on top of the current recovery path
-- start the bounded submission pipeline once `M1H` closes
+- start the bounded submission pipeline
+- expose queue pressure and recovery status once the submission path exists
 
 ## How To Check Progress
 

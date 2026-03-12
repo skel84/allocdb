@@ -30,6 +30,9 @@ current_reservation_id   : u128 | 0
 version                  : u64
 ```
 
+`version` increments on every resource state transition. In v1 it is a read-side observation field,
+not a write precondition.
+
 ### Reservation
 
 A reservation is a historical claim on one resource by one holder.
@@ -227,6 +230,17 @@ Failure cases:
 - `invalid_state`
 - `holder_mismatch`
 
+v1 intentionally does not add `conditional_confirm(expected_version)`.
+
+Rationale:
+
+- `reservation_id` is derived from committed log position and is never reused
+- stale confirms on an old reservation cannot mutate a newer reservation for the same resource
+- the stale client sees `invalid_state`, `reservation_not_found`, or `reservation_retired` instead
+
+If the product later needs read-modify-write protection keyed to a resource read version, that can
+be added as a separate command without changing the single-node v1 safety model.
+
 ### Release
 
 ```text
@@ -345,6 +359,8 @@ without pretending that transport failures do not exist.
 The following rules are fixed for v1:
 
 1. `confirm` and `release` require `holder_id`.
-2. Reservation lookup history is bounded and returns `reservation_retired` after retirement.
-3. Resource metadata is excluded from the trusted core.
-4. Indefinite write outcomes are resolved by client retry with the same `operation_id`.
+2. `confirm` remains keyed by `reservation_id`, not `resource.version`.
+3. The resource `version` field is observable but is not a v1 write guard.
+4. Reservation lookup history is bounded and returns `reservation_retired` after retirement.
+5. Resource metadata is excluded from the trusted core.
+6. Indefinite write outcomes are resolved by client retry with the same `operation_id`.

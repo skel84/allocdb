@@ -11,11 +11,17 @@ use crate::retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
 mod apply;
 #[path = "state_machine_execution.rs"]
 mod execution;
+#[path = "state_machine_metrics.rs"]
+mod metrics;
+#[cfg(test)]
+#[path = "state_machine_observe_tests.rs"]
+mod observe_tests;
 #[path = "state_machine_retire.rs"]
 mod retire;
 #[cfg(test)]
 #[path = "state_machine_tests.rs"]
 mod tests;
+pub use metrics::HealthMetrics;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceState {
@@ -131,61 +137,6 @@ impl AllocDb {
         })
     }
 
-    #[must_use]
-    pub fn config(&self) -> &Config {
-        &self.config
-    }
-
-    #[must_use]
-    pub fn resource(&self, resource_id: ResourceId) -> Option<ResourceRecord> {
-        self.resources.get(resource_id).copied()
-    }
-
-    /// Looks up one reservation while respecting the bounded reservation-history window.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReservationLookupError::NotFound`] if the reservation does not exist and
-    /// [`ReservationLookupError::Retired`] if it has aged out of the configured history window.
-    pub fn reservation(
-        &self,
-        reservation_id: ReservationId,
-        current_slot: Slot,
-    ) -> Result<ReservationRecord, ReservationLookupError> {
-        let Some(record) = self.reservations.get(reservation_id).copied() else {
-            return Err(ReservationLookupError::NotFound);
-        };
-
-        if Self::reservation_is_retired(record, current_slot) {
-            return Err(ReservationLookupError::Retired);
-        }
-
-        Ok(record)
-    }
-
-    /// Returns the stored outcome for an operation while it remains inside the dedupe window.
-    #[must_use]
-    pub fn operation(
-        &self,
-        operation_id: OperationId,
-        current_slot: Slot,
-    ) -> Option<OperationRecord> {
-        self.operations.get(operation_id).and_then(|record| {
-            if current_slot.get() > record.retire_after_slot.get() {
-                None
-            } else {
-                Some(*record)
-            }
-        })
-    }
-
-    /// Returns the reservations scheduled to expire at the provided logical slot.
-    #[must_use]
-    pub fn due_reservations(&self, slot: Slot) -> &[ReservationId] {
-        let bucket_index = self.wheel_bucket_index(slot);
-        &self.wheel[bucket_index]
-    }
-
     fn apply_command(&mut self, context: CommandContext, command: Command) -> CommandOutcome {
         match command {
             Command::CreateResource { resource_id } => self.apply_create_resource(resource_id),
@@ -212,10 +163,6 @@ impl AllocDb {
     fn retire_state(&mut self, current_slot: Slot) {
         self.retire_reservations(current_slot);
         self.retire_operations(current_slot);
-    }
-
-    fn reservation_is_retired(record: ReservationRecord, current_slot: Slot) -> bool {
-        matches!(record.retire_after_slot, Some(slot) if current_slot.get() > slot.get())
     }
 
     fn reservation_id_from_lsn(&self, lsn: Lsn) -> ReservationId {

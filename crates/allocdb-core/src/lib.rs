@@ -17,6 +17,6 @@ pub use config::{Config, ConfigError};
 pub use ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 pub use result::{CommandOutcome, ResultCode};
 pub use state_machine::{
-    AllocDb, OperationRecord, ReservationLookupError, ReservationRecord, ReservationState,
-    ResourceRecord, ResourceState,
+    AllocDb, HealthMetrics, OperationRecord, ReservationLookupError, ReservationRecord,
+    ReservationState, ResourceRecord, ResourceState,
 };

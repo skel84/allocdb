@@ -148,6 +148,10 @@ Required operational signals:
 - `logical_slot_lag = max(0, current_wall_clock_slot - last_request_slot)`
 - expiration backlog, for example the number of due expirations not yet applied
 
+Current implementation anchor:
+
+- `AllocDb::health_metrics(current_wall_clock_slot)` in `crates/allocdb-core/src/state_machine_metrics.rs`
+
 Delayed expiration is acceptable. Premature reuse is not.
 
 ## Expiration Index
