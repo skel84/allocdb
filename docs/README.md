@@ -19,6 +19,7 @@
 - [Fault Model](./fault-model.md)
 - [Replication Notes](./replication.md)
 - [Roadmap](./roadmap.md)
+- [Current Status](./status.md)
 - [Work Breakdown](./work-breakdown.md)
 - [Spikes](./spikes.md)
 - [Storage and Recovery](./storage.md)

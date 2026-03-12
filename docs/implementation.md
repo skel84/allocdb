@@ -88,6 +88,23 @@ Rules:
 - property tests asserting "at most one active owner per resource"
 - capacity tests proving failure behavior at every configured bound
 
+## Repository Guardrails
+
+The repository should enforce basic layout discipline automatically.
+
+Required guardrails:
+
+- `scripts/check_repo.sh` must pass before a chunk is considered complete
+- trusted-core Rust source files stay small enough to review in one pass
+- the core crate dependency set stays explicitly allow-listed
+- the core must not grow async runtimes, generic serializers, randomizing maps, or shared mutable
+  ownership primitives without a documented design change
+
+Current guardrail targets:
+
+- `crates/allocdb-core/src/**/*.rs`
+- [`docs/status.md`](./status.md) as the single-file progress snapshot
+
 ## Follow-Up Docs
 
 The next useful detailed docs are:

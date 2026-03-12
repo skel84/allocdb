@@ -1,0 +1,53 @@
+# AllocDB Status
+
+## Current State
+
+- Phase: single-node v1 foundation
+- Current milestone status:
+  - `M0` semantics freeze: complete enough for core work
+  - `M1` pure state machine: implemented
+  - `M2` durability primitives: partially implemented
+  - `M3+` submission pipeline, simulation, alpha hardening, replication design: not started
+- Latest completed implementation chunks:
+  - `4156a80` `Bootstrap AllocDB core and docs`
+  - `f84a641` `Add WAL file and snapshot recovery primitives`
+  - current chunk: status tracking, repo guardrails, and trusted-core module split
+
+## What Exists
+
+- Trusted-core crate: `crates/allocdb-core`
+- In-memory deterministic allocator:
+  - fixed-capacity resource, reservation, and operation stores
+  - bounded timing-wheel expiration index
+  - `create_resource`, `reserve`, `confirm`, `release`, `expire`
+- Durability primitives:
+  - WAL frame codec and recovery scan
+  - file-backed WAL append, sync, recovery, truncate-to-valid-prefix
+  - snapshot encode, decode, capture, restore
+- Validation:
+  - `cargo fmt --all`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+  - `cargo test`
+  - `scripts/check_repo.sh`
+
+## Current Focus
+
+- keep the trusted core split into reviewable modules
+- enforce architecture and size guardrails automatically
+- continue M2 with snapshot file IO or move into M3 submission/idempotent ingress
+
+## How To Check Progress
+
+- implementation status: [work-breakdown.md](./work-breakdown.md)
+- milestone sequencing: [roadmap.md](./roadmap.md)
+- current snapshot: this file
+- reviewable history: `git log --oneline`
+
+## Update Rule
+
+Update this file whenever a unit of work materially changes:
+
+- milestone completion state
+- implementation coverage
+- recommended next step
+- required validation commands

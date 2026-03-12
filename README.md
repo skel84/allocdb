@@ -17,3 +17,4 @@ AllocDB is a deterministic resource-allocation database focused on correctness u
 
 - [docs/roadmap.md](./docs/roadmap.md)
 - [docs/work-breakdown.md](./docs/work-breakdown.md)
+- [docs/status.md](./docs/status.md)

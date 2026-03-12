@@ -27,6 +27,9 @@ Project-specific design and engineering rules live in:
 - Keep documentation up to date with the code and design. If a change affects behavior, invariants,
   failure modes, operational semantics, testing strategy, or implementation sequencing, update the
   relevant docs in the same unit of work.
+- Keep [`docs/status.md`](./docs/status.md) current as the single-file progress snapshot for the
+  repository. Update it whenever milestone state, implementation coverage, or the recommended next
+  step materially changes.
 - Prefer fixing stale docs immediately over leaving follow-up documentation debt.
 - Add extensive logging where it materially improves debuggability or operational clarity. Use the
   right log level:
