@@ -5,7 +5,7 @@ use allocdb_core::snapshot_file::{SnapshotFile, SnapshotFileError};
 use allocdb_core::wal::{Frame, RecordType, ScanStopReason};
 use allocdb_core::wal_file::{RecoveredWal, WalFileError};
 
-use crate::engine::SingleNodeEngine;
+use crate::engine::{CrashPlan, CrashPoint, SingleNodeEngine};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckpointResult {
@@ -27,6 +27,7 @@ pub enum CheckpointError {
         wal_last_lsn: Option<Lsn>,
         snapshot_lsn: Option<Lsn>,
     },
+    CrashInjected(CrashPlan),
 }
 
 impl From<SnapshotFileError> for CheckpointError {
@@ -89,6 +90,9 @@ impl SingleNodeEngine {
         let previous_snapshot_lsn = self.active_snapshot_lsn;
         let snapshot_file = SnapshotFile::new(snapshot_path);
         snapshot_file.write_snapshot(&snapshot)?;
+        if let Some(plan) = self.maybe_inject_crash(CrashPoint::CheckpointAfterSnapshotWrite) {
+            return Err(CheckpointError::CrashInjected(plan));
+        }
 
         let retained_frames = retained_frames(
             &recovered_wal,
@@ -100,6 +104,9 @@ impl SingleNodeEngine {
             self.accepting_writes = false;
             self.active_snapshot_lsn = snapshot.last_applied_lsn;
             return Err(CheckpointError::WalFile(error));
+        }
+        if let Some(plan) = self.maybe_inject_crash(CrashPoint::CheckpointAfterWalRewrite) {
+            return Err(CheckpointError::CrashInjected(plan));
         }
         self.active_snapshot_lsn = snapshot.last_applied_lsn;
 

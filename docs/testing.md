@@ -97,21 +97,28 @@ The promoted `M4-T01` harness now lives in `crates/allocdb-node/src/simulation.r
 regression coverage in `crates/allocdb-node/src/simulation_tests.rs`. The current evidence shows:
 
 - the same seed reproduces the same same-slot action order and LSN transcript
+- the same seed plus enabled crash-point set reproduces the same one-shot crash selection,
+  independent of slice order
 - advancing the simulated slot without ticking produces deterministic expiration backlog
 - a checkpoint plus WAL-backed restart path still works when an expiration commit halts the live
   engine after append and before sync
+- seeded crash plans now interrupt the real engine at client submit/apply, checkpoint, and
+  recovery boundaries, with restart tests covering post-sync submit replay, snapshot-written
+  before WAL rewrite, and replay-interrupted recovery
 
 What to reuse in follow-up tasks:
 
 - the external-driver architecture
 - explicit slot advancement under test control
 - seeded scheduling for same-slot ready work
+- seeded one-shot crash plans over real engine and recovery boundaries
 - restart helpers that reopen from snapshot plus WAL on disk
 
 What not to promote directly:
 
 - the original spike's ad hoc helper surface
 - any scheduler choice that is not covered by deterministic transcript tests
+- crash toggles that are not selected from a seed and named boundary set
 - one-off layouts that hide the reusable harness from follow-on simulation tasks
 
 This direction keeps trusted-core churn low because the real engine already exposes the slot,

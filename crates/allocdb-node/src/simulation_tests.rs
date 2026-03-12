@@ -3,7 +3,10 @@ use allocdb_core::config::Config;
 use allocdb_core::ids::{ClientId, HolderId, OperationId, ResourceId, Slot};
 use allocdb_core::{ReservationState, ResourceState};
 
-use crate::engine::{EngineConfig, PersistFailurePhase, RecoveryStartupKind, SubmissionError};
+use crate::engine::{
+    CheckpointError, CrashPlan, CrashPoint, EngineConfig, PersistFailurePhase, RecoverEngineError,
+    RecoveryStartupKind, SubmissionError,
+};
 use crate::simulation::SimulationHarness;
 
 fn core_config() -> Config {
@@ -52,6 +55,12 @@ fn reserve(
             ttl_slots,
         },
     }
+}
+
+fn seed_for_point(point: CrashPoint, enabled_points: &[CrashPoint]) -> u64 {
+    (0_u64..256)
+        .find(|seed| CrashPlan::from_seed(*seed, enabled_points).point == point)
+        .expect("test crash point must be reachable from one seed")
 }
 
 #[test]
@@ -257,4 +266,192 @@ fn harness_submit_propagates_persist_failure_for_negative_path_tests() {
 
     assert!(matches!(error, SubmissionError::WalFile(_)));
     assert!(!harness.metrics().accepting_writes);
+}
+
+#[test]
+fn crash_plan_seed_is_reproducible_and_order_independent() {
+    let enabled_points = [
+        CrashPoint::ClientBeforeWalAppend,
+        CrashPoint::ClientAfterWalSync,
+        CrashPoint::ClientAfterApply,
+    ];
+    let reordered_points = [
+        CrashPoint::ClientAfterApply,
+        CrashPoint::ClientBeforeWalAppend,
+        CrashPoint::ClientAfterWalSync,
+        CrashPoint::ClientAfterApply,
+    ];
+
+    let planned = CrashPlan::from_seed(0x5eed, &enabled_points);
+    let reordered = CrashPlan::from_seed(0x5eed, &reordered_points);
+    let observed: std::collections::BTreeSet<_> = (0_u64..16)
+        .map(|seed| CrashPlan::from_seed(seed, &enabled_points).point)
+        .collect();
+
+    assert_eq!(planned, reordered);
+    assert!(observed.len() > 1);
+}
+
+#[test]
+fn seeded_client_post_sync_crash_recovers_via_real_engine() {
+    let runtime_points = [
+        CrashPoint::ClientBeforeWalAppend,
+        CrashPoint::ClientAfterWalSync,
+        CrashPoint::ClientAfterApply,
+    ];
+    let seed = seed_for_point(CrashPoint::ClientAfterWalSync, &runtime_points);
+
+    let mut harness = SimulationHarness::new(
+        "client-post-sync-crash",
+        seed,
+        core_config(),
+        engine_config(),
+    )
+    .unwrap();
+    harness.advance_to(Slot(1));
+    let planned = harness.arm_next_engine_crash(seed, &runtime_points);
+    assert_eq!(planned.point, CrashPoint::ClientAfterWalSync);
+
+    let error = harness.submit(create(11, 1)).unwrap_err();
+
+    assert!(matches!(
+        error,
+        SubmissionError::CrashInjected(plan) if plan == planned
+    ));
+    assert!(!harness.metrics().accepting_writes);
+
+    let recovered = harness.restart().unwrap();
+    assert_eq!(
+        recovered.recovery.startup_kind,
+        RecoveryStartupKind::WalOnly
+    );
+    assert_eq!(recovered.recovery.replayed_wal_frame_count, 1);
+    assert_eq!(
+        recovered
+            .recovery
+            .replayed_wal_last_lsn
+            .map(allocdb_core::Lsn::get),
+        Some(1)
+    );
+    assert!(harness.engine().db().resource(ResourceId(11)).is_some());
+
+    let retry = harness.submit(create(11, 1)).unwrap();
+    assert!(retry.from_retry_cache);
+    assert_eq!(retry.applied_lsn.get(), 1);
+}
+
+#[test]
+fn seeded_checkpoint_crash_after_snapshot_write_is_recoverable() {
+    let checkpoint_points = [
+        CrashPoint::CheckpointAfterSnapshotWrite,
+        CrashPoint::CheckpointAfterWalRewrite,
+    ];
+    let seed = seed_for_point(CrashPoint::CheckpointAfterSnapshotWrite, &checkpoint_points);
+    let mut harness =
+        SimulationHarness::new("checkpoint-crash", seed, core_config(), engine_config()).unwrap();
+
+    harness.advance_to(Slot(1));
+    harness.submit(create(11, 1)).unwrap();
+    harness.checkpoint().unwrap();
+
+    harness.advance_to(Slot(2));
+    harness.submit(create(12, 2)).unwrap();
+
+    let planned = harness.arm_next_engine_crash(seed, &checkpoint_points);
+    let error = harness.checkpoint().unwrap_err();
+
+    assert!(matches!(
+        error,
+        CheckpointError::CrashInjected(plan) if plan == planned
+    ));
+    assert_eq!(planned.point, CrashPoint::CheckpointAfterSnapshotWrite);
+    assert!(!harness.metrics().accepting_writes);
+
+    let recovered = harness.restart().unwrap();
+    assert_eq!(
+        recovered.recovery.startup_kind,
+        RecoveryStartupKind::SnapshotOnly
+    );
+    assert_eq!(
+        recovered
+            .recovery
+            .loaded_snapshot_lsn
+            .map(allocdb_core::Lsn::get),
+        Some(2)
+    );
+    assert_eq!(recovered.recovery.replayed_wal_frame_count, 0);
+    assert!(harness.engine().db().resource(ResourceId(11)).is_some());
+    assert!(harness.engine().db().resource(ResourceId(12)).is_some());
+}
+
+#[test]
+fn seeded_recovery_crash_is_reproducible_and_resumable() {
+    let recovery_points = [
+        CrashPoint::RecoveryAfterSnapshotLoad,
+        CrashPoint::RecoveryAfterWalTruncate,
+        CrashPoint::RecoveryAfterReplayFrame,
+    ];
+    let seed = seed_for_point(CrashPoint::RecoveryAfterReplayFrame, &recovery_points);
+
+    let mut first =
+        SimulationHarness::new("recovery-crash-first", seed, core_config(), engine_config())
+            .unwrap();
+    first.advance_to(Slot(1));
+    first.submit(create(11, 1)).unwrap();
+    first.checkpoint().unwrap();
+    first.advance_to(Slot(2));
+    first.submit(create(12, 2)).unwrap();
+
+    let mut second = SimulationHarness::new(
+        "recovery-crash-second",
+        seed,
+        core_config(),
+        engine_config(),
+    )
+    .unwrap();
+    second.advance_to(Slot(1));
+    second.submit(create(11, 1)).unwrap();
+    second.checkpoint().unwrap();
+    second.advance_to(Slot(2));
+    second.submit(create(12, 2)).unwrap();
+
+    let first_plan = first.arm_next_recovery_crash(seed, &recovery_points);
+    let second_plan = second.arm_next_recovery_crash(seed, &recovery_points);
+    assert_eq!(first_plan, second_plan);
+    assert_eq!(first_plan.point, CrashPoint::RecoveryAfterReplayFrame);
+
+    let first_error = first.restart().unwrap_err();
+    let second_error = second.restart().unwrap_err();
+
+    assert!(matches!(
+        first_error,
+        RecoverEngineError::CrashInjected(plan) if plan == first_plan
+    ));
+    assert!(matches!(
+        second_error,
+        RecoverEngineError::CrashInjected(plan) if plan == second_plan
+    ));
+
+    let recovered = first.restart().unwrap();
+    assert_eq!(
+        recovered.recovery.startup_kind,
+        RecoveryStartupKind::SnapshotAndWal
+    );
+    assert_eq!(
+        recovered
+            .recovery
+            .loaded_snapshot_lsn
+            .map(allocdb_core::Lsn::get),
+        Some(1)
+    );
+    assert_eq!(recovered.recovery.replayed_wal_frame_count, 1);
+    assert_eq!(
+        recovered
+            .recovery
+            .replayed_wal_last_lsn
+            .map(allocdb_core::Lsn::get),
+        Some(2)
+    );
+    assert!(first.engine().db().resource(ResourceId(11)).is_some());
+    assert!(first.engine().db().resource(ResourceId(12)).is_some());
 }

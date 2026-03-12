@@ -8,9 +8,9 @@ use allocdb_core::ids::{Lsn, OperationId, Slot};
 use allocdb_core::result::ResultCode;
 
 use crate::engine::{
-    CheckpointError, CheckpointResult, EngineConfig, EngineMetrics, EngineOpenError,
-    ExpirationTickResult, PersistFailurePhase, RecoverEngineError, SingleNodeEngine,
-    SubmissionError, SubmissionResult,
+    CheckpointError, CheckpointResult, CrashPlan, CrashPoint, EngineConfig, EngineMetrics,
+    EngineOpenError, ExpirationTickResult, PersistFailurePhase, RecoverEngineError,
+    SingleNodeEngine, SubmissionError, SubmissionResult,
 };
 
 #[cfg(test)]
@@ -93,6 +93,7 @@ pub(crate) struct SimulationHarness {
     wal_path: PathBuf,
     snapshot_path: PathBuf,
     engine: Option<SingleNodeEngine>,
+    pending_recovery_crash: Option<CrashPlan>,
 }
 
 impl SimulationHarness {
@@ -113,6 +114,7 @@ impl SimulationHarness {
             wal_path,
             snapshot_path,
             engine: Some(engine),
+            pending_recovery_crash: None,
         })
     }
 
@@ -172,11 +174,12 @@ impl SimulationHarness {
 
     pub(crate) fn restart(&mut self) -> Result<EngineMetrics, RecoverEngineError> {
         drop(self.engine.take());
-        let recovered = SingleNodeEngine::recover(
+        let recovered = SingleNodeEngine::recover_with_crash_plan(
             self.core_config.clone(),
             self.engine_config,
             &self.snapshot_path,
             &self.wal_path,
+            self.pending_recovery_crash.take(),
         )?;
         let metrics = recovered.metrics(self.current_slot());
         self.engine = Some(recovered);
@@ -185,6 +188,30 @@ impl SimulationHarness {
 
     pub(crate) fn inject_next_persist_failure(&mut self, phase: PersistFailurePhase) {
         self.engine_mut().inject_next_persist_failure(phase);
+    }
+
+    pub(crate) fn arm_next_engine_crash(
+        &mut self,
+        seed: u64,
+        enabled_points: &[CrashPoint],
+    ) -> CrashPlan {
+        let plan = CrashPlan::from_seed(seed, enabled_points);
+        self.engine_mut().arm_next_crash(plan);
+        plan
+    }
+
+    pub(crate) fn arm_next_recovery_crash(
+        &mut self,
+        seed: u64,
+        enabled_points: &[CrashPoint],
+    ) -> CrashPlan {
+        let plan = CrashPlan::from_seed(seed, enabled_points);
+        assert!(
+            plan.point.is_recovery_boundary(),
+            "recovery crash plan must target one recovery boundary"
+        );
+        self.pending_recovery_crash = Some(plan);
+        plan
     }
 
     pub(crate) fn engine(&self) -> &SingleNodeEngine {

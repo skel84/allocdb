@@ -7,13 +7,15 @@ use allocdb_core::command_codec::{
 };
 use allocdb_core::config::{Config, ConfigError};
 use allocdb_core::ids::{Lsn, OperationId, ReservationId, Slot};
-use allocdb_core::recovery::{RecoveryError, recover_allocdb};
+use allocdb_core::recovery::{
+    RecoveryBoundary, RecoveryError, RecoveryObserverError, recover_allocdb_with_observer,
+};
 use allocdb_core::result::{CommandOutcome, ResultCode};
 use allocdb_core::snapshot_file::SnapshotFile;
 use allocdb_core::state_machine::AllocDb;
 use allocdb_core::wal::{Frame, RecordType};
 use allocdb_core::wal_file::{WalFile, WalFileError};
-use log::{error, trace};
+use log::{error, trace, warn};
 
 use crate::bounded_queue::{BoundedQueue, BoundedQueueError};
 
@@ -126,6 +128,7 @@ pub enum SubmissionError {
         queue_capacity: u32,
     },
     WalFile(WalFileError),
+    CrashInjected(CrashPlan),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,7 +147,9 @@ impl SubmissionError {
     #[must_use]
     pub fn category(&self) -> SubmissionErrorCategory {
         match self {
-            Self::EngineHalted | Self::WalFile(_) => SubmissionErrorCategory::Indefinite,
+            Self::EngineHalted | Self::WalFile(_) | Self::CrashInjected(_) => {
+                SubmissionErrorCategory::Indefinite
+            }
             Self::InvalidRequest(_) | Self::CommandTooLarge { .. } | Self::Overloaded { .. } => {
                 SubmissionErrorCategory::DefiniteFailure
             }
@@ -156,6 +161,7 @@ impl SubmissionError {
 pub enum RecoverEngineError {
     Recovery(RecoveryError),
     EngineOpen(EngineOpenError),
+    CrashInjected(CrashPlan),
 }
 
 impl From<RecoveryError> for RecoverEngineError {
@@ -202,6 +208,75 @@ pub(crate) enum PersistFailurePhase {
     AfterAppend,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum CrashPoint {
+    ClientBeforeWalAppend,
+    ClientAfterWalSync,
+    ClientAfterApply,
+    InternalBeforeWalAppend,
+    InternalAfterWalSync,
+    InternalAfterApply,
+    CheckpointAfterSnapshotWrite,
+    CheckpointAfterWalRewrite,
+    RecoveryAfterSnapshotLoad,
+    RecoveryAfterWalTruncate,
+    RecoveryAfterReplayFrame,
+}
+
+impl CrashPoint {
+    #[cfg(test)]
+    pub(crate) const fn is_recovery_boundary(self) -> bool {
+        matches!(
+            self,
+            Self::RecoveryAfterSnapshotLoad
+                | Self::RecoveryAfterWalTruncate
+                | Self::RecoveryAfterReplayFrame
+        )
+    }
+
+    fn from_recovery_boundary(boundary: RecoveryBoundary) -> Self {
+        match boundary {
+            RecoveryBoundary::AfterSnapshotLoad => Self::RecoveryAfterSnapshotLoad,
+            RecoveryBoundary::AfterWalTruncate => Self::RecoveryAfterWalTruncate,
+            RecoveryBoundary::AfterReplayFrame { .. } => Self::RecoveryAfterReplayFrame,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CrashPlan {
+    pub seed: u64,
+    pub point: CrashPoint,
+}
+
+impl CrashPlan {
+    #[cfg(test)]
+    pub(crate) fn from_seed(seed: u64, enabled_points: &[CrashPoint]) -> Self {
+        assert!(
+            !enabled_points.is_empty(),
+            "crash plan requires at least one enabled point"
+        );
+
+        let mut points = enabled_points.to_vec();
+        points.sort_unstable();
+        points.dedup();
+
+        let mixed = mix_seed(seed);
+        let point = points[usize::try_from(mixed % u64::try_from(points.len()).unwrap())
+            .expect("crash-plan index must fit usize")];
+
+        Self { seed, point }
+    }
+}
+
+#[cfg(test)]
+const fn mix_seed(seed: u64) -> u64 {
+    let state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mixed = (state ^ (state >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^ (mixed >> 31)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProcessedSubmission {
     operation_id: OperationId,
@@ -227,6 +302,7 @@ pub struct SingleNodeEngine {
     startup_recovery: StartupRecovery,
     // One-shot failure injection used only to exercise ambiguous WAL outcomes in tests.
     injected_persist_failure: Option<PersistFailurePhase>,
+    armed_crash: Option<CrashPlan>,
 }
 
 impl SingleNodeEngine {
@@ -266,11 +342,35 @@ impl SingleNodeEngine {
         snapshot_path: impl AsRef<Path>,
         wal_path: impl AsRef<Path>,
     ) -> Result<Self, RecoverEngineError> {
+        Self::recover_with_crash_plan(core_config, engine_config, snapshot_path, wal_path, None)
+    }
+
+    pub(crate) fn recover_with_crash_plan(
+        core_config: Config,
+        engine_config: EngineConfig,
+        snapshot_path: impl AsRef<Path>,
+        wal_path: impl AsRef<Path>,
+        crash_plan: Option<CrashPlan>,
+    ) -> Result<Self, RecoverEngineError> {
         engine_config.validate().map_err(EngineOpenError::from)?;
         let snapshot_file = SnapshotFile::new(snapshot_path);
         let wal = WalFile::open(wal_path.as_ref(), engine_config.max_command_bytes)
             .map_err(EngineOpenError::from)?;
-        let recovered = recover_allocdb(core_config, &snapshot_file, &wal)?;
+        let mut pending_crash = crash_plan;
+        let recovered = recover_allocdb_with_observer(core_config, &snapshot_file, &wal, |point| {
+            let mapped = CrashPoint::from_recovery_boundary(point);
+            if pending_crash.is_some_and(|plan| plan.point == mapped) {
+                return Err(pending_crash
+                    .take()
+                    .expect("matched recovery crash plan must still be armed"));
+            }
+
+            Ok(())
+        })
+        .map_err(|error| match error {
+            RecoveryObserverError::Recovery(error) => RecoverEngineError::Recovery(error),
+            RecoveryObserverError::Observer(plan) => RecoverEngineError::CrashInjected(plan),
+        })?;
         Self::from_parts(
             recovered.db,
             engine_config,
@@ -320,6 +420,7 @@ impl SingleNodeEngine {
             active_snapshot_lsn,
             startup_recovery,
             injected_persist_failure: None,
+            armed_crash: None,
         })
     }
 
@@ -541,6 +642,9 @@ impl SingleNodeEngine {
         };
 
         let injected_failure = self.take_injected_persist_failure();
+        if let Some(plan) = self.maybe_inject_crash(CrashPoint::ClientBeforeWalAppend) {
+            return Err(SubmissionError::CrashInjected(plan));
+        }
         if injected_failure == Some(PersistFailurePhase::BeforeAppend) {
             return Err(self.halt_on_wal_error(
                 operation_id,
@@ -581,6 +685,10 @@ impl SingleNodeEngine {
             ));
         }
 
+        if let Some(plan) = self.maybe_inject_crash(CrashPoint::ClientAfterWalSync) {
+            return Err(SubmissionError::CrashInjected(plan));
+        }
+
         let outcome = self.db.apply_client(
             CommandContext {
                 lsn: applied_lsn,
@@ -588,6 +696,9 @@ impl SingleNodeEngine {
             },
             pending.request,
         );
+        if let Some(plan) = self.maybe_inject_crash(CrashPoint::ClientAfterApply) {
+            return Err(SubmissionError::CrashInjected(plan));
+        }
         self.next_lsn += 1;
 
         Ok(Some(ProcessedSubmission {
@@ -653,6 +764,9 @@ impl SingleNodeEngine {
 
         let applied_lsn = Lsn(self.next_lsn);
         let injected_failure = self.take_injected_persist_failure();
+        if let Some(plan) = self.maybe_inject_crash(CrashPoint::InternalBeforeWalAppend) {
+            return Err(SubmissionError::CrashInjected(plan));
+        }
         if injected_failure == Some(PersistFailurePhase::BeforeAppend) {
             return Err(self.halt_on_internal_wal_error(
                 request_slot,
@@ -691,6 +805,10 @@ impl SingleNodeEngine {
             return Err(self.halt_on_internal_wal_error(request_slot, applied_lsn, "sync", error));
         }
 
+        if let Some(plan) = self.maybe_inject_crash(CrashPoint::InternalAfterWalSync) {
+            return Err(SubmissionError::CrashInjected(plan));
+        }
+
         let outcome = self.db.apply_internal(
             CommandContext {
                 lsn: applied_lsn,
@@ -698,6 +816,9 @@ impl SingleNodeEngine {
             },
             command,
         );
+        if let Some(plan) = self.maybe_inject_crash(CrashPoint::InternalAfterApply) {
+            return Err(SubmissionError::CrashInjected(plan));
+        }
         self.next_lsn += 1;
 
         Ok(SubmissionResult {
@@ -816,5 +937,31 @@ impl SingleNodeEngine {
     #[cfg(test)]
     pub(crate) fn inject_next_persist_failure(&mut self, phase: PersistFailurePhase) {
         self.injected_persist_failure = Some(phase);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_next_crash(&mut self, plan: CrashPlan) {
+        assert!(
+            !plan.point.is_recovery_boundary(),
+            "runtime engine crash plan must not target recovery boundaries"
+        );
+        self.armed_crash = Some(plan);
+    }
+
+    fn maybe_inject_crash(&mut self, point: CrashPoint) -> Option<CrashPlan> {
+        if self.armed_crash.is_some_and(|plan| plan.point == point) {
+            let plan = self
+                .armed_crash
+                .take()
+                .expect("matched crash plan must still be armed");
+            warn!(
+                "halting engine on injected crash: seed={} point={:?}",
+                plan.seed, plan.point
+            );
+            self.accepting_writes = false;
+            return Some(plan);
+        }
+
+        None
     }
 }

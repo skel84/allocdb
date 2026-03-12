@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use crate::command::CommandContext;
 use crate::command_codec::{CommandCodecError, decode_client_request, decode_internal_command};
 use crate::config::{Config, ConfigError};
@@ -17,6 +19,13 @@ pub struct RecoveryResult {
     pub loaded_snapshot_lsn: Option<Lsn>,
     pub replayed_wal_frame_count: u32,
     pub replayed_wal_last_lsn: Option<Lsn>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryBoundary {
+    AfterSnapshotLoad,
+    AfterWalTruncate,
+    AfterReplayFrame { lsn: Lsn, record_type: RecordType },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +86,48 @@ impl From<ReplayError> for RecoveryError {
     }
 }
 
+#[derive(Debug)]
+pub enum RecoveryObserverError<E> {
+    Recovery(RecoveryError),
+    Observer(E),
+}
+
+impl<E> From<ConfigError> for RecoveryObserverError<E> {
+    fn from(error: ConfigError) -> Self {
+        Self::Recovery(RecoveryError::from(error))
+    }
+}
+
+impl<E> From<SnapshotFileError> for RecoveryObserverError<E> {
+    fn from(error: SnapshotFileError) -> Self {
+        Self::Recovery(RecoveryError::from(error))
+    }
+}
+
+impl<E> From<SnapshotError> for RecoveryObserverError<E> {
+    fn from(error: SnapshotError) -> Self {
+        Self::Recovery(RecoveryError::from(error))
+    }
+}
+
+impl<E> From<WalFileError> for RecoveryObserverError<E> {
+    fn from(error: WalFileError) -> Self {
+        Self::Recovery(RecoveryError::from(error))
+    }
+}
+
+impl<E> From<CommandCodecError> for RecoveryObserverError<E> {
+    fn from(error: CommandCodecError) -> Self {
+        Self::Recovery(RecoveryError::from(error))
+    }
+}
+
+impl<E> From<ReplayError> for RecoveryObserverError<E> {
+    fn from(error: ReplayError) -> Self {
+        Self::Recovery(RecoveryError::from(error))
+    }
+}
+
 /// Recovers one allocator by loading a snapshot, truncating the WAL to the last valid prefix,
 /// and replaying later frames through the live apply path.
 ///
@@ -89,7 +140,35 @@ pub fn recover_allocdb(
     snapshot_file: &SnapshotFile,
     wal_file: &WalFile,
 ) -> Result<RecoveryResult, RecoveryError> {
-    let result = recover_allocdb_impl(config, snapshot_file, wal_file);
+    recover_allocdb_with_observer(
+        config,
+        snapshot_file,
+        wal_file,
+        |_| Ok::<(), Infallible>(()),
+    )
+    .map_err(|error| match error {
+        RecoveryObserverError::Recovery(error) => error,
+        RecoveryObserverError::Observer(never) => match never {},
+    })
+}
+
+/// Recovers one allocator while notifying one observer at named recovery boundaries.
+///
+/// # Errors
+///
+/// Returns [`RecoveryObserverError::Recovery`] if snapshot loading, WAL scanning, replay-order
+/// validation, or payload decoding fails. Returns [`RecoveryObserverError::Observer`] if the
+/// caller-provided boundary observer aborts recovery.
+pub fn recover_allocdb_with_observer<E, F>(
+    config: Config,
+    snapshot_file: &SnapshotFile,
+    wal_file: &WalFile,
+    mut observer: F,
+) -> Result<RecoveryResult, RecoveryObserverError<E>>
+where
+    F: FnMut(RecoveryBoundary) -> Result<(), E>,
+{
+    let result = recover_allocdb_impl(config, snapshot_file, wal_file, &mut observer);
 
     match &result {
         Ok(result) => {
@@ -101,17 +180,24 @@ pub fn recover_allocdb(
                 result.replayed_wal_last_lsn,
             );
         }
-        Err(error) => log_recovery_failure(error, snapshot_file, wal_file),
+        Err(RecoveryObserverError::Recovery(error)) => {
+            log_recovery_failure(error, snapshot_file, wal_file);
+        }
+        Err(RecoveryObserverError::Observer(_)) => {}
     }
 
     result
 }
 
-fn recover_allocdb_impl(
+fn recover_allocdb_impl<E, F>(
     config: Config,
     snapshot_file: &SnapshotFile,
     wal_file: &WalFile,
-) -> Result<RecoveryResult, RecoveryError> {
+    observer: &mut F,
+) -> Result<RecoveryResult, RecoveryObserverError<E>>
+where
+    F: FnMut(RecoveryBoundary) -> Result<(), E>,
+{
     let snapshot = snapshot_file.load_snapshot()?;
     let loaded_snapshot = snapshot.is_some();
     let loaded_snapshot_lsn = snapshot.as_ref().and_then(|value| value.last_applied_lsn);
@@ -119,8 +205,10 @@ fn recover_allocdb_impl(
         Some(snapshot) => AllocDb::from_snapshot(config, snapshot)?,
         None => AllocDb::new(config)?,
     };
+    observer(RecoveryBoundary::AfterSnapshotLoad).map_err(RecoveryObserverError::Observer)?;
 
     let recovered_wal = wal_file.truncate_to_valid_prefix()?;
+    observer(RecoveryBoundary::AfterWalTruncate).map_err(RecoveryObserverError::Observer)?;
     let mut replayed_wal_frame_count = 0_u32;
     let mut replayed_wal_last_lsn = None;
     let mut replay_last_lsn = db.last_applied_lsn();
@@ -148,12 +236,22 @@ fn recover_allocdb_impl(
                 db.apply_client(context, request);
                 replayed_wal_frame_count = replayed_wal_frame_count.saturating_add(1);
                 replayed_wal_last_lsn = Some(frame.lsn);
+                observer(RecoveryBoundary::AfterReplayFrame {
+                    lsn: frame.lsn,
+                    record_type: frame.record_type,
+                })
+                .map_err(RecoveryObserverError::Observer)?;
             }
             RecordType::InternalCommand => {
                 let command = decode_internal_command(&frame.payload)?;
                 db.apply_internal(context, command);
                 replayed_wal_frame_count = replayed_wal_frame_count.saturating_add(1);
                 replayed_wal_last_lsn = Some(frame.lsn);
+                observer(RecoveryBoundary::AfterReplayFrame {
+                    lsn: frame.lsn,
+                    record_type: frame.record_type,
+                })
+                .map_err(RecoveryObserverError::Observer)?;
             }
             RecordType::SnapshotMarker => {}
         }

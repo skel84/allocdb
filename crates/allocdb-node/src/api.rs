@@ -154,7 +154,9 @@ impl SubmissionFailure {
                 queue_depth,
                 queue_capacity,
             },
-            SubmissionError::WalFile(_) => SubmissionFailureCode::StorageFailure,
+            SubmissionError::WalFile(_) | SubmissionError::CrashInjected(_) => {
+                SubmissionFailureCode::StorageFailure
+            }
         };
 
         Self { category, code }
