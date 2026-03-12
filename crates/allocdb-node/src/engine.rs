@@ -165,6 +165,12 @@ struct PendingSubmission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistFailurePhase {
+    BeforeAppend,
+    AfterAppend,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProcessedSubmission {
     operation_id: OperationId,
     command_fingerprint: u128,
@@ -180,6 +186,8 @@ pub struct SingleNodeEngine {
     next_lsn: u64,
     accepting_writes: bool,
     active_snapshot_lsn: Option<Lsn>,
+    // One-shot failure injection used only to exercise ambiguous WAL outcomes in tests.
+    injected_persist_failure: Option<PersistFailurePhase>,
 }
 
 impl SingleNodeEngine {
@@ -258,6 +266,7 @@ impl SingleNodeEngine {
             next_lsn,
             accepting_writes: true,
             active_snapshot_lsn,
+            injected_persist_failure: None,
         })
     }
 
@@ -430,9 +439,25 @@ impl SingleNodeEngine {
             payload: pending.encoded,
         };
 
-        if let Err(error) = self.wal.append_frame(&frame).and_then(|()| self.wal.sync()) {
-            self.accepting_writes = false;
-            return Err(SubmissionError::WalFile(error));
+        let injected_failure = self.take_injected_persist_failure();
+        if injected_failure == Some(PersistFailurePhase::BeforeAppend) {
+            return Err(
+                self.halt_on_wal_error(std::io::Error::other("injected WAL failure before append"))
+            );
+        }
+
+        if let Err(error) = self.wal.append_frame(&frame) {
+            return Err(self.halt_on_wal_error(error));
+        }
+
+        if injected_failure == Some(PersistFailurePhase::AfterAppend) {
+            return Err(
+                self.halt_on_wal_error(std::io::Error::other("injected WAL failure after append"))
+            );
+        }
+
+        if let Err(error) = self.wal.sync() {
+            return Err(self.halt_on_wal_error(error));
         }
 
         let outcome = self.db.apply_client(
@@ -517,5 +542,19 @@ impl SingleNodeEngine {
         }
 
         Ok(())
+    }
+
+    fn halt_on_wal_error(&mut self, error: impl Into<WalFileError>) -> SubmissionError {
+        self.accepting_writes = false;
+        SubmissionError::WalFile(error.into())
+    }
+
+    fn take_injected_persist_failure(&mut self) -> Option<PersistFailurePhase> {
+        self.injected_persist_failure.take()
+    }
+
+    #[cfg(test)]
+    fn inject_next_persist_failure(&mut self, phase: PersistFailurePhase) {
+        self.injected_persist_failure = Some(phase);
     }
 }
