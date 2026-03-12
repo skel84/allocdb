@@ -6,6 +6,7 @@ AllocDB is a deterministic resource-allocation database focused on correctness u
 
 - [docs/README.md](./docs/README.md)
 - [AGENTS.md](./AGENTS.md)
+- [CONTRIBUTING.md](./CONTRIBUTING.md)
 
 ## Core Docs
 

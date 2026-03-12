@@ -51,7 +51,7 @@ Spike code should:
 
 ## Approved Spike Areas
 
-### SPIKE-101: Fixed-Capacity Tables
+### M1-S01: Fixed-Capacity Tables
 
 Question:
 
@@ -63,10 +63,12 @@ Why a spike is justified:
 
 Current chosen direction:
 
-- sorted fixed-capacity `Vec` stores with deterministic binary search and insertion
-- no hash tables in the trusted core for the first implementation slice
+- the first implementation slice used sorted fixed-capacity `Vec` stores to keep the prototype
+  small and deterministic
+- the production direction is now deterministic fixed-capacity open-addressed tables in the
+  trusted core
 
-### SPIKE-102: Timing Wheel
+### M1-S02: Timing Wheel
 
 Question:
 
@@ -83,7 +85,7 @@ Current chosen direction:
 - explicit `MAX_EXPIRATION_BUCKET_LEN` per slot
 - deterministic sorted bucket contents
 
-### SPIKE-201: WAL Framing
+### M2-S01: WAL Framing
 
 Question:
 
@@ -99,7 +101,7 @@ Current chosen direction:
 - per-frame CRC32C checksum
 - recovery scan stops at the last valid frame boundary
 
-### SPIKE-401: Simulation Harness
+### M4-S01: Simulation Harness
 
 Question:
 

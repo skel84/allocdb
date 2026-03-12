@@ -2,12 +2,12 @@
 
 ## Status
 
-Draft. This document breaks the roadmap into concrete units of work sized for implementation and
-review.
+Draft. This document breaks the roadmap into concrete milestone-scoped tasks sized for
+implementation and review.
 
-## Unit-of-Work Rules
+## Task Rules
 
-Each unit should:
+Each task should:
 
 - produce one reviewable artifact
 - be small enough for roughly 1 to 3 days of focused work
@@ -25,9 +25,15 @@ Tracking template:
 - `Test Evidence`
 - `Non-Goals`
 
+## Naming
+
+- tasks use `M#-T#` identifiers such as `M2-T08`
+- spikes use `M#-S#` identifiers such as `M1-S01`
+- GitHub issues and PRs should use the same identifiers when they map to planned work
+
 ## M0: Freeze v1 Semantics
 
-### UOW-000: Approve spike list and guardrails
+### M0-T01: Approve spike list and guardrails
 
 Goal:
 
@@ -46,7 +52,7 @@ Test evidence:
 
 - docs review only
 
-### UOW-001: Define result codes
+### M0-T02: Define result codes
 
 Goal:
 
@@ -65,7 +71,7 @@ Test evidence:
 
 - docs review only
 
-### UOW-002: Define config knobs and bounds
+### M0-T03: Define config knobs and bounds
 
 Goal:
 
@@ -80,7 +86,7 @@ Test evidence:
 
 - docs review only
 
-### UOW-003: Define trusted-core crate boundaries
+### M0-T04: Define trusted-core crate boundaries
 
 Goal:
 
@@ -95,7 +101,7 @@ Test evidence:
 
 - docs review only
 
-### UOW-004: Decide version-guarded command semantics
+### M0-T05: Decide version-guarded command semantics
 
 Goal:
 
@@ -117,7 +123,7 @@ Test evidence:
 
 ## M1: Pure State Machine
 
-### SPIKE-101: Fixed-capacity table experiment
+### M1-S01: Fixed-capacity table experiment
 
 Goal:
 
@@ -125,9 +131,9 @@ Goal:
 
 Blocked by:
 
-- UOW-000
-- UOW-001
-- UOW-002
+- M0-T01
+- M0-T02
+- M0-T03
 
 Acceptance criteria:
 
@@ -139,7 +145,7 @@ Test evidence:
 
 - benchmark notes or focused experiment output
 
-### SPIKE-102: Timing-wheel experiment
+### M1-S02: Timing-wheel experiment
 
 Goal:
 
@@ -147,8 +153,8 @@ Goal:
 
 Blocked by:
 
-- UOW-000
-- UOW-002
+- M0-T01
+- M0-T03
 
 Acceptance criteria:
 
@@ -160,7 +166,7 @@ Test evidence:
 
 - focused experiment output
 
-### UOW-101: Implement ID newtypes and core records
+### M1-T01: Implement ID newtypes and core records
 
 Goal:
 
@@ -168,8 +174,8 @@ Goal:
 
 Blocked by:
 
-- UOW-001
-- UOW-002
+- M0-T02
+- M0-T03
 
 Acceptance criteria:
 
@@ -180,7 +186,7 @@ Test evidence:
 
 - unit tests for parsing, construction, and size assertions
 
-### UOW-102: Implement fixed-capacity resource table
+### M1-T02: Implement fixed-capacity resource table
 
 Goal:
 
@@ -188,8 +194,8 @@ Goal:
 
 Blocked by:
 
-- UOW-101
-- SPIKE-101
+- M1-T01
+- M1-S01
 
 Acceptance criteria:
 
@@ -200,7 +206,7 @@ Test evidence:
 
 - unit tests and capacity-bound tests
 
-### UOW-103: Implement fixed-capacity reservation table
+### M1-T03: Implement fixed-capacity reservation table
 
 Goal:
 
@@ -208,9 +214,9 @@ Goal:
 
 Blocked by:
 
-- UOW-101
-- UOW-002
-- SPIKE-101
+- M1-T01
+- M0-T03
+- M1-S01
 
 Acceptance criteria:
 
@@ -221,7 +227,7 @@ Test evidence:
 
 - unit tests for insert, retire, reuse
 
-### UOW-104: Implement fixed-capacity operation table
+### M1-T04: Implement fixed-capacity operation table
 
 Goal:
 
@@ -229,8 +235,8 @@ Goal:
 
 Blocked by:
 
-- UOW-101
-- SPIKE-101
+- M1-T01
+- M1-S01
 
 Acceptance criteria:
 
@@ -241,7 +247,7 @@ Test evidence:
 
 - unit tests for duplicates and conflict cases
 
-### UOW-105: Implement timing-wheel expiration index
+### M1-T05: Implement timing-wheel expiration index
 
 Goal:
 
@@ -249,9 +255,9 @@ Goal:
 
 Blocked by:
 
-- UOW-101
-- UOW-103
-- SPIKE-102
+- M1-T01
+- M1-T03
+- M1-S02
 
 Acceptance criteria:
 
@@ -262,7 +268,7 @@ Test evidence:
 
 - unit tests for scheduling, draining, and overflow
 
-### UOW-106: Implement `create_resource`
+### M1-T06: Implement `create_resource`
 
 Goal:
 
@@ -270,8 +276,8 @@ Goal:
 
 Blocked by:
 
-- UOW-102
-- UOW-104
+- M1-T02
+- M1-T04
 
 Acceptance criteria:
 
@@ -281,7 +287,7 @@ Test evidence:
 
 - state-machine unit tests
 
-### UOW-107: Implement `reserve`
+### M1-T07: Implement `reserve`
 
 Goal:
 
@@ -289,10 +295,10 @@ Goal:
 
 Blocked by:
 
-- UOW-102
-- UOW-103
-- UOW-104
-- UOW-105
+- M1-T02
+- M1-T03
+- M1-T04
+- M1-T05
 
 Acceptance criteria:
 
@@ -303,7 +309,7 @@ Test evidence:
 
 - state-machine tests and contention property tests
 
-### UOW-108: Implement `confirm`
+### M1-T08: Implement `confirm`
 
 Goal:
 
@@ -311,8 +317,8 @@ Goal:
 
 Blocked by:
 
-- UOW-103
-- UOW-107
+- M1-T03
+- M1-T07
 
 Acceptance criteria:
 
@@ -323,7 +329,7 @@ Test evidence:
 
 - transition tests and negative-path tests
 
-### UOW-109: Implement `release`
+### M1-T09: Implement `release`
 
 Goal:
 
@@ -331,8 +337,8 @@ Goal:
 
 Blocked by:
 
-- UOW-103
-- UOW-107
+- M1-T03
+- M1-T07
 
 Acceptance criteria:
 
@@ -343,7 +349,7 @@ Test evidence:
 
 - transition tests and negative-path tests
 
-### UOW-110: Implement `expire`
+### M1-T10: Implement `expire`
 
 Goal:
 
@@ -351,9 +357,9 @@ Goal:
 
 Blocked by:
 
-- UOW-103
-- UOW-105
-- UOW-107
+- M1-T03
+- M1-T05
+- M1-T07
 
 Acceptance criteria:
 
@@ -364,7 +370,7 @@ Test evidence:
 
 - interleaving tests with confirm and release
 
-### UOW-111: Add invariant assertion layer
+### M1-T11: Add invariant assertion layer
 
 Goal:
 
@@ -372,7 +378,7 @@ Goal:
 
 Blocked by:
 
-- UOW-102 through UOW-110
+- M1-T02 through M1-T10
 
 Acceptance criteria:
 
@@ -385,7 +391,7 @@ Test evidence:
 
 ## M1H: Constant-Time Core Hardening
 
-### SPIKE-103: Fixed-capacity open-addressed table experiment
+### M1H-S01: Fixed-capacity open-addressed table experiment
 
 Goal:
 
@@ -405,7 +411,7 @@ Test evidence:
 
 - focused experiment output or benchmark notes
 
-### UOW-112: Implement deterministic fixed-capacity hash-table primitive
+### M1H-T01: Implement deterministic fixed-capacity hash-table primitive
 
 Goal:
 
@@ -413,7 +419,7 @@ Goal:
 
 Blocked by:
 
-- SPIKE-103
+- M1H-S01
 
 Acceptance criteria:
 
@@ -425,7 +431,7 @@ Test evidence:
 
 - primitive unit tests for insert, lookup, replace, delete, and full-capacity behavior
 
-### UOW-113: Replace resource lookup with constant-time table access
+### M1H-T02: Replace resource lookup with constant-time table access
 
 Goal:
 
@@ -433,7 +439,7 @@ Goal:
 
 Blocked by:
 
-- UOW-112
+- M1H-T01
 
 Acceptance criteria:
 
@@ -444,7 +450,7 @@ Test evidence:
 
 - state-machine regression tests and table-focused unit tests
 
-### UOW-114: Replace reservation and operation lookup with constant-time table access
+### M1H-T03: Replace reservation and operation lookup with constant-time table access
 
 Goal:
 
@@ -452,7 +458,7 @@ Goal:
 
 Blocked by:
 
-- UOW-112
+- M1H-T01
 
 Acceptance criteria:
 
@@ -463,7 +469,7 @@ Test evidence:
 
 - state-machine regression tests and table-focused unit tests
 
-### UOW-115: Replace full-table retirement scans with ordered retirement draining
+### M1H-T04: Replace full-table retirement scans with ordered retirement draining
 
 Goal:
 
@@ -472,7 +478,7 @@ Goal:
 
 Blocked by:
 
-- UOW-114
+- M1H-T03
 
 Acceptance criteria:
 
@@ -484,7 +490,7 @@ Test evidence:
 
 - retirement regression tests and capacity-bound tests
 
-### UOW-116: Decide and implement version-guarded confirm handling
+### M1H-T05: Decide and implement version-guarded confirm handling
 
 Goal:
 
@@ -493,8 +499,8 @@ Goal:
 
 Blocked by:
 
-- UOW-004
-- UOW-108
+- M0-T05
+- M1-T08
 
 Acceptance criteria:
 
@@ -508,7 +514,7 @@ Test evidence:
 
 ## M2: Durability and Recovery
 
-### SPIKE-201: WAL framing and torn-tail experiment
+### M2-S01: WAL framing and torn-tail experiment
 
 Goal:
 
@@ -516,8 +522,8 @@ Goal:
 
 Blocked by:
 
-- UOW-000
-- UOW-101
+- M0-T01
+- M1-T01
 
 Acceptance criteria:
 
@@ -528,7 +534,7 @@ Test evidence:
 
 - focused experiment output
 
-### UOW-201: Define WAL frame codec
+### M2-T01: Define WAL frame codec
 
 Goal:
 
@@ -536,8 +542,8 @@ Goal:
 
 Blocked by:
 
-- UOW-101
-- SPIKE-201
+- M1-T01
+- M2-S01
 
 Acceptance criteria:
 
@@ -548,7 +554,7 @@ Test evidence:
 
 - codec unit tests with corrupted frames
 
-### UOW-202: Implement append-only WAL writer
+### M2-T02: Implement append-only WAL writer
 
 Goal:
 
@@ -556,7 +562,7 @@ Goal:
 
 Blocked by:
 
-- UOW-201
+- M2-T01
 
 Acceptance criteria:
 
@@ -567,7 +573,7 @@ Test evidence:
 
 - file-backed tests with induced write failures
 
-### UOW-203: Implement recovery scanner
+### M2-T03: Implement recovery scanner
 
 Goal:
 
@@ -575,8 +581,8 @@ Goal:
 
 Blocked by:
 
-- UOW-201
-- UOW-202
+- M2-T01
+- M2-T02
 
 Acceptance criteria:
 
@@ -587,7 +593,7 @@ Test evidence:
 
 - torn-tail recovery tests
 
-### UOW-204: Define snapshot format
+### M2-T04: Define snapshot format
 
 Goal:
 
@@ -595,7 +601,7 @@ Goal:
 
 Blocked by:
 
-- UOW-102 through UOW-105
+- M1-T02 through M1-T05
 
 Acceptance criteria:
 
@@ -606,7 +612,7 @@ Test evidence:
 
 - round-trip snapshot tests
 
-### UOW-205: Implement snapshot writer and loader
+### M2-T05: Implement snapshot writer and loader
 
 Goal:
 
@@ -614,7 +620,7 @@ Goal:
 
 Blocked by:
 
-- UOW-204
+- M2-T04
 
 Acceptance criteria:
 
@@ -625,7 +631,7 @@ Test evidence:
 
 - crash and corruption tests around snapshot load
 
-### UOW-206: Implement replay using the live apply path
+### M2-T06: Implement replay using the live apply path
 
 Goal:
 
@@ -633,10 +639,10 @@ Goal:
 
 Blocked by:
 
-- UOW-202
-- UOW-203
-- UOW-205
-- UOW-111
+- M2-T02
+- M2-T03
+- M2-T05
+- M1-T11
 
 Acceptance criteria:
 
@@ -647,7 +653,7 @@ Test evidence:
 
 - replay-equivalence tests
 
-### UOW-207: Distinguish torn tails from durable-log corruption
+### M2-T07: Distinguish torn tails from durable-log corruption
 
 Goal:
 
@@ -655,8 +661,8 @@ Goal:
 
 Blocked by:
 
-- UOW-203
-- UOW-206
+- M2-T03
+- M2-T06
 
 Acceptance criteria:
 
@@ -668,7 +674,7 @@ Test evidence:
 
 - torn-tail tests and mid-log corruption tests
 
-### UOW-208: Add safe checkpoint coordination and WAL truncation rules
+### M2-T08: Add safe checkpoint coordination and WAL truncation rules
 
 Goal:
 
@@ -677,9 +683,9 @@ Goal:
 
 Blocked by:
 
-- UOW-205
-- UOW-206
-- UOW-207
+- M2-T05
+- M2-T06
+- M2-T07
 
 Acceptance criteria:
 
@@ -695,7 +701,7 @@ Test evidence:
 
 ## M3: Submission Pipeline
 
-### UOW-301: Implement command envelope validation
+### M3-T01: Implement command envelope validation
 
 Goal:
 
@@ -703,8 +709,8 @@ Goal:
 
 Blocked by:
 
-- UOW-001
-- UOW-206
+- M0-T02
+- M2-T06
 
 Acceptance criteria:
 
@@ -715,7 +721,7 @@ Test evidence:
 
 - request validation tests
 
-### UOW-302: Implement bounded submission queue
+### M3-T02: Implement bounded submission queue
 
 Goal:
 
@@ -723,7 +729,7 @@ Goal:
 
 Blocked by:
 
-- UOW-002
+- M0-T03
 
 Acceptance criteria:
 
@@ -734,7 +740,7 @@ Test evidence:
 
 - overload and backpressure tests
 
-### UOW-303: Implement sequencer
+### M3-T03: Implement sequencer
 
 Goal:
 
@@ -742,9 +748,9 @@ Goal:
 
 Blocked by:
 
-- UOW-202
-- UOW-301
-- UOW-302
+- M2-T02
+- M3-T01
+- M3-T02
 
 Acceptance criteria:
 
@@ -755,7 +761,7 @@ Test evidence:
 
 - sequencing tests
 
-### UOW-304: Implement result publication and retry lookup
+### M3-T04: Implement result publication and retry lookup
 
 Goal:
 
@@ -763,8 +769,8 @@ Goal:
 
 Blocked by:
 
-- UOW-104
-- UOW-303
+- M1-T04
+- M3-T03
 
 Acceptance criteria:
 
@@ -775,7 +781,7 @@ Test evidence:
 
 - duplicate and conflict-path tests
 
-### UOW-305: Implement strict-read fence
+### M3-T05: Implement strict-read fence
 
 Goal:
 
@@ -783,8 +789,8 @@ Goal:
 
 Blocked by:
 
-- UOW-206
-- UOW-303
+- M2-T06
+- M3-T03
 
 Acceptance criteria:
 
@@ -794,7 +800,7 @@ Test evidence:
 
 - read-fence tests
 
-### UOW-306: Implement indefinite-outcome retry behavior
+### M3-T06: Implement indefinite-outcome retry behavior
 
 Goal:
 
@@ -802,7 +808,7 @@ Goal:
 
 Blocked by:
 
-- UOW-304
+- M3-T04
 
 Acceptance criteria:
 
@@ -817,7 +823,7 @@ Test evidence:
 
 ## M4: Deterministic Simulation
 
-### SPIKE-401: Simulation harness experiment
+### M4-S01: Simulation harness experiment
 
 Goal:
 
@@ -825,8 +831,8 @@ Goal:
 
 Blocked by:
 
-- UOW-000
-- UOW-303
+- M0-T01
+- M3-T03
 
 Acceptance criteria:
 
@@ -838,7 +844,7 @@ Test evidence:
 
 - focused experiment output
 
-### UOW-401: Build simulated slot driver
+### M4-T01: Build simulated slot driver
 
 Goal:
 
@@ -846,8 +852,8 @@ Goal:
 
 Blocked by:
 
-- UOW-303
-- SPIKE-401
+- M3-T03
+- M4-S01
 
 Acceptance criteria:
 
@@ -857,7 +863,7 @@ Test evidence:
 
 - simulator tests with reproducible seeds
 
-### UOW-402: Inject crash points
+### M4-T02: Inject crash points
 
 Goal:
 
@@ -865,8 +871,8 @@ Goal:
 
 Blocked by:
 
-- UOW-206
-- UOW-401
+- M2-T06
+- M4-T01
 
 Acceptance criteria:
 
@@ -877,7 +883,7 @@ Test evidence:
 
 - crash-seed regression tests
 
-### UOW-403: Inject storage faults
+### M4-T03: Inject storage faults
 
 Goal:
 
@@ -885,9 +891,9 @@ Goal:
 
 Blocked by:
 
-- UOW-203
-- UOW-205
-- UOW-401
+- M2-T03
+- M2-T05
+- M4-T01
 
 Acceptance criteria:
 
@@ -897,7 +903,7 @@ Test evidence:
 
 - storage fault-injection tests
 
-### UOW-404: Add seeded schedule exploration
+### M4-T04: Add seeded schedule exploration
 
 Goal:
 
@@ -905,7 +911,7 @@ Goal:
 
 Blocked by:
 
-- UOW-401
+- M4-T01
 
 Acceptance criteria:
 
@@ -917,7 +923,7 @@ Test evidence:
 
 ## M5: Single-Node Alpha
 
-### UOW-501: Add minimal API surface
+### M5-T01: Add minimal API surface
 
 Goal:
 
@@ -925,7 +931,7 @@ Goal:
 
 Blocked by:
 
-- UOW-306
+- M3-T06
 
 Acceptance criteria:
 
@@ -936,7 +942,7 @@ Test evidence:
 
 - API integration tests
 
-### UOW-502: Add metrics and health signals
+### M5-T02: Add metrics and health signals
 
 Goal:
 
@@ -944,8 +950,8 @@ Goal:
 
 Blocked by:
 
-- UOW-302
-- UOW-403
+- M3-T02
+- M4-T03
 
 Acceptance criteria:
 
@@ -959,7 +965,7 @@ Test evidence:
 
 - metrics integration tests
 
-### UOW-503: Add benchmark harness
+### M5-T03: Add benchmark harness
 
 Goal:
 
@@ -967,7 +973,7 @@ Goal:
 
 Blocked by:
 
-- UOW-501
+- M5-T01
 
 Acceptance criteria:
 
@@ -977,7 +983,7 @@ Test evidence:
 
 - documented benchmark runs
 
-### UOW-504: Write operator runbook
+### M5-T04: Write operator runbook
 
 Goal:
 
@@ -985,7 +991,7 @@ Goal:
 
 Blocked by:
 
-- UOW-502
+- M5-T02
 
 Acceptance criteria:
 
@@ -997,7 +1003,7 @@ Test evidence:
 
 ## M6: Replication Design Gate
 
-### UOW-601: Expand replication protocol notes
+### M6-T01: Expand replication protocol notes
 
 Goal:
 
@@ -1016,7 +1022,7 @@ Test evidence:
 
 - design review only
 
-### UOW-602: Define replicated simulation plan
+### M6-T02: Define replicated simulation plan
 
 Goal:
 
@@ -1024,7 +1030,7 @@ Goal:
 
 Blocked by:
 
-- UOW-601
+- M6-T01
 
 Acceptance criteria:
 
@@ -1034,7 +1040,7 @@ Test evidence:
 
 - design review only
 
-### UOW-603: Define Jepsen validation plan
+### M6-T03: Define Jepsen validation plan
 
 Goal:
 
@@ -1042,7 +1048,7 @@ Goal:
 
 Blocked by:
 
-- UOW-601
+- M6-T01
 
 Acceptance criteria:
 
@@ -1056,20 +1062,20 @@ Test evidence:
 
 If implementation starts immediately, the highest-value first slice is:
 
-1. UOW-000
-2. UOW-001
-3. UOW-002
-4. UOW-101
-5. SPIKE-101
-6. SPIKE-102
-7. UOW-102
-8. UOW-103
-9. UOW-104
-10. UOW-105
-11. UOW-107
-12. UOW-108
-13. UOW-109
-14. UOW-110
-15. UOW-111
+1. M0-T01
+2. M0-T02
+3. M0-T03
+4. M1-T01
+5. M1-S01
+6. M1-S02
+7. M1-T02
+8. M1-T03
+9. M1-T04
+10. M1-T05
+11. M1-T07
+12. M1-T08
+13. M1-T09
+14. M1-T10
+15. M1-T11
 
 That sequence yields the pure allocator core before any durability or API work.

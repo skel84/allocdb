@@ -1,11 +1,12 @@
 # Project Agents
 
-Primary Rust development guidance for this repository lives in
+Additional workspace-local Rust development guidance, when present, lives in
 [`.rust-skills/AGENTS.md`](./.rust-skills/AGENTS.md).
 
 Project-specific documentation starts at:
 
 - [`docs/README.md`](./docs/README.md)
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md)
 
 Project-specific design and engineering rules live in:
 
@@ -26,7 +27,7 @@ Project-specific design and engineering rules live in:
   when the behavior is exercised credibly.
 - Keep documentation up to date with the code and design. If a change affects behavior, invariants,
   failure modes, operational semantics, testing strategy, or implementation sequencing, update the
-  relevant docs in the same unit of work.
+  relevant docs in the same task or PR.
 - Keep [`docs/status.md`](./docs/status.md) current as the single-file progress snapshot for the
   repository. Update it whenever milestone state, implementation coverage, or the recommended next
   step materially changes.
@@ -39,6 +40,16 @@ Project-specific design and engineering rules live in:
   - `debug` for detailed execution traces useful in development
   - `trace` only for very high-volume diagnostic detail
 - Logging must be structured and purposeful. Do not add noisy logs that obscure signal or hide bugs.
+- After GitHub workflow setup, do substantive work on issue branches, not directly on `main`.
+- Every substantial change should link to a tracked GitHub issue or explicitly explain why it is
+  issue-less.
+- Keep each PR scoped to one planned task such as `M2-T08`, or one tightly related bundle small
+  enough to review in one pass.
+- Treat CodeRabbit as advisory but mandatory to triage. Apply correctness, safety, recovery, test,
+  and docs-alignment feedback by default; document why you reject suggestions that would weaken
+  determinism, boundedness, or trusted-core discipline.
+- After review-driven edits, rerun the relevant validation commands before considering the work
+  ready to merge.
 - As an LLM agent, iterate autonomously. Re-read the relevant code and docs, test your assumptions,
   self-check intermediate results, and keep pushing until the current goal is actually resolved.
 - Do not stop at the first plausible answer. Verify behavior, inspect the consequences of your

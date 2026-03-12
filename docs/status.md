@@ -3,6 +3,9 @@
 ## Current State
 
 - Phase: single-node v1 foundation
+- Planning IDs:
+  - tasks use `M#-T#`
+  - spikes use `M#-S#`
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
   - `M1` pure state machine: implemented
@@ -56,10 +59,12 @@
 
 ## Current Focus
 
-- tighten WAL/snapshot checkpoint coordination on top of the current recovery path
-- implement a safe truncation rule that preserves overlap through the previous checkpoint anchor
-- finish the remaining submission semantics around indefinite outcomes after write/sync failure
-- expose recovery status alongside the current queue-pressure and core-health signals
+- `M2-T08`: tighten WAL/snapshot checkpoint coordination on top of the current recovery path
+- `M2-T08`: implement a safe truncation rule that preserves overlap through the previous
+  checkpoint anchor
+- `M3-T06`: finish the remaining submission semantics around indefinite outcomes after write/sync
+  failure
+- `M5-T02`: expose recovery status alongside the current queue-pressure and core-health signals
 
 ## How To Check Progress
 
@@ -70,7 +75,7 @@
 
 ## Update Rule
 
-Update this file whenever a unit of work materially changes:
+Update this file whenever a task or milestone materially changes:
 
 - milestone completion state
 - implementation coverage

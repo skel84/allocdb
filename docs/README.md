@@ -27,6 +27,10 @@
 - [Testing Strategy](./testing.md)
 - [Engineering Design Overview](./design.md)
 
+## Repository Workflow
+
+- [Contributing Guide](../CONTRIBUTING.md)
+
 ## Source Style Docs
 
 - [TigerStyle Source](./tiger_style.md)
