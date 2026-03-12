@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 allocdb-core = { path = "../allocdb-core" }
+log = "0.4.28"
 
 [lints]
 workspace = true

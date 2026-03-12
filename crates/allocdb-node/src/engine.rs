@@ -12,6 +12,7 @@ use allocdb_core::snapshot_file::SnapshotFile;
 use allocdb_core::state_machine::AllocDb;
 use allocdb_core::wal::{Frame, RecordType};
 use allocdb_core::wal_file::{WalFile, WalFileError};
+use log::error;
 
 use crate::bounded_queue::{BoundedQueue, BoundedQueueError};
 
@@ -545,8 +546,10 @@ impl SingleNodeEngine {
     }
 
     fn halt_on_wal_error(&mut self, error: impl Into<WalFileError>) -> SubmissionError {
+        let error = error.into();
+        error!("halting engine on WAL error, accepting_writes set to false: {error:?}");
         self.accepting_writes = false;
-        SubmissionError::WalFile(error.into())
+        SubmissionError::WalFile(error)
     }
 
     fn take_injected_persist_failure(&mut self) -> Option<PersistFailurePhase> {
