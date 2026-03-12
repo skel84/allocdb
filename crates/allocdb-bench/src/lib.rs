@@ -25,9 +25,13 @@ const HOTSPOT_HISTORY_WINDOW_SLOTS: u64 = 4;
 const RETRY_TTL_SLOTS: u64 = 4;
 const RETRY_WINDOW_SLOTS: u64 = 4;
 const RETRY_HISTORY_WINDOW_SLOTS: u64 = 2;
+const RETRY_RESOURCE_HEADROOM: u32 = 8;
 const DEFAULT_MAX_COMMAND_BYTES: usize = 256;
 const DEFAULT_QUEUE_CAPACITY: u32 = 8;
 const DEFAULT_EXPIRATIONS_PER_TICK: u32 = 8;
+// Keep the benchmark harness safely local. Larger fixed-capacity tables can turn a bad CLI
+// invocation into multi-gigabyte allocations before the engine ever reports a useful error.
+const MAX_DERIVED_TABLE_CAPACITY: u32 = 65_536;
 const BENCH_CLIENT_ID: ClientId = ClientId(7);
 const RETRY_CONFLICT_RESOURCE_OFFSET: u128 = 1_000_000;
 static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -87,42 +91,103 @@ impl BenchmarkOptions {
     /// degenerate.
     pub fn validate(self) -> Result<(), BenchmarkError> {
         if self.hotspot_rounds == 0 {
-            return Err(BenchmarkError::InvalidOption {
-                option: "hotspot_rounds",
-                message: "must be greater than zero",
-            });
+            return Err(invalid_option(
+                "hotspot_rounds",
+                "must be greater than zero",
+            ));
         }
 
         if self.hotspot_contenders < 2 {
-            return Err(BenchmarkError::InvalidOption {
-                option: "hotspot_contenders",
-                message: "must be at least two contenders per round",
-            });
+            return Err(invalid_option(
+                "hotspot_contenders",
+                "must be at least two contenders per round",
+            ));
         }
 
         if self.retry_table_capacity == 0 {
-            return Err(BenchmarkError::InvalidOption {
-                option: "retry_table_capacity",
-                message: "must be greater than zero",
-            });
+            return Err(invalid_option(
+                "retry_table_capacity",
+                "must be greater than zero",
+            ));
         }
 
         if self.retry_duplicate_fanout == 0 {
-            return Err(BenchmarkError::InvalidOption {
-                option: "retry_duplicate_fanout",
-                message: "must be greater than zero",
-            });
+            return Err(invalid_option(
+                "retry_duplicate_fanout",
+                "must be greater than zero",
+            ));
         }
 
         if self.retry_full_rejection_attempts == 0 {
-            return Err(BenchmarkError::InvalidOption {
-                option: "retry_full_rejection_attempts",
-                message: "must be greater than zero",
-            });
+            return Err(invalid_option(
+                "retry_full_rejection_attempts",
+                "must be greater than zero",
+            ));
         }
+
+        validate_hotspot_derived_capacities(self)?;
+        validate_retry_derived_capacities(self)?;
 
         Ok(())
     }
+}
+
+fn validate_hotspot_derived_capacities(options: BenchmarkOptions) -> Result<(), BenchmarkError> {
+    let reservation_capacity = checked_hotspot_reservation_capacity(options.hotspot_rounds)
+        .ok_or_else(|| {
+            invalid_option(
+                "hotspot_rounds",
+                "overflows the derived reservation-table capacity",
+            )
+        })?;
+    if reservation_capacity > MAX_DERIVED_TABLE_CAPACITY {
+        return Err(invalid_option(
+            "hotspot_rounds",
+            format!(
+                "derives reservation-table capacity {reservation_capacity} beyond safe benchmark limit {MAX_DERIVED_TABLE_CAPACITY}"
+            ),
+        ));
+    }
+
+    let operation_capacity =
+        checked_hotspot_operation_capacity(options.hotspot_rounds, options.hotspot_contenders)
+            .ok_or_else(|| {
+                invalid_option(
+                    "hotspot_rounds/hotspot_contenders",
+                    "overflows the derived operation-table capacity",
+                )
+            })?;
+    if operation_capacity > MAX_DERIVED_TABLE_CAPACITY {
+        return Err(invalid_option(
+            "hotspot_rounds/hotspot_contenders",
+            format!(
+                "derives operation-table capacity {operation_capacity} beyond safe benchmark limit {MAX_DERIVED_TABLE_CAPACITY}"
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_retry_derived_capacities(options: BenchmarkOptions) -> Result<(), BenchmarkError> {
+    let resource_capacity = checked_retry_resource_capacity(options.retry_table_capacity)
+        .ok_or_else(|| {
+            invalid_option(
+                "retry_table_capacity",
+                "overflows the derived resource-table capacity",
+            )
+        })?;
+    if resource_capacity > MAX_DERIVED_TABLE_CAPACITY {
+        return Err(invalid_option(
+            "retry_table_capacity",
+            format!(
+                "must be at most {} so the derived resource-table capacity stays within safe benchmark limit {MAX_DERIVED_TABLE_CAPACITY}",
+                MAX_DERIVED_TABLE_CAPACITY - RETRY_RESOURCE_HEADROOM
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -258,7 +323,7 @@ impl fmt::Display for ScenarioReport {
 pub enum BenchmarkError {
     InvalidOption {
         option: &'static str,
-        message: &'static str,
+        message: String,
     },
     EngineOpen(EngineOpenError),
     Submission(SubmissionError),
@@ -293,6 +358,13 @@ impl fmt::Display for BenchmarkError {
 }
 
 impl std::error::Error for BenchmarkError {}
+
+fn invalid_option(option: &'static str, message: impl Into<String>) -> BenchmarkError {
+    BenchmarkError::InvalidOption {
+        option,
+        message: message.into(),
+    }
+}
 
 impl From<std::io::Error> for BenchmarkError {
     fn from(error: std::io::Error) -> Self {
@@ -414,6 +486,15 @@ fn run_high_retry_pressure(
     let elapsed = started.elapsed();
     let final_metrics = snapshot_metrics(&engine, retirement_slot);
     let wal_bytes_after_retirement = wal_len(&workspace.wal_path)?;
+    ensure_high_retry_pressure_invariants(
+        options,
+        pre_retire_metrics,
+        final_metrics,
+        wal_bytes_after_fill,
+        wal_bytes_after_retry_pressure,
+        wal_bytes_after_full_rejections,
+        wal_bytes_after_retirement,
+    )?;
 
     Ok(HighRetryPressureReport {
         elapsed,
@@ -440,13 +521,32 @@ fn run_high_retry_pressure(
     })
 }
 
+fn checked_hotspot_reservation_capacity(rounds: u32) -> Option<u32> {
+    rounds.checked_add(4)
+}
+
 fn hotspot_reservation_capacity(rounds: u32) -> u32 {
-    rounds.saturating_add(4)
+    checked_hotspot_reservation_capacity(rounds)
+        .expect("validated benchmark options must keep hotspot reservation capacity in range")
+}
+
+fn checked_hotspot_operation_capacity(rounds: u32, contenders_per_round: u32) -> Option<u32> {
+    let ops_per_round = contenders_per_round.checked_add(1)?;
+    rounds.checked_mul(ops_per_round)?.checked_add(9)
 }
 
 fn hotspot_operation_capacity(rounds: u32, contenders_per_round: u32) -> u32 {
-    let ops_per_round = contenders_per_round.saturating_add(1);
-    rounds.saturating_mul(ops_per_round).saturating_add(9)
+    checked_hotspot_operation_capacity(rounds, contenders_per_round)
+        .expect("validated benchmark options must keep hotspot operation capacity in range")
+}
+
+fn checked_retry_resource_capacity(table_capacity: u32) -> Option<u32> {
+    table_capacity.checked_add(RETRY_RESOURCE_HEADROOM)
+}
+
+fn retry_resource_capacity(table_capacity: u32) -> u32 {
+    checked_retry_resource_capacity(table_capacity)
+        .expect("validated benchmark options must keep retry resource capacity in range")
 }
 
 fn format_one_resource_many_contenders_report(
@@ -602,7 +702,7 @@ fn open_retry_engine(
 ) -> Result<SingleNodeEngine, BenchmarkError> {
     let config = Config {
         shard_id: 0,
-        max_resources: options.retry_table_capacity.saturating_add(8),
+        max_resources: retry_resource_capacity(options.retry_table_capacity),
         max_reservations: 1,
         max_operations: options.retry_table_capacity,
         max_ttl_slots: RETRY_TTL_SLOTS,
@@ -880,6 +980,69 @@ fn recover_after_retry_window(
         },
     )?;
     Ok(retirement_slot)
+}
+
+fn ensure_high_retry_pressure_invariants(
+    options: BenchmarkOptions,
+    pre_retire_metrics: MetricsSnapshot,
+    final_metrics: MetricsSnapshot,
+    wal_bytes_after_fill: u64,
+    wal_bytes_after_retry_pressure: u64,
+    wal_bytes_after_full_rejections: u64,
+    wal_bytes_after_retirement: u64,
+) -> Result<(), BenchmarkError> {
+    let scenario = ScenarioName::HighRetryPressure;
+    if pre_retire_metrics.operation_table_used != options.retry_table_capacity {
+        return Err(BenchmarkError::InvariantViolation {
+            scenario,
+            step: "fill-operation-table",
+            message: format!(
+                "expected the operation table to fill to {}, got {}",
+                options.retry_table_capacity, pre_retire_metrics.operation_table_used
+            ),
+        });
+    }
+
+    if wal_bytes_after_retry_pressure != wal_bytes_after_fill {
+        return Err(BenchmarkError::InvariantViolation {
+            scenario,
+            step: "retry-pressure-wal",
+            message: format!(
+                "expected retry-cache pressure not to grow the WAL, got {wal_bytes_after_fill} -> {wal_bytes_after_retry_pressure}"
+            ),
+        });
+    }
+
+    if wal_bytes_after_full_rejections <= wal_bytes_after_retry_pressure {
+        return Err(BenchmarkError::InvariantViolation {
+            scenario,
+            step: "operation-table-full-wal",
+            message: String::from("expected fresh full-table rejections to append to the WAL"),
+        });
+    }
+
+    if final_metrics.operation_table_used != 1 {
+        return Err(BenchmarkError::InvariantViolation {
+            scenario,
+            step: "post-retirement-utilization",
+            message: format!(
+                "expected only the post-window recovery operation to remain live, got {} entries",
+                final_metrics.operation_table_used
+            ),
+        });
+    }
+
+    if wal_bytes_after_retirement <= wal_bytes_after_full_rejections {
+        return Err(BenchmarkError::InvariantViolation {
+            scenario,
+            step: "post-retirement-wal",
+            message: format!(
+                "expected post-window recovery to append to the WAL, got {wal_bytes_after_full_rejections} -> {wal_bytes_after_retirement}"
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 fn submit_create_resource(

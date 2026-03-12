@@ -75,6 +75,8 @@
   - one-checkpoint WAL overlap and `snapshot_marker` retention for safe checkpoint replacement
 - Validation:
   - `cargo run -p allocdb-bench -- --scenario all`
+  - `cargo test -p allocdb-core repeated_removals_preserve_lookup_for_operation_like_hashes`
+  - `cargo test -p allocdb-core operation_table_utilization_drops_after_retry_window_retirement`
   - `scripts/preflight.sh`
 
 ## Current Focus

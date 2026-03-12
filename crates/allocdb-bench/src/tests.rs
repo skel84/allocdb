@@ -1,4 +1,7 @@
-use super::{BenchmarkOptions, ScenarioReport, ScenarioSelection, run_benchmarks};
+use super::{
+    BenchmarkError, BenchmarkOptions, MAX_DERIVED_TABLE_CAPACITY, ScenarioReport,
+    ScenarioSelection, run_benchmarks,
+};
 
 #[test]
 fn benchmark_options_reject_degenerate_values() {
@@ -19,6 +22,58 @@ fn benchmark_options_reject_degenerate_values() {
         ..BenchmarkOptions::default()
     };
     assert!(zero_retry_capacity.validate().is_err());
+
+    let zero_duplicate_fanout = BenchmarkOptions {
+        retry_duplicate_fanout: 0,
+        ..BenchmarkOptions::default()
+    };
+    assert!(zero_duplicate_fanout.validate().is_err());
+
+    let zero_rejection_attempts = BenchmarkOptions {
+        retry_full_rejection_attempts: 0,
+        ..BenchmarkOptions::default()
+    };
+    assert!(zero_rejection_attempts.validate().is_err());
+}
+
+#[test]
+fn benchmark_options_reject_oversized_derived_capacities() {
+    let oversized_hotspot = BenchmarkOptions {
+        hotspot_rounds: 1_024,
+        hotspot_contenders: 1_024,
+        ..BenchmarkOptions::default()
+    };
+    assert!(matches!(
+        oversized_hotspot.validate(),
+        Err(BenchmarkError::InvalidOption {
+            option: "hotspot_rounds/hotspot_contenders",
+            ..
+        })
+    ));
+
+    let overflowing_hotspot = BenchmarkOptions {
+        hotspot_contenders: u32::MAX,
+        ..BenchmarkOptions::default()
+    };
+    assert!(matches!(
+        overflowing_hotspot.validate(),
+        Err(BenchmarkError::InvalidOption {
+            option: "hotspot_rounds/hotspot_contenders",
+            ..
+        })
+    ));
+
+    let oversized_retry_capacity = BenchmarkOptions {
+        retry_table_capacity: MAX_DERIVED_TABLE_CAPACITY,
+        ..BenchmarkOptions::default()
+    };
+    assert!(matches!(
+        oversized_retry_capacity.validate(),
+        Err(BenchmarkError::InvalidOption {
+            option: "retry_table_capacity",
+            ..
+        })
+    ));
 }
 
 #[test]

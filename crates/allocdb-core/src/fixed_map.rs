@@ -197,8 +197,14 @@ impl<K: FixedKey, V> FixedMap<K, V> {
     }
 
     fn close_deletion_gap(&mut self, removed_bucket: usize) {
+        let trace_enabled = log::log_enabled!(log::Level::Trace);
         let mut gap = removed_bucket;
         let mut current = self.next_bucket(gap);
+        if trace_enabled {
+            log::trace!(
+                "close_deletion_gap: start removed_bucket={removed_bucket} gap={gap} current={current}"
+            );
+        }
 
         loop {
             match self
@@ -208,15 +214,38 @@ impl<K: FixedKey, V> FixedMap<K, V> {
                 .expect("bucket index must exist")
             {
                 Bucket::Empty => {
+                    if trace_enabled {
+                        log::trace!(
+                            "close_deletion_gap: inspect gap={gap} current={current} bucket=empty"
+                        );
+                    }
                     self.buckets[gap] = Bucket::Empty;
+                    if trace_enabled {
+                        log::trace!(
+                            "close_deletion_gap: exit removed_bucket={removed_bucket} final_gap={gap} current={current}"
+                        );
+                    }
                     break;
                 }
                 Bucket::Occupied { key, slot } => {
+                    let key_hash = key.hash64();
                     let ideal = self.bucket_index(key);
+                    let distance_current = self.probe_distance(ideal, current);
+                    let distance_gap = self.probe_distance(ideal, gap);
+                    if trace_enabled {
+                        log::trace!(
+                            "close_deletion_gap: inspect gap={gap} current={current} bucket=occupied key_hash={key_hash} slot={slot} ideal={ideal} distance_current={distance_current} distance_gap={distance_gap}"
+                        );
+                    }
                     // Keep scanning until the cluster ends. A key sitting in its ideal bucket does
                     // not terminate the repair because later wrapped keys can still probe through
                     // the current gap.
-                    if self.probe_distance(ideal, current) > self.probe_distance(ideal, gap) {
+                    if distance_current > distance_gap {
+                        if trace_enabled {
+                            log::trace!(
+                                "close_deletion_gap: move gap={gap} current={current} key_hash={key_hash} slot={slot} ideal={ideal} distance_current={distance_current} distance_gap={distance_gap}"
+                            );
+                        }
                         self.buckets[gap] = Bucket::Occupied { key, slot };
                         gap = current;
                     }
