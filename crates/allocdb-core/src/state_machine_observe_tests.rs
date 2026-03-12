@@ -130,6 +130,9 @@ fn health_metrics_report_due_expiration_backlog() {
     assert_eq!(due.last_request_slot, Some(Slot(2)));
     assert_eq!(due.logical_slot_lag, 3);
     assert_eq!(due.expiration_backlog, 1);
+    assert_eq!(due.operation_table_used, 2);
+    assert_eq!(due.operation_table_capacity, 16);
+    assert_eq!(due.operation_table_utilization_pct, 12);
 
     db.apply_internal(
         context(3, 5),
@@ -142,4 +145,7 @@ fn health_metrics_report_due_expiration_backlog() {
     let cleared = db.health_metrics(Slot(5));
     assert_eq!(cleared.logical_slot_lag, 0);
     assert_eq!(cleared.expiration_backlog, 0);
+    assert_eq!(cleared.operation_table_used, 2);
+    assert_eq!(cleared.operation_table_capacity, 16);
+    assert_eq!(cleared.operation_table_utilization_pct, 12);
 }

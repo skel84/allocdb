@@ -11,6 +11,9 @@ pub struct HealthMetrics {
     pub last_request_slot: Option<Slot>,
     pub logical_slot_lag: u64,
     pub expiration_backlog: u32,
+    pub operation_table_used: u32,
+    pub operation_table_capacity: u32,
+    pub operation_table_utilization_pct: u8,
 }
 
 impl AllocDb {
@@ -115,14 +118,25 @@ impl AllocDb {
     ///
     /// # Panics
     ///
-    /// Panics only if internal state has already violated the configured reservation bound.
+    /// Panics only if internal state has already violated the configured reservation or operation
+    /// bounds.
     #[must_use]
     pub fn health_metrics(&self, current_wall_clock_slot: Slot) -> HealthMetrics {
+        let operation_table_used =
+            u32::try_from(self.operations.len()).expect("operation table len must fit u32");
+        let operation_table_capacity = self.config.max_operations;
+        let operation_table_utilization_pct =
+            u8::try_from(operation_table_used.saturating_mul(100) / operation_table_capacity)
+                .expect("operation table utilization percent must fit u8");
+
         HealthMetrics {
             last_applied_lsn: self.last_applied_lsn,
             last_request_slot: self.last_request_slot,
             logical_slot_lag: self.logical_slot_lag(current_wall_clock_slot),
             expiration_backlog: self.expiration_backlog(current_wall_clock_slot),
+            operation_table_used,
+            operation_table_capacity,
+            operation_table_utilization_pct,
         }
     }
 }

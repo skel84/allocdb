@@ -48,12 +48,14 @@ Current observability surface:
   product needs read-version preconditions beyond reservation identity
 - classify torn EOF tails separately from durable-log corruption in every recovery path
 - expose logical slot lag and expiration backlog through a bounded health snapshot
+- expose operation-table utilization so dedupe-window pressure is visible before hard rejection
 - expose queue depth and write-acceptance state through the single-node engine wrapper
 
 Next hardening steps before alpha are:
 
+- formalize snapshot-safe WAL truncation with an overlapping checkpoint rule
 - surface recovery status alongside the current lag and backlog signals
-- tighten checkpoint coordination between snapshot creation and WAL truncation
+- preserve definite-vs-indefinite submission categories in the external wire protocol
 
 ## Dependency Policy
 

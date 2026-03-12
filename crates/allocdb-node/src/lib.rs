@@ -3,5 +3,6 @@ pub mod engine;
 
 pub use engine::{
     EngineConfig, EngineConfigError, EngineMetrics, EngineOpenError, EnqueueResult, ReadError,
-    RecoverEngineError, SingleNodeEngine, SubmissionError, SubmissionResult,
+    RecoverEngineError, SingleNodeEngine, SubmissionError, SubmissionErrorCategory,
+    SubmissionResult,
 };

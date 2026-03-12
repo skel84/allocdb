@@ -668,6 +668,31 @@ Test evidence:
 
 - torn-tail tests and mid-log corruption tests
 
+### UOW-208: Add safe checkpoint coordination and WAL truncation rules
+
+Goal:
+
+- coordinate snapshot replacement and WAL retention so recovery always has overlapping durable
+  history
+
+Blocked by:
+
+- UOW-205
+- UOW-206
+- UOW-207
+
+Acceptance criteria:
+
+- checkpoint metadata makes the active snapshot anchor explicit
+- any WAL truncation preserves overlap through the previously successful snapshot anchor
+- crash during snapshot replacement or WAL rewrite remains recoverable
+- the implementation either rewrites WAL prefixes safely or introduces segmented retention; it does
+  not pretend suffix truncation solves prefix-retention needs
+
+Test evidence:
+
+- checkpoint crash/restart tests and retained-history recovery tests
+
 ## M3: Submission Pipeline
 
 ### UOW-301: Implement command envelope validation
@@ -783,6 +808,8 @@ Acceptance criteria:
 
 - no duplicate execution occurs for the same `operation_id`
 - ambiguity is resolved within retention only
+- submission failures distinguish definite pre-commit rejection from indefinite post-write
+  ambiguity
 
 Test evidence:
 
@@ -926,6 +953,7 @@ Acceptance criteria:
   core
 - expiration backlog and recovery status are visible
 - queue pressure is visible
+- operation-table utilization is visible before `operation_table_full`
 
 Test evidence:
 

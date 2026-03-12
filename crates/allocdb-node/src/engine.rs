@@ -109,9 +109,27 @@ pub enum SubmissionError {
     WalFile(WalFileError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubmissionErrorCategory {
+    DefiniteFailure,
+    Indefinite,
+}
+
 impl From<WalFileError> for SubmissionError {
     fn from(error: WalFileError) -> Self {
         Self::WalFile(error)
+    }
+}
+
+impl SubmissionError {
+    #[must_use]
+    pub fn category(&self) -> SubmissionErrorCategory {
+        match self {
+            Self::EngineHalted | Self::WalFile(_) => SubmissionErrorCategory::Indefinite,
+            Self::InvalidRequest(_) | Self::CommandTooLarge { .. } | Self::Overloaded { .. } => {
+                SubmissionErrorCategory::DefiniteFailure
+            }
+        }
     }
 }
 

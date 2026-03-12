@@ -158,6 +158,7 @@ Deliverables:
 - snapshot format
 - replay path using the same apply logic
 - corruption and torn-tail handling
+- checkpoint coordination and safe WAL truncation rules
 - decisions from the WAL spike folded into the implementation
 
 Exit criteria:
@@ -165,6 +166,7 @@ Exit criteria:
 - live apply and replay produce identical results
 - crash-recovery tests pass
 - corrupted or torn local state fails closed
+- snapshot/WAL coordination preserves overlapping durable history across checkpoint replacement
 
 ### M3: Submission Pipeline
 
@@ -218,6 +220,7 @@ Deliverables:
 - metrics and health signals
 - benchmark harness
 - operator runbook
+- explicit wire-level mapping for definite vs indefinite submission failures
 
 Exit criteria:
 

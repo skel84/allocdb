@@ -155,6 +155,7 @@ Required operational signals:
 
 - `logical_slot_lag = max(0, current_wall_clock_slot - last_request_slot)`
 - expiration backlog, for example the number of due expirations not yet applied
+- `operation_table_utilization`, so dedupe-window pressure is visible before `operation_table_full`
 
 Current implementation anchor:
 

@@ -91,6 +91,27 @@ If a WAL tail is torn after crash, recovery truncates at the last valid frame bo
 If recovery detects a checksum or framing error before EOF, the node fails closed and surfaces the
 corruption instead of rewriting the WAL.
 
+## Checkpoint Coordination
+
+Current behavior:
+
+- recovery loads the latest snapshot first
+- replay skips WAL frames at or below the snapshot's `last_applied_lsn`
+- snapshot writing is atomic at the file level through temp-file, fsync, and rename discipline
+
+Current limitation:
+
+- the system does not yet perform snapshot-driven WAL prefix truncation after a successful
+  checkpoint
+- because the current WAL implementation is one file, safe truncation requires either a prefix
+  rewrite or segmented WAL files; suffix truncation is not enough
+
+Required follow-up rule:
+
+- any future checkpoint truncation must leave overlapping history through the previously successful
+  snapshot anchor, so a crash during or after snapshot replacement never strands recovery without a
+  durable path back to the latest stable checkpoint
+
 ## Design Notes
 
 - the WAL is the source of truth

@@ -18,8 +18,9 @@
   - `1583d67` `Use fixed-capacity maps in allocator core`
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
-  - current validated chunk: `allocdb-node` single-node engine with bounded queue, request
-    validation, sequencing, retry-cache lookup, strict read fence, and restart recovery
+  - `82cb8d8` `Add single-node submission engine crate`
+  - current validated chunk: explicit submission error categories and dedupe-window utilization
+    signal
 
 ## What Exists
 
@@ -30,7 +31,8 @@
   - bounded reservation and operation retirement queues
   - bounded timing-wheel expiration index
   - `create_resource`, `reserve`, `confirm`, `release`, `expire`
-  - bounded health snapshot with logical slot lag and expiration backlog
+  - bounded health snapshot with logical slot lag, expiration backlog, and operation-table
+    utilization
 - In-process submission engine:
   - typed and encoded request validation before commit
   - bounded submission queue with deterministic overload behavior
@@ -38,6 +40,7 @@
   - pre-sequencing duplicate lookup for applied and already-queued `operation_id`
   - strict-read fence by applied LSN
   - restart path from snapshot plus WAL
+  - explicit definite-vs-indefinite submission error categorization
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -54,6 +57,7 @@
 ## Current Focus
 
 - tighten WAL/snapshot checkpoint coordination on top of the current recovery path
+- implement a safe truncation rule that preserves overlap through the previous checkpoint anchor
 - finish the remaining submission semantics around indefinite outcomes after write/sync failure
 - expose recovery status alongside the current queue-pressure and core-health signals
 

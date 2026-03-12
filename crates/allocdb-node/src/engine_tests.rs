@@ -8,9 +8,11 @@ use allocdb_core::command_codec::{CommandCodecError, encode_client_request};
 use allocdb_core::config::Config;
 use allocdb_core::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use allocdb_core::result::ResultCode;
+use allocdb_core::wal_file::WalFileError;
 
 use crate::engine::{
     EngineConfig, EngineConfigError, EnqueueResult, ReadError, SingleNodeEngine, SubmissionError,
+    SubmissionErrorCategory,
 };
 
 fn test_path(name: &str) -> PathBuf {
@@ -77,6 +79,7 @@ fn encoded_submission_rejects_malformed_payload_before_commit() {
     let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
 
     let error = engine.submit_encoded(Slot(1), &[1, 2, 3]).unwrap_err();
+    assert_eq!(error.category(), SubmissionErrorCategory::DefiniteFailure);
     assert!(matches!(
         error,
         SubmissionError::InvalidRequest(CommandCodecError::BufferTooShort)
@@ -102,6 +105,7 @@ fn oversized_submission_is_rejected_before_commit() {
 
     let request = create(11, 1);
     let error = engine.submit(Slot(1), request).unwrap_err();
+    assert_eq!(error.category(), SubmissionErrorCategory::DefiniteFailure);
     assert!(matches!(
         error,
         SubmissionError::CommandTooLarge {
@@ -131,6 +135,7 @@ fn enqueue_respects_bounded_queue_capacity() {
     let second = engine.enqueue_client(Slot(1), create(12, 2)).unwrap_err();
 
     assert_eq!(first, EnqueueResult::Queued);
+    assert_eq!(second.category(), SubmissionErrorCategory::DefiniteFailure);
     assert!(matches!(
         second,
         SubmissionError::Overloaded {
@@ -355,4 +360,24 @@ fn recover_restores_state_and_retry_cache() {
 
     fs::remove_file(wal_path).unwrap();
     let _ = fs::remove_file(snapshot_path);
+}
+
+#[test]
+fn submission_errors_have_explicit_indefinite_category() {
+    assert_eq!(
+        SubmissionError::EngineHalted.category(),
+        SubmissionErrorCategory::Indefinite
+    );
+    assert_eq!(
+        SubmissionError::WalFile(WalFileError::Io(std::io::Error::other("boom"))).category(),
+        SubmissionErrorCategory::Indefinite
+    );
+    assert_eq!(
+        SubmissionError::Overloaded {
+            queue_depth: 1,
+            queue_capacity: 2,
+        }
+        .category(),
+        SubmissionErrorCategory::DefiniteFailure
+    );
 }

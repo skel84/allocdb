@@ -351,6 +351,13 @@ The v1 rule is:
 - the server never invents a fresh second execution for the same `operation_id`
 - the server does not promise to resolve ambiguity after dedupe retention has expired
 
+Current single-node engine rule:
+
+- malformed request, payload-too-large, and overload errors are definite pre-commit failures
+- WAL write failure and engine-halted errors are indefinite submission failures
+- the future wire protocol must preserve that distinction explicitly instead of flattening all
+  submission errors into one generic failure class
+
 This is the practical meaning of reliable submission in v1. It keeps command handling bounded
 without pretending that transport failures do not exist.
 
