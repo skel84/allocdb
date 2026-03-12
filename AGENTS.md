@@ -56,6 +56,9 @@ Project-specific design and engineering rules live in:
   determinism, boundedness, or trusted-core discipline.
 - After review-driven edits, rerun the relevant validation commands before considering the work
   ready to merge.
+- Keep PR comments concise. For review follow-ups, state what changed and which validation command
+  was rerun, but do not paste raw command output into PR comments unless the failure output or
+  specific lines are themselves important.
 - As an LLM agent, iterate autonomously. Re-read the relevant code and docs, test your assumptions,
   self-check intermediate results, and keep pushing until the current goal is actually resolved.
 - Do not stop at the first plausible answer. Verify behavior, inspect the consequences of your
