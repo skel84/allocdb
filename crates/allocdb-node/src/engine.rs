@@ -217,6 +217,7 @@ impl StartupRecovery {
 pub(crate) enum PersistFailurePhase {
     BeforeAppend,
     AfterAppend,
+    Sync,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -759,6 +760,16 @@ impl SingleNodeEngine {
             ));
         }
 
+        if injected_failure == Some(PersistFailurePhase::Sync) {
+            return Err(self.halt_on_wal_error(
+                operation_id,
+                pending.request_slot,
+                applied_lsn,
+                "sync",
+                std::io::Error::other("injected WAL sync failure"),
+            ));
+        }
+
         if let Err(error) = self.wal.sync() {
             return Err(self.halt_on_wal_error(
                 operation_id,
@@ -887,6 +898,15 @@ impl SingleNodeEngine {
                 applied_lsn,
                 "after_append_before_sync",
                 std::io::Error::other("injected WAL failure after append"),
+            ));
+        }
+
+        if injected_failure == Some(PersistFailurePhase::Sync) {
+            return Err(self.halt_on_internal_wal_error(
+                request_slot,
+                applied_lsn,
+                "sync",
+                std::io::Error::other("injected WAL sync failure"),
             ));
         }
 

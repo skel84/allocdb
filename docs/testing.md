@@ -105,6 +105,9 @@ regression coverage in `crates/allocdb-node/src/simulation_tests.rs`. The curren
 - seeded crash plans now interrupt the real engine at client submit/apply, checkpoint, and
   recovery boundaries, with restart tests covering post-sync submit replay, snapshot-written
   before WAL rewrite, and replay-interrupted recovery
+- one-shot storage-fault helpers now cover append-failure halts, sync-failure ambiguity,
+  checksum-mismatch fail-closed recovery, and torn-tail truncation against the real WAL and
+  restart path
 
 What to reuse in follow-up tasks:
 
@@ -112,6 +115,7 @@ What to reuse in follow-up tasks:
 - explicit slot advancement under test control
 - seeded scheduling for same-slot ready work
 - seeded one-shot crash plans over real engine and recovery boundaries
+- one-shot storage-fault helpers over live WAL writes and post-crash WAL mutation
 - restart helpers that reopen from snapshot plus WAL on disk
 
 What not to promote directly:
