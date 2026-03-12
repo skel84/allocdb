@@ -61,6 +61,8 @@ Rules:
 Current implementation anchor:
 
 - `allocdb_node::SingleNodeEngine` in `crates/allocdb-node/src/engine.rs`
+- `allocdb_node::api` in `crates/allocdb-node/src/api.rs` for the current transport-neutral alpha
+  request/response boundary
 
 ## Read Path
 

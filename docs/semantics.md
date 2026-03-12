@@ -5,6 +5,8 @@
 This document defines the v1 data model, command semantics, consistency model, and product-level
 API rules.
 
+For the current transport-neutral alpha request/response surface, see [api.md](./api.md).
+
 ## Core Concepts
 
 ### Resource

@@ -24,8 +24,8 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: recovery-status and checkpoint-health signals through the node
-    metrics surface
+  - current validated chunk: transport-neutral alpha API surface with submit, read, and metrics
+    request/response handling
 
 ## What Exists
 
@@ -49,6 +49,12 @@
   - explicit restart-and-retry handling for ambiguous WAL failures within the dedupe window
   - node-level metrics for queue pressure, write acceptance, startup recovery status, and active
     snapshot anchor
+- Alpha API surface:
+  - transport-neutral request and response types in `crates/allocdb-node::api`
+  - binary request and response codec with fixed-width little-endian encoding
+  - explicit wire-level mapping for definite vs indefinite submission failures
+  - strict-read fence responses for resource and reservation queries
+  - metrics exposure through the same API boundary
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -63,9 +69,9 @@
 
 ## Current Focus
 
-- `M5-T01`: expose the minimal single-node alpha API on top of the completed submission layer
-- open the next tracked issue for `M5-T01` and keep the wire-level error mapping explicit
-- prepare the wire/API mapping for definite-vs-indefinite submission failures
+- `M5-T03`: add the benchmark harness for contention and boundedness behavior
+- open the next tracked issue for `M5-T03`
+- follow with `M5-T04` operator runbook once benchmark and fault-run evidence is available
 
 ## How To Check Progress
 
