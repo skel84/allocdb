@@ -10,6 +10,7 @@ use allocdb_core::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, Res
 use allocdb_core::result::ResultCode;
 use allocdb_core::wal_file::WalFileError;
 
+use super::PersistFailurePhase;
 use crate::engine::{
     EngineConfig, EngineConfigError, EnqueueResult, ReadError, SingleNodeEngine, SubmissionError,
     SubmissionErrorCategory,
@@ -380,4 +381,92 @@ fn submission_errors_have_explicit_indefinite_category() {
         .category(),
         SubmissionErrorCategory::DefiniteFailure
     );
+}
+
+#[test]
+fn retry_after_failed_pre_append_attempt_executes_once_after_recovery() {
+    let wal_path = test_path("retry-after-pre-append-failure");
+    let snapshot_path = wal_path.with_extension("snapshot");
+
+    {
+        let mut live = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+        live.inject_next_persist_failure(PersistFailurePhase::BeforeAppend);
+
+        let error = live.submit(Slot(1), create(11, 1)).unwrap_err();
+        assert_eq!(error.category(), SubmissionErrorCategory::Indefinite);
+        assert!(matches!(error, SubmissionError::WalFile(_)));
+        assert!(!live.metrics(Slot(1)).accepting_writes);
+        assert!(matches!(
+            live.submit(Slot(2), create(11, 1)),
+            Err(SubmissionError::EngineHalted)
+        ));
+        assert_eq!(fs::metadata(&wal_path).unwrap().len(), 0);
+    }
+
+    let mut recovered =
+        SingleNodeEngine::recover(core_config(), engine_config(), &snapshot_path, &wal_path)
+            .unwrap();
+    let retry = recovered.submit(Slot(2), create(11, 1)).unwrap();
+
+    assert!(!retry.from_retry_cache);
+    assert_eq!(retry.applied_lsn, Lsn(1));
+    assert_eq!(retry.outcome.result_code, ResultCode::Ok);
+    assert!(recovered.db().resource(ResourceId(11)).is_some());
+    assert!(fs::metadata(&wal_path).unwrap().len() > 0);
+
+    fs::remove_file(wal_path).unwrap();
+    let _ = fs::remove_file(snapshot_path);
+}
+
+#[test]
+fn retry_after_failed_post_append_attempt_returns_cached_result_after_recovery() {
+    let wal_path = test_path("retry-after-post-append-failure");
+    let snapshot_path = wal_path.with_extension("snapshot");
+
+    let persisted_wal_len = {
+        let mut live = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+        live.inject_next_persist_failure(PersistFailurePhase::AfterAppend);
+
+        let error = live.submit(Slot(1), create(11, 1)).unwrap_err();
+        assert_eq!(error.category(), SubmissionErrorCategory::Indefinite);
+        assert!(matches!(error, SubmissionError::WalFile(_)));
+        assert!(!live.metrics(Slot(1)).accepting_writes);
+        fs::metadata(&wal_path).unwrap().len()
+    };
+
+    assert!(persisted_wal_len > 0);
+
+    let mut recovered =
+        SingleNodeEngine::recover(core_config(), engine_config(), &snapshot_path, &wal_path)
+            .unwrap();
+    assert!(recovered.db().resource(ResourceId(11)).is_some());
+
+    let retry = recovered.submit(Slot(2), create(11, 1)).unwrap();
+
+    assert!(retry.from_retry_cache);
+    assert_eq!(retry.applied_lsn, Lsn(1));
+    assert_eq!(retry.outcome.result_code, ResultCode::Ok);
+    assert_eq!(fs::metadata(&wal_path).unwrap().len(), persisted_wal_len);
+
+    fs::remove_file(wal_path).unwrap();
+    let _ = fs::remove_file(snapshot_path);
+}
+
+#[test]
+fn retry_resolution_is_only_guaranteed_within_the_dedupe_window() {
+    let wal_path = test_path("retry-window-expiry");
+    let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+
+    let first = engine.submit(Slot(1), create(11, 1)).unwrap();
+    let wal_len = fs::metadata(&wal_path).unwrap().len();
+    let retried_after_expiry = engine.submit(Slot(30), create(12, 1)).unwrap();
+
+    assert_eq!(first.outcome.result_code, ResultCode::Ok);
+    assert_eq!(retried_after_expiry.outcome.result_code, ResultCode::Ok);
+    assert!(!retried_after_expiry.from_retry_cache);
+    assert_eq!(retried_after_expiry.applied_lsn, Lsn(2));
+    assert!(engine.db().resource(ResourceId(12)).is_some());
+    assert!(fs::metadata(&wal_path).unwrap().len() > wal_len);
+
+    fs::remove_file(wal_path).unwrap();
 }

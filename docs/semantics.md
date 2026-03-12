@@ -354,7 +354,14 @@ The v1 rule is:
 Current single-node engine rule:
 
 - malformed request, payload-too-large, and overload errors are definite pre-commit failures
-- WAL write failure and engine-halted errors are indefinite submission failures
+- WAL write failure halts the live engine and is an indefinite submission failure
+- after a WAL-path failure, the live engine refuses further writes with `engine_halted`
+- clients resolve that ambiguity by recovering the node, then retrying the same `operation_id`
+- if the failed attempt reached durable WAL, the retry returns the original stored result
+- if the failed attempt did not reach durable WAL, the retry executes once as a fresh command
+- `engine_halted` remains an indefinite submission failure because the halted node refuses to claim
+  whether a prior ambiguous write committed
+- the retry contract only holds while the dedupe retention window is still open
 - the future wire protocol must preserve that distinction explicitly instead of flattening all
   submission errors into one generic failure class
 
