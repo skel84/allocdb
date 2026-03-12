@@ -29,7 +29,9 @@
     sequencing paths, including deterministic pre-commit overflow rejection for request slots,
     fail-closed replay rejection for overflowed WAL commands, restart coverage for post-sync
     submit replay and replay-interrupted recovery, and explicit `next_lsn` exhaustion handling
-    after `u64::MAX`
+    after `u64::MAX`, plus deterministic storage-fault injection for append failures,
+    sync-failure ambiguity, checksum-mismatch fail-closed recovery, and torn-tail truncation over
+    the real WAL restart path
 
 ## What Exists
 
@@ -95,10 +97,14 @@
   - seeded same-slot ready-set scheduling with reproducible transcripts
   - seeded one-shot crash plans over named client-submit, internal-apply, checkpoint, and
     recovery boundaries
-  - checkpoint, restart, and injected persist-failure helpers over the real `SingleNodeEngine`
+  - one-shot storage fault helpers over append failure, sync failure, checksum mismatch, and
+    torn-tail WAL mutation against real on-disk recovery
+  - checkpoint, restart, and live write-fault helpers over the real `SingleNodeEngine`
   - regression coverage for crash-selected post-sync submit replay, crash-after-snapshot-write
-    checkpoint recovery, and replay-interrupted recovery restart
+    checkpoint recovery, replay-interrupted recovery restart, sync-failure retry recovery,
+    checksum-corruption fail-closed restart, and torn-tail truncation retry
 - Validation:
+  - `cargo test -p allocdb-core wal -- --nocapture`
   - `cargo test -p allocdb-core snapshot -- --nocapture`
   - `cargo test -p allocdb-core recovery -- --nocapture`
   - `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
@@ -110,10 +116,10 @@
 
 ## Current Focus
 
-- `M4-T03`: extend the same seeded simulation driver with storage-fault coverage for torn writes,
-  checksum mismatch, and sync failures
-- keep the operator runbook aligned as new simulation and storage-fault evidence lands
-- keep `M4-T02` regression coverage green while broadening the fault matrix
+- `M4-T04`: extend the seeded simulation driver with reproducible schedule exploration over
+  ingress order, expiration order, and retry timing
+- keep `M4-T02` and `M4-T03` regression coverage green while broadening the schedule matrix
+- keep the operator runbook and testing notes aligned as new simulation evidence lands
 
 ## How To Check Progress
 
