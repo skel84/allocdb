@@ -29,8 +29,8 @@
 
 ## What Exists
 
- - Trusted-core crate: `crates/allocdb-core`
- - Single-node wrapper crate: `crates/allocdb-node`
+- Trusted-core crate: `crates/allocdb-core`
+- Single-node wrapper crate: `crates/allocdb-node`
 - In-memory deterministic allocator:
   - deterministic fixed-capacity open-addressed resource, reservation, and operation tables
   - bounded reservation and operation retirement queues

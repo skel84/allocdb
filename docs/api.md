@@ -26,6 +26,9 @@ The alpha API is available through:
 - `allocdb_node::encode_response`
 - `allocdb_node::decode_response`
 
+The public request encoder is fallible. It returns `length_too_large` if a variable-length field
+cannot fit in the binary wire length prefix.
+
 `handle_api_bytes` is the transport-facing path:
 
 ```text

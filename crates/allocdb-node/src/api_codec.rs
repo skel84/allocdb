@@ -22,14 +22,19 @@ pub enum ApiCodecError {
     LengthTooLarge,
 }
 
-#[must_use]
-pub fn encode_request(request: &ApiRequest) -> Vec<u8> {
+/// Encodes one transport-neutral API request.
+///
+/// # Errors
+///
+/// Returns [`ApiCodecError::LengthTooLarge`] if a variable-length field cannot fit in the wire
+/// length prefix.
+pub fn encode_request(request: &ApiRequest) -> Result<Vec<u8>, ApiCodecError> {
     let mut bytes = Vec::new();
     match request {
         ApiRequest::Submit(request) => {
             bytes.push(1);
             bytes.extend_from_slice(&request.request_slot.get().to_le_bytes());
-            encode_bytes(&mut bytes, &request.payload);
+            encode_bytes(&mut bytes, &request.payload)?;
         }
         ApiRequest::GetResource(request) => {
             bytes.push(2);
@@ -47,7 +52,7 @@ pub fn encode_request(request: &ApiRequest) -> Vec<u8> {
             bytes.extend_from_slice(&request.current_wall_clock_slot.get().to_le_bytes());
         }
     }
-    bytes
+    Ok(bytes)
 }
 
 /// Decodes one transport-neutral API request.
@@ -424,10 +429,11 @@ fn encode_bool(bytes: &mut Vec<u8>, value: bool) {
     bytes.push(u8::from(value));
 }
 
-fn encode_bytes(bytes: &mut Vec<u8>, payload: &[u8]) {
-    let len = u32::try_from(payload.len()).expect("payload length must fit u32");
+fn encode_bytes(bytes: &mut Vec<u8>, payload: &[u8]) -> Result<(), ApiCodecError> {
+    let len = u32::try_from(payload.len()).map_err(|_| ApiCodecError::LengthTooLarge)?;
     bytes.extend_from_slice(&len.to_le_bytes());
     bytes.extend_from_slice(payload);
+    Ok(())
 }
 
 fn encode_submission_error_category(category: SubmissionErrorCategory) -> u8 {
