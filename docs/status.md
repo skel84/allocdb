@@ -12,7 +12,7 @@
   - `M1H` constant-time core hardening: complete
   - `M2` durability and recovery: implemented
   - `M3` submission pipeline: implemented
-  - `M4` simulation: not started
+  - `M4` simulation: in progress
   - `M5` single-node alpha surface: in progress
   - `M6` replication design: not started
 - Latest completed implementation chunks:
@@ -24,9 +24,9 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: deterministic benchmark harness for one-resource-many-contenders and
-    high-retry-pressure scenarios, including docs and invariant checks around retry-cache and
-    bounded operation-table behavior
+  - current validated chunk: deterministic simulated slot-driver support in `allocdb-node`,
+    including seeded same-slot scheduling, explicit logical-slot advancement, restart-path
+    regression coverage, and doc updates for the promoted simulation harness
 
 ## What Exists
 
@@ -73,7 +73,14 @@
   - explicit WAL command payload encoding and live-path replay recovery
   - checkpoint path that writes the new snapshot first, then rewrites retained WAL history
   - one-checkpoint WAL overlap and `snapshot_marker` retention for safe checkpoint replacement
+- Deterministic simulation support:
+  - reusable simulation harness in `crates/allocdb-node/src/simulation.rs`
+  - explicit simulated slot advancement under test control, with no wall-clock reads in the
+    exercised engine path
+  - seeded same-slot ready-set scheduling with reproducible transcripts
+  - checkpoint, restart, and injected persist-failure helpers over the real `SingleNodeEngine`
 - Validation:
+  - `cargo test -p allocdb-node simulation`
   - `cargo run -p allocdb-bench -- --scenario all`
   - `cargo test -p allocdb-core repeated_removals_preserve_lookup_for_operation_like_hashes`
   - `cargo test -p allocdb-core operation_table_utilization_drops_after_retry_window_retirement`
@@ -81,10 +88,10 @@
 
 ## Current Focus
 
-- `M5-T04`: write the operator runbook for startup, recovery, overload, and corruption handling
-- use benchmark harness evidence from `docs/benchmark-harness.md` to ground operator guidance
-- follow with `M4` deterministic simulation work after the single-node alpha evidence set is
-  documented
+- `M4-T02`: inject reproducible crash points around WAL, apply, snapshot, and recovery boundaries
+  on top of the promoted simulation harness
+- follow with `M4-T03` storage-fault coverage using the same deterministic driver
+- resume `M5-T04` operator guidance after the simulation evidence set is broader
 
 ## How To Check Progress
 

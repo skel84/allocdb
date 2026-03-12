@@ -1,6 +1,8 @@
 pub mod api;
 mod bounded_queue;
 pub mod engine;
+#[cfg(test)]
+pub(crate) mod simulation;
 
 pub use api::{
     ApiCodecError, ApiRequest, ApiResponse, InvalidRequestReason, MetricsRequest, MetricsResponse,

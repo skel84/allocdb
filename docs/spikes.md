@@ -123,8 +123,9 @@ Current chosen direction:
 
 Evidence gathered:
 
-- `crates/allocdb-node/src/experiments/simulation_harness_spike_tests.rs` runs the real engine
-  under seeded batch ordering and explicit slot advancement
+- `crates/allocdb-node/src/simulation.rs` and
+  `crates/allocdb-node/src/simulation_tests.rs` now carry the promoted harness shape selected by
+  the spike: the real engine, seeded same-slot ordering, and explicit slot advancement
 - the spike proves one restart path with checkpoint, logged expiration, injected WAL ambiguity, and
   recovery from snapshot plus WAL
 
@@ -143,8 +144,8 @@ Discard after the spike:
 
 Next step:
 
-- promote the chosen shape into reusable simulation test support during `M4-T01`, then add crash
-  point and storage-fault coverage on top of that support
+- add crash-point and storage-fault coverage on top of the promoted simulation support during
+  `M4-T02` and `M4-T03`
 
 ## Non-Approved Spike Areas
 
