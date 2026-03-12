@@ -11,6 +11,9 @@ use crate::retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
 mod apply;
 #[path = "state_machine_execution.rs"]
 mod execution;
+#[cfg(test)]
+#[path = "state_machine_issue_32_tests.rs"]
+mod issue_32_tests;
 #[path = "state_machine_metrics.rs"]
 mod metrics;
 #[cfg(test)]

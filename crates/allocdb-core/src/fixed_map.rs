@@ -213,13 +213,13 @@ impl<K: FixedKey, V> FixedMap<K, V> {
                 }
                 Bucket::Occupied { key, slot } => {
                     let ideal = self.bucket_index(key);
-                    if self.probe_distance(ideal, current) == 0 {
-                        self.buckets[gap] = Bucket::Empty;
-                        break;
+                    // Keep scanning until the cluster ends. A key sitting in its ideal bucket does
+                    // not terminate the repair because later wrapped keys can still probe through
+                    // the current gap.
+                    if self.probe_distance(ideal, gap) < self.probe_distance(ideal, current) {
+                        self.buckets[gap] = Bucket::Occupied { key, slot };
+                        gap = current;
                     }
-
-                    self.buckets[gap] = Bucket::Occupied { key, slot };
-                    gap = current;
                     current = self.next_bucket(current);
                 }
             }
@@ -277,6 +277,18 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct PositionedKey {
+        id: u64,
+        hash: u64,
+    }
+
+    impl FixedKey for PositionedKey {
+        fn hash64(self) -> u64 {
+            self.hash
+        }
+    }
+
     #[test]
     fn insert_get_and_remove_round_trip() {
         let mut map = FixedMap::with_capacity(4);
@@ -315,5 +327,24 @@ mod tests {
         assert_eq!(map.remove(CollidingKey(1)), Some(10));
         assert_eq!(map.get(CollidingKey(2)), Some(&20));
         assert_eq!(map.get(CollidingKey(3)), Some(&30));
+    }
+
+    #[test]
+    fn deletion_preserves_wrapped_probe_chain_past_home_bucket() {
+        let mut map = FixedMap::with_capacity(4);
+        let removed = PositionedKey { id: 1, hash: 6 };
+        let home = PositionedKey { id: 2, hash: 7 };
+        let wrapped = PositionedKey { id: 3, hash: 6 };
+        let displaced = PositionedKey { id: 4, hash: 0 };
+
+        map.insert(removed, 10).unwrap();
+        map.insert(home, 20).unwrap();
+        map.insert(wrapped, 30).unwrap();
+        map.insert(displaced, 40).unwrap();
+
+        assert_eq!(map.remove(removed), Some(10));
+        assert_eq!(map.get(home), Some(&20));
+        assert_eq!(map.get(wrapped), Some(&30));
+        assert_eq!(map.get(displaced), Some(&40));
     }
 }
