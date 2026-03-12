@@ -95,6 +95,26 @@ Test evidence:
 
 - docs review only
 
+### UOW-004: Decide version-guarded command semantics
+
+Goal:
+
+- decide whether v1 needs `conditional_confirm` or another version-guarded write surface
+
+Blocked by:
+
+- [semantics.md](./semantics.md)
+
+Acceptance criteria:
+
+- docs explain whether `reservation_id` already prevents the relevant ABA cases
+- if a version guard is adopted, the exact command shape and failure semantics are explicit
+- if deferred, the deferral rationale is written down explicitly
+
+Test evidence:
+
+- docs review only
+
 ## M1: Pure State Machine
 
 ### SPIKE-101: Fixed-capacity table experiment
@@ -363,6 +383,129 @@ Test evidence:
 
 - invariant tests and negative injected-state tests
 
+## M1H: Constant-Time Core Hardening
+
+### SPIKE-103: Fixed-capacity open-addressed table experiment
+
+Goal:
+
+- compare deterministic open-addressing shapes for the trusted-core lookup tables
+
+Blocked by:
+
+- M1 exit criteria
+
+Acceptance criteria:
+
+- probe strategy, tombstone policy, and resize-free behavior are compared explicitly
+- the experiment ends with one deterministic table design and a short rationale
+- spike output includes expected full-capacity failure behavior
+
+Test evidence:
+
+- focused experiment output or benchmark notes
+
+### UOW-112: Implement deterministic fixed-capacity hash-table primitive
+
+Goal:
+
+- add the shared open-addressed table primitive for the trusted core
+
+Blocked by:
+
+- SPIKE-103
+
+Acceptance criteria:
+
+- no randomized seeds are used
+- probe bounds are explicit and testable
+- full-capacity behavior fails explicitly
+
+Test evidence:
+
+- primitive unit tests for insert, lookup, replace, delete, and full-capacity behavior
+
+### UOW-113: Replace resource lookup with constant-time table access
+
+Goal:
+
+- remove binary-search and shifting-insert costs from resource lookup and update paths
+
+Blocked by:
+
+- UOW-112
+
+Acceptance criteria:
+
+- resource lookup is constant-time in the intended design
+- resource updates do not require shifting unrelated records
+
+Test evidence:
+
+- state-machine regression tests and table-focused unit tests
+
+### UOW-114: Replace reservation and operation lookup with constant-time table access
+
+Goal:
+
+- remove binary-search and shifting-insert costs from reservation and operation lookup paths
+
+Blocked by:
+
+- UOW-112
+
+Acceptance criteria:
+
+- reservation and operation lookup are constant-time in the intended design
+- duplicate-operation lookup no longer depends on sorted `Vec` order
+
+Test evidence:
+
+- state-machine regression tests and table-focused unit tests
+
+### UOW-115: Replace full-table retirement scans with ordered retirement draining
+
+Goal:
+
+- retire reservations and operation records in expiration order instead of using full-table
+  `retain` scans on every apply
+
+Blocked by:
+
+- UOW-114
+
+Acceptance criteria:
+
+- retirement work is proportional to expired entries
+- reservation retirement and operation dedupe retirement do not scan the whole lookup table
+- the ordering structure is bounded and deterministic
+
+Test evidence:
+
+- retirement regression tests and capacity-bound tests
+
+### UOW-116: Decide and implement version-guarded confirm handling
+
+Goal:
+
+- either add `conditional_confirm` or explicitly document why `confirm` remains keyed only by
+  `reservation_id`
+
+Blocked by:
+
+- UOW-004
+- UOW-108
+
+Acceptance criteria:
+
+- if implemented, version mismatch behavior is deterministic and tested
+- if deferred, the docs explain which stale-read races are already prevented by `reservation_id`
+  and which are intentionally unsupported in v1
+
+Test evidence:
+
+- docs review only, or state-machine tests if the command is added
+
 ## M2: Durability and Recovery
 
 ### SPIKE-201: WAL framing and torn-tail experiment
@@ -503,6 +646,27 @@ Acceptance criteria:
 Test evidence:
 
 - replay-equivalence tests
+
+### UOW-207: Distinguish torn tails from durable-log corruption
+
+Goal:
+
+- classify WAL recovery stop reasons so only EOF torn tails are auto-truncated
+
+Blocked by:
+
+- UOW-203
+- UOW-206
+
+Acceptance criteria:
+
+- incomplete EOF tails are classified as expected crash artifacts
+- checksum or framing failures in the middle of durable history fail closed
+- recovery surfaces the failure kind and byte offset clearly
+
+Test evidence:
+
+- torn-tail tests and mid-log corruption tests
 
 ## M3: Submission Pipeline
 
@@ -758,7 +922,10 @@ Blocked by:
 
 Acceptance criteria:
 
-- queue pressure, expiration lag, and recovery status are visible
+- `logical_slot_lag = current_wall_clock_slot - last_request_slot` is visible outside the trusted
+  core
+- expiration backlog and recovery status are visible
+- queue pressure is visible
 
 Test evidence:
 

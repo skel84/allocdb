@@ -6,6 +6,7 @@
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
   - `M1` pure state machine: implemented
+  - `M1H` constant-time core hardening: planned, not started
   - `M2` durability primitives: partially implemented
   - `M3+` submission pipeline, simulation, alpha hardening, replication design: not started
 - Latest completed implementation chunks:
@@ -35,9 +36,11 @@
 
 ## Current Focus
 
-- keep the trusted core split into reviewable modules
-- enforce architecture and size guardrails automatically
-- continue M2 with richer recovery cases or move into M3 submission/idempotent ingress
+- replace sorted `Vec` lookups with deterministic fixed-capacity open-addressed tables
+- separate lookup tables from retirement order so retirement work is proportional to expired items
+- harden WAL recovery to distinguish EOF torn tails from middle-of-log corruption
+- decide whether version-guarded `conditional_confirm` belongs in v1 or is deferred
+- define `logical_slot_lag` and expiration backlog as first-class operational signals
 
 ## How To Check Progress
 

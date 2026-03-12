@@ -83,7 +83,7 @@ Rules:
 
 - the scheduler never mutates allocation state directly
 - at most `MAX_EXPIRATIONS_PER_TICK` expirations are enqueued
-- lag must be observable
+- lag must be observable as an explicit metric outside the trusted core
 
 ## Time and TTL Model
 
@@ -142,6 +142,11 @@ Expected behavior under pressure:
 - new writes fail fast with `overloaded` or a more specific capacity error
 - reads remain available where possible
 - expirations may lag, but lag must be observable
+
+Required operational signals:
+
+- `logical_slot_lag = max(0, current_wall_clock_slot - last_request_slot)`
+- expiration backlog, for example the number of due expirations not yet applied
 
 Delayed expiration is acceptable. Premature reuse is not.
 

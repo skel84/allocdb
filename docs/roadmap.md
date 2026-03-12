@@ -13,9 +13,10 @@ The roadmap follows these rules:
 
 1. Freeze semantics before implementation invents behavior.
 2. Build the pure deterministic allocator before adding IO and transport.
-3. Prove recovery and boundedness before polishing APIs.
-4. Add simulation before distributed features.
-5. Start replication design only after the single-node core is credible.
+3. Remove prototype hot-path costs before calling the core production-grade.
+4. Prove recovery and boundedness before polishing APIs.
+5. Add simulation before distributed features.
+6. Start replication design only after the single-node core is credible.
 
 These principles follow:
 
@@ -57,6 +58,21 @@ Spike outputs must be:
 - documented with the decision they support
 
 See [spikes.md](./spikes.md).
+
+## Current Priority Adjustments
+
+Recent external review tightened the near-term plan in four ways:
+
+- the sorted `Vec` tables were acceptable for the first deterministic slice, but they are not the
+  intended production-grade shape
+- retirement work must stop scanning whole tables on every apply path
+- WAL recovery must distinguish an expected EOF torn tail from a genuine corruption event in the
+  middle of durable history
+- observability must expose logical executor lag explicitly, and the version field may justify a
+  version-guarded confirm API if the product wants read-modify-write protection beyond
+  `reservation_id`
+
+This feedback changes the order of work: core-table hardening comes before deeper M3 work.
 
 ## Milestones
 
@@ -106,6 +122,28 @@ Exit criteria:
 - state-machine tests cover all transitions
 - property tests prove no double allocation
 - capacity tests prove fail-fast behavior at bounds
+
+### M1H: Constant-Time Core Hardening
+
+Goal:
+
+- replace prototype table and retirement mechanics with production-grade constant-time structures
+
+Deliverables:
+
+- deterministic fixed-capacity open-addressed tables for resource, reservation, and operation
+  lookup
+- explicit retirement queues or equivalent ordered indexes so retirement work drains expired items
+  instead of scanning whole tables
+- measured probe-bound and full-capacity behavior documented by tests or focused experiments
+- decision on whether version-guarded `conditional_confirm` is required in v1
+
+Exit criteria:
+
+- resource, reservation, and operation lookup do not depend on binary search or shifting inserts
+- retirement work is proportional to expired entries, not table size
+- constant-time behavior remains deterministic at configured limits
+- the semantics decision for version-guarded confirm is explicit
 
 ### M2: Durability and Recovery
 
@@ -212,7 +250,7 @@ Exit criteria:
 The minimum dependency chain is:
 
 ```text
-M0 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6
+M0 -> M1 -> M1H -> M2 -> M3 -> M4 -> M5 -> M6
 ```
 
 Allowed overlap:
@@ -220,6 +258,8 @@ Allowed overlap:
 - docs can advance continuously
 - approved spikes can run ahead of their consuming milestone if they stay time-boxed and disposable
 - some M2 storage scaffolding can start during late M1
+- some M2 durability hardening can overlap with M1H when it does not reopen state-machine
+  semantics
 - some M5 API and metrics work can start during late M3
 
 Not allowed:
@@ -233,9 +273,10 @@ Suggested review points:
 
 1. end of M0: semantic freeze review
 2. end of M1: invariant and state-machine review
-3. end of M2: durability and corruption-handling review
-4. end of M4: simulation credibility review
-5. end of M5: alpha readiness review
+3. end of M1H: constant-time and hot-path review
+4. end of M2: durability and corruption-handling review
+5. end of M4: simulation credibility review
+6. end of M5: alpha readiness review
 
 ## Planning Output
 
