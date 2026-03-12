@@ -9,9 +9,10 @@ use allocdb_core::result::ResultCode;
 use allocdb_core::{ReservationState, ResourceState};
 
 use super::{
-    ApiRequest, ApiResponse, InvalidRequestReason, MetricsRequest, MetricsResponse,
+    ApiCodecError, ApiRequest, ApiResponse, InvalidRequestReason, MetricsRequest, MetricsResponse,
     ReservationRequest, ReservationResponse, ResourceRequest, ResourceResponse,
-    SubmissionFailureCode, SubmitRequest, SubmitResponse, decode_response, encode_request,
+    SubmissionFailureCode, SubmitRequest, SubmitResponse, decode_request, decode_response,
+    encode_request, encode_response,
 };
 use crate::engine::{EngineConfig, RecoveryStartupKind, SingleNodeEngine, SubmissionErrorCategory};
 
@@ -21,6 +22,14 @@ fn test_path(name: &str) -> PathBuf {
         .expect("system time should be after epoch")
         .as_nanos();
     std::env::temp_dir().join(format!("allocdb-api-{name}-{nanos}.wal"))
+}
+
+fn test_snapshot_path(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("allocdb-api-{name}-{nanos}.snapshot"))
 }
 
 fn core_config() -> Config {
@@ -83,9 +92,141 @@ fn submit_request_round_trips_through_wire_codec() {
         reserve_request(11, 1, 22),
     ));
 
-    let decoded = super::decode_request(&encode_request(&request)).unwrap();
+    let decoded = super::decode_request(&encode_request(&request).unwrap()).unwrap();
 
     assert_eq!(decoded, request);
+}
+
+#[test]
+fn request_codec_round_trips_all_variants() {
+    let requests = vec![
+        ApiRequest::Submit(SubmitRequest::from_client_request(
+            Slot(9),
+            reserve_request(11, 1, 22),
+        )),
+        ApiRequest::GetResource(ResourceRequest {
+            resource_id: ResourceId(12),
+            required_lsn: Some(Lsn(7)),
+        }),
+        ApiRequest::GetReservation(ReservationRequest {
+            reservation_id: ReservationId(13),
+            current_slot: Slot(14),
+            required_lsn: None,
+        }),
+        ApiRequest::GetMetrics(MetricsRequest {
+            current_wall_clock_slot: Slot(15),
+        }),
+    ];
+
+    for request in requests {
+        let encoded = encode_request(&request).unwrap();
+        assert_eq!(decode_request(&encoded).unwrap(), request);
+    }
+}
+
+#[test]
+fn response_codec_round_trips_all_variants() {
+    let responses = vec![
+        ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
+            applied_lsn: Lsn(1),
+            outcome: allocdb_core::result::CommandOutcome::new(ResultCode::Ok),
+            from_retry_cache: false,
+        })),
+        ApiResponse::Submit(SubmitResponse::Rejected(super::SubmissionFailure {
+            category: SubmissionErrorCategory::DefiniteFailure,
+            code: SubmissionFailureCode::InvalidRequest(InvalidRequestReason::InvalidLayout),
+        })),
+        ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
+            resource_id: ResourceId(21),
+            state: ResourceState::Confirmed,
+            current_reservation_id: Some(ReservationId(22)),
+            version: 5,
+        })),
+        ApiResponse::GetResource(ResourceResponse::NotFound),
+        ApiResponse::GetResource(ResourceResponse::FenceNotApplied {
+            required_lsn: Lsn(9),
+            last_applied_lsn: Some(Lsn(8)),
+        }),
+        ApiResponse::GetReservation(ReservationResponse::Found(super::ReservationView {
+            reservation_id: ReservationId(31),
+            resource_id: ResourceId(32),
+            holder_id: HolderId(33),
+            state: ReservationState::Released,
+            created_lsn: Lsn(2),
+            deadline_slot: Slot(7),
+            released_lsn: Some(Lsn(3)),
+            retire_after_slot: Some(Slot(9)),
+        })),
+        ApiResponse::GetReservation(ReservationResponse::NotFound),
+        ApiResponse::GetReservation(ReservationResponse::Retired),
+        ApiResponse::GetReservation(ReservationResponse::FenceNotApplied {
+            required_lsn: Lsn(11),
+            last_applied_lsn: None,
+        }),
+        ApiResponse::GetMetrics(MetricsResponse {
+            metrics: crate::engine::EngineMetrics {
+                queue_depth: 1,
+                queue_capacity: 2,
+                accepting_writes: false,
+                recovery: crate::engine::RecoveryStatus {
+                    startup_kind: RecoveryStartupKind::SnapshotOnly,
+                    loaded_snapshot_lsn: Some(Lsn(4)),
+                    replayed_wal_frame_count: 0,
+                    replayed_wal_last_lsn: None,
+                    active_snapshot_lsn: Some(Lsn(4)),
+                },
+                core: allocdb_core::HealthMetrics {
+                    last_applied_lsn: Some(Lsn(4)),
+                    last_request_slot: Some(Slot(6)),
+                    logical_slot_lag: 3,
+                    expiration_backlog: 2,
+                    operation_table_used: 5,
+                    operation_table_capacity: 16,
+                    operation_table_utilization_pct: 31,
+                },
+            },
+        }),
+    ];
+
+    for response in responses {
+        let encoded = encode_response(&response);
+        assert_eq!(decode_response(&encoded).unwrap(), response);
+    }
+}
+
+#[test]
+fn api_codec_rejects_truncated_and_trailing_frames() {
+    let request = ApiRequest::GetMetrics(MetricsRequest {
+        current_wall_clock_slot: Slot(5),
+    });
+    let mut encoded_request = encode_request(&request).unwrap();
+    encoded_request.push(0);
+    assert_eq!(
+        decode_request(&encoded_request),
+        Err(ApiCodecError::InvalidLayout)
+    );
+
+    let response = ApiResponse::GetResource(ResourceResponse::NotFound);
+    let mut encoded_response = encode_response(&response);
+    encoded_response.push(0);
+    assert_eq!(
+        decode_response(&encoded_response),
+        Err(ApiCodecError::InvalidLayout)
+    );
+
+    let mut truncated_request = encode_request(&request).unwrap();
+    truncated_request.pop();
+    assert_eq!(
+        decode_request(&truncated_request),
+        Err(ApiCodecError::BufferTooShort)
+    );
+
+    let mut truncated_response = encode_response(&response);
+    truncated_response.clear();
+    assert_eq!(
+        decode_response(&truncated_response),
+        Err(ApiCodecError::BufferTooShort)
+    );
 }
 
 #[test]
@@ -114,7 +255,8 @@ fn api_submit_commits_and_exposes_retry_cache() {
         }))
     );
 
-    fs::remove_file(wal_path).unwrap();
+    drop(engine);
+    fs::remove_file(&wal_path).unwrap();
 }
 
 #[test]
@@ -135,7 +277,8 @@ fn api_submit_maps_invalid_payload_to_definite_failure() {
         }))
     );
 
-    fs::remove_file(wal_path).unwrap();
+    drop(engine);
+    fs::remove_file(&wal_path).unwrap();
 }
 
 #[test]
@@ -205,7 +348,8 @@ fn api_reads_enforce_fence_and_return_views() {
         }))
     );
 
-    fs::remove_file(wal_path).unwrap();
+    drop(engine);
+    fs::remove_file(&wal_path).unwrap();
 }
 
 #[test]
@@ -237,7 +381,8 @@ fn api_reservation_reports_retired_history() {
         ApiResponse::GetReservation(ReservationResponse::Retired)
     );
 
-    fs::remove_file(wal_path).unwrap();
+    drop(engine);
+    fs::remove_file(&wal_path).unwrap();
 }
 
 #[test]
@@ -247,7 +392,8 @@ fn api_bytes_round_trip_metrics_response() {
 
     let encoded = encode_request(&ApiRequest::GetMetrics(MetricsRequest {
         current_wall_clock_slot: Slot(5),
-    }));
+    }))
+    .unwrap();
     let response = decode_response(&engine.handle_api_bytes(&encoded).unwrap()).unwrap();
 
     assert_eq!(
@@ -277,5 +423,64 @@ fn api_bytes_round_trip_metrics_response() {
         })
     );
 
-    fs::remove_file(wal_path).unwrap();
+    drop(engine);
+    fs::remove_file(&wal_path).unwrap();
+}
+
+#[test]
+fn api_bytes_recovery_preserves_state_and_retry_cache() {
+    let wal_path = test_path("bytes-recovery");
+    let snapshot_path = test_snapshot_path("bytes-recovery");
+    let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+    let submit_bytes = encode_request(&ApiRequest::Submit(SubmitRequest::from_client_request(
+        Slot(1),
+        create_request(11, 1),
+    )))
+    .unwrap();
+
+    let first = decode_response(&engine.handle_api_bytes(&submit_bytes).unwrap()).unwrap();
+    assert_eq!(
+        first,
+        ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
+            applied_lsn: Lsn(1),
+            outcome: allocdb_core::result::CommandOutcome::new(ResultCode::Ok),
+            from_retry_cache: false,
+        }))
+    );
+
+    drop(engine);
+
+    let mut recovered =
+        SingleNodeEngine::recover(core_config(), engine_config(), &snapshot_path, &wal_path)
+            .unwrap();
+
+    let retry = decode_response(&recovered.handle_api_bytes(&submit_bytes).unwrap()).unwrap();
+    assert_eq!(
+        retry,
+        ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
+            applied_lsn: Lsn(1),
+            outcome: allocdb_core::result::CommandOutcome::new(ResultCode::Ok),
+            from_retry_cache: true,
+        }))
+    );
+
+    let read_bytes = encode_request(&ApiRequest::GetResource(ResourceRequest {
+        resource_id: ResourceId(11),
+        required_lsn: Some(Lsn(1)),
+    }))
+    .unwrap();
+    let read = decode_response(&recovered.handle_api_bytes(&read_bytes).unwrap()).unwrap();
+    assert_eq!(
+        read,
+        ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
+            resource_id: ResourceId(11),
+            state: ResourceState::Available,
+            current_reservation_id: None,
+            version: 0,
+        }))
+    );
+
+    drop(recovered);
+    let _ = fs::remove_file(&snapshot_path);
+    fs::remove_file(&wal_path).unwrap();
 }
