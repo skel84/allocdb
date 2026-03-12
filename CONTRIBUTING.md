@@ -47,7 +47,29 @@ Examples:
 - every substantial code or design change should link to an issue
 - keep each issue scoped to one task or one tightly related doc change
 - add the appropriate milestone and area labels
+- add planned work to the GitHub Project `AllocDB`
 - close or retitle stale issues instead of letting the tracker drift
+
+## Project Board
+
+Use the GitHub Project `AllocDB` as the operational board for the repository.
+
+Current policy:
+
+- milestones are the roadmap view
+- the project board is the live execution queue
+- `Todo` means not started
+- `In Progress` means active implementation or active PR review
+- `Done` means merged or otherwise completed
+
+When you pick up an issue:
+
+- move it to `In Progress`
+- keep it linked to the correct milestone
+- leave it `In Progress` while the PR is open
+- move it to `Done` after merge or explicit closure
+
+Keep only a small number of items in `In Progress` at the same time.
 
 ## Pull Request Rules
 
@@ -150,8 +172,12 @@ Recommended labels:
 - `area:core`
 - `area:node`
 - `area:storage`
+- `area:simulation`
+- `area:replication`
 - `area:docs`
 - `type:task`
+- `type:spike`
+- `type:design`
 - `type:bug`
 - `type:docs`
 - `type:test`
