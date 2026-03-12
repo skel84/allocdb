@@ -225,6 +225,23 @@ pub enum CrashPoint {
 
 impl CrashPoint {
     #[cfg(test)]
+    const fn stable_id(self) -> u8 {
+        match self {
+            Self::ClientBeforeWalAppend => 1,
+            Self::ClientAfterWalSync => 2,
+            Self::ClientAfterApply => 3,
+            Self::InternalBeforeWalAppend => 4,
+            Self::InternalAfterWalSync => 5,
+            Self::InternalAfterApply => 6,
+            Self::CheckpointAfterSnapshotWrite => 7,
+            Self::CheckpointAfterWalRewrite => 8,
+            Self::RecoveryAfterSnapshotLoad => 9,
+            Self::RecoveryAfterWalTruncate => 10,
+            Self::RecoveryAfterReplayFrame => 11,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) const fn is_recovery_boundary(self) -> bool {
         matches!(
             self,
@@ -232,14 +249,6 @@ impl CrashPoint {
                 | Self::RecoveryAfterWalTruncate
                 | Self::RecoveryAfterReplayFrame
         )
-    }
-
-    fn from_recovery_boundary(boundary: RecoveryBoundary) -> Self {
-        match boundary {
-            RecoveryBoundary::AfterSnapshotLoad => Self::RecoveryAfterSnapshotLoad,
-            RecoveryBoundary::AfterWalTruncate => Self::RecoveryAfterWalTruncate,
-            RecoveryBoundary::AfterReplayFrame { .. } => Self::RecoveryAfterReplayFrame,
-        }
     }
 }
 
@@ -258,7 +267,7 @@ impl CrashPlan {
         );
 
         let mut points = enabled_points.to_vec();
-        points.sort_unstable();
+        points.sort_by_key(|point| point.stable_id());
         points.dedup();
 
         let mixed = mix_seed(seed);
@@ -267,9 +276,43 @@ impl CrashPlan {
 
         Self { seed, point }
     }
+
+    fn matches_recovery_boundary(self, boundary: RecoveryBoundary) -> bool {
+        match boundary {
+            RecoveryBoundary::AfterSnapshotLoad => {
+                self.point == CrashPoint::RecoveryAfterSnapshotLoad
+            }
+            RecoveryBoundary::AfterWalTruncate => {
+                self.point == CrashPoint::RecoveryAfterWalTruncate
+            }
+            RecoveryBoundary::AfterReplayFrame {
+                replay_ordinal,
+                replayable_frame_count,
+                ..
+            } => {
+                self.point == CrashPoint::RecoveryAfterReplayFrame
+                    && replay_ordinal == self.recovery_replay_ordinal(replayable_frame_count)
+            }
+        }
+    }
+
+    fn recovery_replay_ordinal(self, replayable_frame_count: u32) -> u32 {
+        assert!(
+            replayable_frame_count > 0,
+            "replayable recovery frame count must be non-zero"
+        );
+
+        let replayable_frame_count = u64::from(replayable_frame_count);
+        let selected = mix_seed(self.seed ^ 0xA5A5_A5A5_A5A5_A5A5) % replayable_frame_count;
+        u32::try_from(selected).expect("selected recovery replay ordinal must fit u32") + 1
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_recovery_replay_ordinal(self, replayable_frame_count: u32) -> u32 {
+        self.recovery_replay_ordinal(replayable_frame_count)
+    }
 }
 
-#[cfg(test)]
 const fn mix_seed(seed: u64) -> u64 {
     let state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mixed = (state ^ (state >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -358,11 +401,15 @@ impl SingleNodeEngine {
             .map_err(EngineOpenError::from)?;
         let mut pending_crash = crash_plan;
         let recovered = recover_allocdb_with_observer(core_config, &snapshot_file, &wal, |point| {
-            let mapped = CrashPoint::from_recovery_boundary(point);
-            if pending_crash.is_some_and(|plan| plan.point == mapped) {
-                return Err(pending_crash
+            if pending_crash.is_some_and(|plan| plan.matches_recovery_boundary(point)) {
+                let plan = pending_crash
                     .take()
-                    .expect("matched recovery crash plan must still be armed"));
+                    .expect("matched recovery crash plan must still be armed");
+                warn!(
+                    "halting engine recovery on injected crash: seed={} point={:?} boundary={:?}",
+                    plan.seed, plan.point, point,
+                );
+                return Err(plan);
             }
 
             Ok(())

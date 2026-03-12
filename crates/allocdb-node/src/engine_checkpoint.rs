@@ -51,7 +51,8 @@ impl SingleNodeEngine {
     /// # Errors
     ///
     /// Returns [`CheckpointError`] if the engine is halted, queued writes still exist, the WAL is
-    /// not clean, or snapshot/WAL persistence fails.
+    /// not clean, snapshot/WAL persistence fails, or a seeded crash plan aborts one checkpoint
+    /// durability boundary via [`CheckpointError::CrashInjected`].
     ///
     /// # Panics
     ///

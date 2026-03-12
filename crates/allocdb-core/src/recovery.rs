@@ -25,7 +25,12 @@ pub struct RecoveryResult {
 pub enum RecoveryBoundary {
     AfterSnapshotLoad,
     AfterWalTruncate,
-    AfterReplayFrame { lsn: Lsn, record_type: RecordType },
+    AfterReplayFrame {
+        lsn: Lsn,
+        record_type: RecordType,
+        replay_ordinal: u32,
+        replayable_frame_count: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -209,6 +214,18 @@ where
 
     let recovered_wal = wal_file.truncate_to_valid_prefix()?;
     observer(RecoveryBoundary::AfterWalTruncate).map_err(RecoveryObserverError::Observer)?;
+    let replayable_frame_count = u32::try_from(
+        recovered_wal
+            .scan_result
+            .frames
+            .iter()
+            .filter(|frame| {
+                loaded_snapshot_lsn.is_none_or(|snapshot_lsn| frame.lsn.get() > snapshot_lsn.get())
+                    && !matches!(frame.record_type, RecordType::SnapshotMarker)
+            })
+            .count(),
+    )
+    .expect("replayable frame count must fit u32");
     let mut replayed_wal_frame_count = 0_u32;
     let mut replayed_wal_last_lsn = None;
     let mut replay_last_lsn = db.last_applied_lsn();
@@ -239,6 +256,8 @@ where
                 observer(RecoveryBoundary::AfterReplayFrame {
                     lsn: frame.lsn,
                     record_type: frame.record_type,
+                    replay_ordinal: replayed_wal_frame_count,
+                    replayable_frame_count,
                 })
                 .map_err(RecoveryObserverError::Observer)?;
             }
@@ -250,6 +269,8 @@ where
                 observer(RecoveryBoundary::AfterReplayFrame {
                     lsn: frame.lsn,
                     record_type: frame.record_type,
+                    replay_ordinal: replayed_wal_frame_count,
+                    replayable_frame_count,
                 })
                 .map_err(RecoveryObserverError::Observer)?;
             }
