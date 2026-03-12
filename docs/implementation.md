@@ -49,7 +49,8 @@ Current observability surface:
 - classify torn EOF tails separately from durable-log corruption in every recovery path
 - expose logical slot lag and expiration backlog through a bounded health snapshot
 - expose operation-table utilization so dedupe-window pressure is visible before hard rejection
-- expose queue depth and write-acceptance state through the single-node engine wrapper
+- expose queue depth, write-acceptance state, startup recovery status, and the active snapshot
+  anchor through the single-node engine wrapper
 
 Current durability shape before alpha:
 
@@ -60,7 +61,7 @@ Current durability shape before alpha:
 
 Next hardening steps before alpha are:
 
-- surface recovery status alongside the current lag and backlog signals
+- expose the minimal alpha API around the current single-node engine and metrics surface
 - preserve definite-vs-indefinite submission categories in the external wire protocol
 
 ## Dependency Policy

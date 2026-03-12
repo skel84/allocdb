@@ -27,7 +27,7 @@ mod observe;
 #[path = "engine_tests.rs"]
 mod tests;
 pub use checkpoint::{CheckpointError, CheckpointResult};
-pub use observe::{EngineMetrics, ReadError};
+pub use observe::{EngineMetrics, ReadError, RecoveryStartupKind, RecoveryStatus};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EngineConfig {
@@ -166,6 +166,23 @@ struct PendingSubmission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StartupRecovery {
+    loaded_snapshot_lsn: Option<Lsn>,
+    replayed_wal_frame_count: u32,
+    replayed_wal_last_lsn: Option<Lsn>,
+}
+
+impl StartupRecovery {
+    const fn fresh_start() -> Self {
+        Self {
+            loaded_snapshot_lsn: None,
+            replayed_wal_frame_count: 0,
+            replayed_wal_last_lsn: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PersistFailurePhase {
     BeforeAppend,
     AfterAppend,
@@ -187,6 +204,7 @@ pub struct SingleNodeEngine {
     next_lsn: u64,
     accepting_writes: bool,
     active_snapshot_lsn: Option<Lsn>,
+    startup_recovery: StartupRecovery,
     // One-shot failure injection used only to exercise ambiguous WAL outcomes in tests.
     injected_persist_failure: Option<PersistFailurePhase>,
 }
@@ -204,7 +222,13 @@ impl SingleNodeEngine {
         wal_path: impl AsRef<Path>,
     ) -> Result<Self, EngineOpenError> {
         let db = AllocDb::new(core_config)?;
-        Self::from_parts(db, engine_config, wal_path, None)
+        Self::from_parts(
+            db,
+            engine_config,
+            wal_path,
+            None,
+            StartupRecovery::fresh_start(),
+        )
     }
 
     /// Recovers one engine from snapshot plus WAL, then reopens the live WAL path for new writes.
@@ -232,6 +256,11 @@ impl SingleNodeEngine {
             engine_config,
             wal_path,
             recovered.loaded_snapshot_lsn,
+            StartupRecovery {
+                loaded_snapshot_lsn: recovered.loaded_snapshot_lsn,
+                replayed_wal_frame_count: recovered.replayed_wal_frame_count,
+                replayed_wal_last_lsn: recovered.replayed_wal_last_lsn,
+            },
         )
         .map_err(RecoverEngineError::from)
     }
@@ -246,11 +275,12 @@ impl SingleNodeEngine {
     /// # Panics
     ///
     /// Panics only if validated queue bounds cannot fit the platform `usize`.
-    pub fn from_parts(
+    fn from_parts(
         db: AllocDb,
         engine_config: EngineConfig,
         wal_path: impl AsRef<Path>,
         active_snapshot_lsn: Option<Lsn>,
+        startup_recovery: StartupRecovery,
     ) -> Result<Self, EngineOpenError> {
         engine_config.validate()?;
         let wal = WalFile::open(wal_path, engine_config.max_command_bytes)?;
@@ -267,6 +297,7 @@ impl SingleNodeEngine {
             next_lsn,
             accepting_writes: true,
             active_snapshot_lsn,
+            startup_recovery,
             injected_persist_failure: None,
         })
     }

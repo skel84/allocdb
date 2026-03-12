@@ -12,8 +12,8 @@ use allocdb_core::wal_file::WalFileError;
 
 use super::PersistFailurePhase;
 use crate::engine::{
-    EngineConfig, EngineConfigError, EnqueueResult, ReadError, SingleNodeEngine, SubmissionError,
-    SubmissionErrorCategory,
+    EngineConfig, EngineConfigError, EnqueueResult, ReadError, RecoveryStartupKind,
+    SingleNodeEngine, SubmissionError, SubmissionErrorCategory,
 };
 
 fn test_path(name: &str) -> PathBuf {
@@ -285,6 +285,14 @@ fn metrics_include_queue_depth_and_core_health() {
     assert_eq!(metrics.queue_depth, 2);
     assert_eq!(metrics.queue_capacity, 2);
     assert!(metrics.accepting_writes);
+    assert_eq!(
+        metrics.recovery.startup_kind,
+        RecoveryStartupKind::FreshStart
+    );
+    assert_eq!(metrics.recovery.loaded_snapshot_lsn, None);
+    assert_eq!(metrics.recovery.replayed_wal_frame_count, 0);
+    assert_eq!(metrics.recovery.replayed_wal_last_lsn, None);
+    assert_eq!(metrics.recovery.active_snapshot_lsn, None);
     assert_eq!(metrics.core.logical_slot_lag, 0);
     assert_eq!(metrics.core.expiration_backlog, 0);
 
@@ -354,6 +362,13 @@ fn recover_restores_state_and_retry_cache() {
             .unwrap();
 
     assert!(recovered.db().resource(ResourceId(11)).is_some());
+    let metrics = recovered.metrics(Slot(2));
+    assert_eq!(metrics.recovery.startup_kind, RecoveryStartupKind::WalOnly);
+    assert_eq!(metrics.recovery.loaded_snapshot_lsn, None);
+    assert_eq!(metrics.recovery.replayed_wal_frame_count, 1);
+    assert_eq!(metrics.recovery.replayed_wal_last_lsn, Some(Lsn(1)));
+    assert_eq!(metrics.recovery.active_snapshot_lsn, None);
+
     let retry = recovered.submit(Slot(2), create(11, 1)).unwrap();
     assert!(retry.from_retry_cache);
     assert_eq!(retry.applied_lsn, Lsn(1));
@@ -361,6 +376,36 @@ fn recover_restores_state_and_retry_cache() {
 
     fs::remove_file(wal_path).unwrap();
     let _ = fs::remove_file(snapshot_path);
+}
+
+#[test]
+fn recovery_metrics_report_snapshot_and_wal_replay() {
+    let wal_path = test_path("recover-metrics");
+    let snapshot_path = wal_path.with_extension("snapshot");
+
+    {
+        let mut live = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+        live.submit(Slot(1), create(11, 1)).unwrap();
+        live.checkpoint(&snapshot_path).unwrap();
+        live.submit(Slot(2), create(12, 2)).unwrap();
+    }
+
+    let recovered =
+        SingleNodeEngine::recover(core_config(), engine_config(), &snapshot_path, &wal_path)
+            .unwrap();
+    let metrics = recovered.metrics(Slot(4));
+
+    assert_eq!(
+        metrics.recovery.startup_kind,
+        RecoveryStartupKind::SnapshotAndWal
+    );
+    assert_eq!(metrics.recovery.loaded_snapshot_lsn, Some(Lsn(1)));
+    assert_eq!(metrics.recovery.replayed_wal_frame_count, 1);
+    assert_eq!(metrics.recovery.replayed_wal_last_lsn, Some(Lsn(2)));
+    assert_eq!(metrics.recovery.active_snapshot_lsn, Some(Lsn(1)));
+
+    fs::remove_file(wal_path).unwrap();
+    fs::remove_file(snapshot_path).unwrap();
 }
 
 #[test]

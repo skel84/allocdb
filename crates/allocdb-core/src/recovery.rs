@@ -12,6 +12,8 @@ pub struct RecoveryResult {
     pub db: AllocDb,
     pub recovered_wal: RecoveredWal,
     pub loaded_snapshot_lsn: Option<Lsn>,
+    pub replayed_wal_frame_count: u32,
+    pub replayed_wal_last_lsn: Option<Lsn>,
 }
 
 #[derive(Debug)]
@@ -66,6 +68,8 @@ pub fn recover_allocdb(
     };
 
     let recovered_wal = wal_file.truncate_to_valid_prefix()?;
+    let mut replayed_wal_frame_count = 0_u32;
+    let mut replayed_wal_last_lsn = None;
     for frame in &recovered_wal.scan_result.frames {
         if loaded_snapshot_lsn.is_some_and(|snapshot_lsn| frame.lsn.get() <= snapshot_lsn.get()) {
             continue;
@@ -80,10 +84,14 @@ pub fn recover_allocdb(
             RecordType::ClientCommand => {
                 let request = decode_client_request(&frame.payload)?;
                 db.apply_client(context, request);
+                replayed_wal_frame_count = replayed_wal_frame_count.saturating_add(1);
+                replayed_wal_last_lsn = Some(frame.lsn);
             }
             RecordType::InternalCommand => {
                 let command = decode_internal_command(&frame.payload)?;
                 db.apply_internal(context, command);
+                replayed_wal_frame_count = replayed_wal_frame_count.saturating_add(1);
+                replayed_wal_last_lsn = Some(frame.lsn);
             }
             RecordType::SnapshotMarker => {}
         }
@@ -93,6 +101,8 @@ pub fn recover_allocdb(
         db,
         recovered_wal,
         loaded_snapshot_lsn,
+        replayed_wal_frame_count,
+        replayed_wal_last_lsn,
     })
 }
 
@@ -193,6 +203,9 @@ mod tests {
         let snapshot_file = SnapshotFile::new(&snapshot_path);
         let recovered = recover_allocdb(config(), &snapshot_file, &wal).unwrap();
 
+        assert_eq!(recovered.loaded_snapshot_lsn, None);
+        assert_eq!(recovered.replayed_wal_frame_count, 2);
+        assert_eq!(recovered.replayed_wal_last_lsn, Some(Lsn(2)));
         assert_eq!(recovered.db.snapshot(), live.snapshot());
 
         fs::remove_file(wal_path).unwrap();
@@ -244,6 +257,8 @@ mod tests {
         let recovered = recover_allocdb(config(), &snapshot_file, &wal).unwrap();
 
         assert_eq!(recovered.loaded_snapshot_lsn, Some(Lsn(1)));
+        assert_eq!(recovered.replayed_wal_frame_count, 2);
+        assert_eq!(recovered.replayed_wal_last_lsn, Some(Lsn(3)));
         assert_eq!(recovered.db.snapshot(), live.snapshot());
 
         fs::remove_file(wal_path).unwrap();

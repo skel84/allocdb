@@ -156,6 +156,12 @@ Required operational signals:
 - `logical_slot_lag = max(0, current_wall_clock_slot - last_request_slot)`
 - expiration backlog, for example the number of due expirations not yet applied
 - `operation_table_utilization`, so dedupe-window pressure is visible before `operation_table_full`
+- recovery and checkpoint status, including:
+  - how the current process started (`fresh_start`, `wal_only`, `snapshot_only`, or
+    `snapshot_and_wal`)
+  - which snapshot LSN was loaded at startup, if any
+  - how many WAL frames were replayed at startup
+  - what snapshot LSN is currently the active durable anchor
 
 Current implementation anchor:
 
