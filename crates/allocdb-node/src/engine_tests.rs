@@ -400,6 +400,138 @@ fn expiration_tick_commits_internal_expire_and_frees_overdue_resource() {
 }
 
 #[test]
+fn expiration_tick_pre_append_failure_leaves_expiration_uncommitted_after_recovery() {
+    let wal_path = test_path("expiration-tick-pre-append-failure");
+    let snapshot_path = wal_path.with_extension("snapshot");
+
+    let reservation_id = {
+        let mut live = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+        live.submit(Slot(1), create(11, 1)).unwrap();
+        let reserved = live
+            .submit(
+                Slot(2),
+                ClientRequest {
+                    operation_id: OperationId(2),
+                    client_id: ClientId(7),
+                    command: Command::Reserve {
+                        resource_id: ResourceId(11),
+                        holder_id: HolderId(9),
+                        ttl_slots: 3,
+                    },
+                },
+            )
+            .unwrap();
+        live.inject_next_persist_failure(PersistFailurePhase::BeforeAppend);
+
+        let error = live.tick_expirations(Slot(20)).unwrap_err();
+        assert_eq!(error.category(), SubmissionErrorCategory::Indefinite);
+        assert!(matches!(error, SubmissionError::WalFile(_)));
+        assert_eq!(
+            live.enforce_read_fence(Lsn(0)),
+            Err(ReadError::EngineHalted)
+        );
+
+        reserved
+            .outcome
+            .reservation_id
+            .expect("reserve must return reservation id")
+    };
+
+    let recovered =
+        SingleNodeEngine::recover(core_config(), engine_config(), &snapshot_path, &wal_path)
+            .unwrap();
+
+    assert_eq!(recovered.enforce_read_fence(Lsn(2)), Ok(()));
+    assert_eq!(
+        recovered
+            .db()
+            .resource(ResourceId(11))
+            .unwrap()
+            .current_state,
+        ResourceState::Reserved
+    );
+    assert_eq!(
+        recovered
+            .db()
+            .reservation(reservation_id, Slot(20))
+            .unwrap()
+            .state,
+        ReservationState::Reserved
+    );
+
+    fs::remove_file(wal_path).unwrap();
+    let _ = fs::remove_file(snapshot_path);
+}
+
+#[test]
+fn expiration_tick_post_append_failure_requires_recovery_for_expired_state() {
+    let wal_path = test_path("expiration-tick-post-append-failure");
+    let snapshot_path = wal_path.with_extension("snapshot");
+
+    let reservation_id = {
+        let mut live = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+        live.submit(Slot(1), create(11, 1)).unwrap();
+        let reserved = live
+            .submit(
+                Slot(2),
+                ClientRequest {
+                    operation_id: OperationId(2),
+                    client_id: ClientId(7),
+                    command: Command::Reserve {
+                        resource_id: ResourceId(11),
+                        holder_id: HolderId(9),
+                        ttl_slots: 3,
+                    },
+                },
+            )
+            .unwrap();
+        live.inject_next_persist_failure(PersistFailurePhase::AfterAppend);
+
+        let error = live.tick_expirations(Slot(20)).unwrap_err();
+        assert_eq!(error.category(), SubmissionErrorCategory::Indefinite);
+        assert!(matches!(error, SubmissionError::WalFile(_)));
+        assert_eq!(
+            live.enforce_read_fence(Lsn(0)),
+            Err(ReadError::EngineHalted)
+        );
+        assert_eq!(
+            live.enforce_read_fence(Lsn(3)),
+            Err(ReadError::EngineHalted)
+        );
+
+        reserved
+            .outcome
+            .reservation_id
+            .expect("reserve must return reservation id")
+    };
+
+    let recovered =
+        SingleNodeEngine::recover(core_config(), engine_config(), &snapshot_path, &wal_path)
+            .unwrap();
+
+    assert_eq!(recovered.enforce_read_fence(Lsn(3)), Ok(()));
+    assert_eq!(
+        recovered
+            .db()
+            .resource(ResourceId(11))
+            .unwrap()
+            .current_state,
+        ResourceState::Available
+    );
+    assert_eq!(
+        recovered
+            .db()
+            .reservation(reservation_id, Slot(20))
+            .unwrap()
+            .state,
+        ReservationState::Expired
+    );
+
+    fs::remove_file(wal_path).unwrap();
+    let _ = fs::remove_file(snapshot_path);
+}
+
+#[test]
 fn strict_read_fence_requires_applied_lsn() {
     let wal_path = test_path("read-fence");
     let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();

@@ -630,6 +630,16 @@ impl SingleNodeEngine {
         }
 
         let applied_lsn = Lsn(self.next_lsn);
+        let injected_failure = self.take_injected_persist_failure();
+        if injected_failure == Some(PersistFailurePhase::BeforeAppend) {
+            return Err(self.halt_on_internal_wal_error(
+                request_slot,
+                applied_lsn,
+                "before_append",
+                std::io::Error::other("injected WAL failure before append"),
+            ));
+        }
+
         let frame = Frame {
             lsn: applied_lsn,
             request_slot,
@@ -643,6 +653,15 @@ impl SingleNodeEngine {
                 applied_lsn,
                 "append",
                 error,
+            ));
+        }
+
+        if injected_failure == Some(PersistFailurePhase::AfterAppend) {
+            return Err(self.halt_on_internal_wal_error(
+                request_slot,
+                applied_lsn,
+                "after_append_before_sync",
+                std::io::Error::other("injected WAL failure after append"),
             ));
         }
 
