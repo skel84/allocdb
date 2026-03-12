@@ -442,23 +442,43 @@ impl SingleNodeEngine {
 
         let injected_failure = self.take_injected_persist_failure();
         if injected_failure == Some(PersistFailurePhase::BeforeAppend) {
-            return Err(
-                self.halt_on_wal_error(std::io::Error::other("injected WAL failure before append"))
-            );
+            return Err(self.halt_on_wal_error(
+                operation_id,
+                pending.request_slot,
+                applied_lsn,
+                "before_append",
+                std::io::Error::other("injected WAL failure before append"),
+            ));
         }
 
         if let Err(error) = self.wal.append_frame(&frame) {
-            return Err(self.halt_on_wal_error(error));
+            return Err(self.halt_on_wal_error(
+                operation_id,
+                pending.request_slot,
+                applied_lsn,
+                "append",
+                error,
+            ));
         }
 
         if injected_failure == Some(PersistFailurePhase::AfterAppend) {
-            return Err(
-                self.halt_on_wal_error(std::io::Error::other("injected WAL failure after append"))
-            );
+            return Err(self.halt_on_wal_error(
+                operation_id,
+                pending.request_slot,
+                applied_lsn,
+                "after_append_before_sync",
+                std::io::Error::other("injected WAL failure after append"),
+            ));
         }
 
         if let Err(error) = self.wal.sync() {
-            return Err(self.halt_on_wal_error(error));
+            return Err(self.halt_on_wal_error(
+                operation_id,
+                pending.request_slot,
+                applied_lsn,
+                "sync",
+                error,
+            ));
         }
 
         let outcome = self.db.apply_client(
@@ -545,9 +565,22 @@ impl SingleNodeEngine {
         Ok(())
     }
 
-    fn halt_on_wal_error(&mut self, error: impl Into<WalFileError>) -> SubmissionError {
+    fn halt_on_wal_error(
+        &mut self,
+        operation_id: OperationId,
+        request_slot: Slot,
+        applied_lsn: Lsn,
+        phase: &'static str,
+        error: impl Into<WalFileError>,
+    ) -> SubmissionError {
         let error = error.into();
-        error!("halting engine on WAL error, accepting_writes set to false: {error:?}");
+        error!(
+            "halting engine on WAL error, accepting_writes set to false: operation_id={} request_slot={} applied_lsn={} phase={} error={error:?}",
+            operation_id.get(),
+            request_slot.get(),
+            applied_lsn.get(),
+            phase,
+        );
         self.accepting_writes = false;
         SubmissionError::WalFile(error)
     }
