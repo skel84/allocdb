@@ -158,18 +158,57 @@ fn snapshot_restores_retired_lookup_watermark() {
 
 #[test]
 fn snapshot_decode_accepts_legacy_v1_layout() {
-    let snapshot = Snapshot {
-        last_applied_lsn: None,
-        last_request_slot: None,
-        max_retired_reservation_id: None,
-        resources: Vec::new(),
-        reservations: Vec::new(),
-        operations: Vec::new(),
-        wheel: vec![Vec::new(); config().wheel_len()],
-    };
-    let mut bytes = snapshot.encode();
-    bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
-    bytes.remove(8);
+    let snapshots = [
+        Snapshot {
+            last_applied_lsn: None,
+            last_request_slot: None,
+            max_retired_reservation_id: None,
+            resources: Vec::new(),
+            reservations: Vec::new(),
+            operations: Vec::new(),
+            wheel: vec![Vec::new(); config().wheel_len()],
+        },
+        Snapshot {
+            last_applied_lsn: Some(Lsn(7)),
+            last_request_slot: None,
+            max_retired_reservation_id: None,
+            resources: Vec::new(),
+            reservations: Vec::new(),
+            operations: Vec::new(),
+            wheel: vec![Vec::new(); config().wheel_len()],
+        },
+        Snapshot {
+            last_applied_lsn: None,
+            last_request_slot: Some(Slot(11)),
+            max_retired_reservation_id: None,
+            resources: Vec::new(),
+            reservations: Vec::new(),
+            operations: Vec::new(),
+            wheel: vec![Vec::new(); config().wheel_len()],
+        },
+        Snapshot {
+            last_applied_lsn: Some(Lsn(7)),
+            last_request_slot: Some(Slot(11)),
+            max_retired_reservation_id: None,
+            resources: Vec::new(),
+            reservations: Vec::new(),
+            operations: Vec::new(),
+            wheel: vec![Vec::new(); config().wheel_len()],
+        },
+    ];
 
-    assert_eq!(Snapshot::decode(&bytes).unwrap(), snapshot);
+    for snapshot in snapshots {
+        let mut bytes = snapshot.encode();
+        bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        let removal_index = 8
+            + encoded_optional_u64_len(snapshot.last_applied_lsn.map(Lsn::get))
+            + encoded_optional_u64_len(snapshot.last_request_slot.map(Slot::get));
+        bytes.remove(removal_index);
+
+        assert_eq!(Snapshot::decode(&bytes).unwrap(), snapshot);
+    }
+}
+
+fn encoded_optional_u64_len(value: Option<u64>) -> usize {
+    if value.is_some() { 9 } else { 1 }
 }

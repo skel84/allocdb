@@ -111,6 +111,9 @@ fn reservation_lookup_keeps_unknown_future_ids_not_found() {
 
 #[test]
 fn reservation_lookup_conservatively_marks_older_ids_retired() {
+    // IDs below the retired watermark are conservatively reported as Retired,
+    // even if they were never actually created. This bounds memory usage while
+    // preserving the "never flips to NotFound after Retired" guarantee.
     let mut db = AllocDb::new(config()).unwrap();
     db.apply_client(context(1, 1), create(11));
     db.apply_client(
