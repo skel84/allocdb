@@ -1,5 +1,3 @@
-use core::cmp::Ordering;
-
 use crate::command::{Command, CommandContext};
 use crate::config::{Config, ConfigError};
 use crate::fixed_map::{FixedMap, FixedMapError};
@@ -11,6 +9,8 @@ use crate::retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
 mod apply;
 #[path = "state_machine_execution.rs"]
 mod execution;
+#[path = "state_machine_invariants.rs"]
+mod invariants;
 #[cfg(test)]
 #[path = "state_machine_issue_32_tests.rs"]
 mod issue_32_tests;
@@ -27,6 +27,7 @@ mod retire;
 #[cfg(test)]
 #[path = "state_machine_tests.rs"]
 mod tests;
+pub use invariants::AllocDbInvariantError;
 pub use metrics::HealthMetrics;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -295,102 +296,5 @@ impl AllocDb {
         }
 
         reservation_id <= max_retired_reservation_id
-    }
-
-    pub(crate) fn assert_invariants(&self) {
-        for resource in self.resources.iter() {
-            match resource.current_state {
-                ResourceState::Available => assert!(resource.current_reservation_id.is_none()),
-                ResourceState::Reserved | ResourceState::Confirmed => {
-                    let reservation_id = resource
-                        .current_reservation_id
-                        .expect("non-available resources must reference an active reservation");
-                    let reservation = self
-                        .reservations
-                        .get(reservation_id)
-                        .copied()
-                        .expect("active resource reservation must exist");
-                    assert_eq!(reservation.resource_id, resource.resource_id);
-                    match resource.current_state {
-                        ResourceState::Reserved => {
-                            assert_eq!(reservation.state, ReservationState::Reserved);
-                        }
-                        ResourceState::Confirmed => {
-                            assert_eq!(reservation.state, ReservationState::Confirmed);
-                        }
-                        ResourceState::Available => unreachable!(),
-                    }
-                }
-            }
-        }
-
-        for reservation in self.reservations.iter() {
-            match reservation.state {
-                ReservationState::Reserved => {
-                    let resource = self
-                        .resources
-                        .get(reservation.resource_id)
-                        .copied()
-                        .expect("reserved reservation resource must exist");
-                    assert_eq!(resource.current_state, ResourceState::Reserved);
-                    assert_eq!(
-                        resource.current_reservation_id,
-                        Some(reservation.reservation_id)
-                    );
-
-                    let bucket_index = self.wheel_bucket_index(reservation.deadline_slot);
-                    let scheduled = self.wheel[bucket_index]
-                        .binary_search(&reservation.reservation_id)
-                        .is_ok();
-                    assert!(scheduled, "reserved reservations must be scheduled");
-                }
-                ReservationState::Confirmed => {
-                    let resource = self
-                        .resources
-                        .get(reservation.resource_id)
-                        .copied()
-                        .expect("confirmed reservation resource must exist");
-                    assert_eq!(resource.current_state, ResourceState::Confirmed);
-                    assert_eq!(
-                        resource.current_reservation_id,
-                        Some(reservation.reservation_id)
-                    );
-
-                    let bucket_index = self.wheel_bucket_index(reservation.deadline_slot);
-                    let scheduled = self.wheel[bucket_index]
-                        .binary_search(&reservation.reservation_id)
-                        .is_ok();
-                    assert!(!scheduled, "confirmed reservations must not stay scheduled");
-                }
-                ReservationState::Released | ReservationState::Expired => {
-                    assert!(reservation.retire_after_slot.is_some());
-                    let resource = self
-                        .resources
-                        .get(reservation.resource_id)
-                        .copied()
-                        .expect("terminal reservation resource must exist");
-                    assert!(
-                        resource.current_reservation_id != Some(reservation.reservation_id),
-                        "terminal reservations must not stay active on the resource"
-                    );
-
-                    let bucket_index = self.wheel_bucket_index(reservation.deadline_slot);
-                    let scheduled = self.wheel[bucket_index]
-                        .binary_search(&reservation.reservation_id)
-                        .is_ok();
-                    assert!(!scheduled, "terminal reservations must not stay scheduled");
-                }
-            }
-        }
-
-        for bucket in &self.wheel {
-            for pair in bucket.windows(2) {
-                assert_eq!(
-                    pair[0].cmp(&pair[1]),
-                    Ordering::Less,
-                    "wheel buckets must stay strictly ordered"
-                );
-            }
-        }
     }
 }

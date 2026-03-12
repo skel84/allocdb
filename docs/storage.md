@@ -32,6 +32,8 @@ Required properties:
 - classify WAL recovery stop reasons as `clean_eof`, `torn_tail`, or `corruption`
 - auto-truncate only incomplete EOF torn tails
 - fail closed on middle-of-log corruption
+- fail closed on semantically invalid replay ordering such as non-monotonic `lsn` or rewound
+  `request_slot`
 - no `serde` or format whose layout is implicit
 
 Current implementation anchor:
@@ -44,7 +46,9 @@ The current code covers frame encoding, decoding, checksum validation, and in-me
 scanning up to the last valid frame boundary, explicit command-payload encoding for client and
 internal commands, file-backed append, sync, recovery scan, truncate-to-valid-prefix behavior for
 one WAL file, and safe WAL rewrite during checkpoint retention. Recovery distinguishes a
-crash-torn tail from durable-log corruption: only torn tails are truncated automatically.
+crash-torn tail from durable-log corruption: only torn tails are truncated automatically. Replay
+also rejects checksum-valid WAL input whose frame metadata moves `lsn` backwards or rewinds
+`request_slot`.
 
 ## Snapshots
 
@@ -72,7 +76,9 @@ Current implementation anchor:
 
 The current code covers snapshot encode, decode, allocator-state capture, and allocator restore
 from one decoded snapshot, plus file-backed snapshot write and load with temp-file and rename
-discipline.
+discipline. Restore validates configured table capacities, duplicate IDs, wheel bounds, replay
+watermark consistency, and trusted-core resource/reservation invariants before admitting decoded
+contents into live state.
 
 Recovery implementation anchors:
 
@@ -93,6 +99,9 @@ If a WAL tail is torn after crash, recovery truncates at the last valid frame bo
 
 If recovery detects a checksum or framing error before EOF, the node fails closed and surfaces the
 corruption instead of rewriting the WAL.
+
+If recovery detects semantically invalid decoded snapshot contents or WAL replay ordering, the node
+also fails closed and returns a structured error instead of panicking.
 
 ## Checkpoint Coordination
 

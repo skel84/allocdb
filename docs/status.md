@@ -24,9 +24,9 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: keep retired reservation lookups distinct from `not_found` across
-    later writes and snapshot restore using bounded retired-watermark metadata, with core/API
-    regression coverage and docs alignment
+  - current validated chunk: fail-closed recovery on semantically invalid WAL ordering and
+    malformed decoded snapshots, including typed restore/replay errors, explicit recovery logging,
+    and bounded retired-reservation watermark preservation across snapshot restore
 
 ## What Exists
 
@@ -70,6 +70,8 @@
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
   - fail-closed recovery on middle-of-log corruption
+  - fail-closed recovery on non-monotonic WAL replay metadata and malformed decoded snapshot
+    semantics
   - snapshot encode, decode, capture, restore
   - file-backed snapshot write and load
   - explicit WAL command payload encoding and live-path replay recovery
@@ -82,7 +84,8 @@
   - seeded same-slot ready-set scheduling with reproducible transcripts
   - checkpoint, restart, and injected persist-failure helpers over the real `SingleNodeEngine`
 - Validation:
-  - `cargo test -p allocdb-core retired_reservation_lookup_survives_unrelated_later_write`
+  - `cargo test -p allocdb-core snapshot -- --nocapture`
+  - `cargo test -p allocdb-core recovery -- --nocapture`
   - `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
   - `cargo test -p allocdb-node api_reservation_reports_retired_history`
   - `cargo run -p allocdb-bench -- --scenario all`
