@@ -17,6 +17,7 @@ pub enum ResultCode {
     OperationConflict,
     InvalidState,
     HolderMismatch,
+    SlotOverflow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

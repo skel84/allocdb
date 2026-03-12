@@ -100,8 +100,9 @@ If a WAL tail is torn after crash, recovery truncates at the last valid frame bo
 If recovery detects a checksum or framing error before EOF, the node fails closed and surfaces the
 corruption instead of rewriting the WAL.
 
-If recovery detects semantically invalid decoded snapshot contents or WAL replay ordering, the node
-also fails closed and returns a structured error instead of panicking.
+If recovery detects semantically invalid decoded snapshot contents, WAL replay ordering, or replayed
+commands whose derived slot bounds would overflow `u64`, the node also fails closed and returns a
+structured error instead of panicking.
 
 ## Checkpoint Coordination
 

@@ -14,14 +14,23 @@ pub struct Config {
 pub enum ConfigError {
     ZeroCapacity(&'static str),
     HistoryWindowTooLarge,
+    OperationWindowTooLarge,
     BucketCapacityTooLarge,
     WheelTooLarge,
 }
 
 impl Config {
+    /// Returns the dedupe retention window measured in logical slots.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called before [`Self::validate`] has confirmed that the additive window fits in
+    /// `u64`.
     #[must_use]
-    pub const fn operation_window_slots(&self) -> u64 {
-        self.max_ttl_slots + self.max_client_retry_window_slots
+    pub fn operation_window_slots(&self) -> u64 {
+        self.max_ttl_slots
+            .checked_add(self.max_client_retry_window_slots)
+            .expect("validated operation window must fit in u64")
     }
 
     /// Validates that the configured capacities and retention windows are internally consistent.
@@ -54,6 +63,13 @@ impl Config {
         if self.reservation_history_window_slots > self.max_ttl_slots {
             return Err(ConfigError::HistoryWindowTooLarge);
         }
+
+        let Some(_) = self
+            .max_ttl_slots
+            .checked_add(self.max_client_retry_window_slots)
+        else {
+            return Err(ConfigError::OperationWindowTooLarge);
+        };
 
         if self.max_expiration_bucket_len > self.max_reservations {
             return Err(ConfigError::BucketCapacityTooLarge);

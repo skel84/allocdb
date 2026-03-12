@@ -1,7 +1,7 @@
 use allocdb_core::HealthMetrics;
 use allocdb_core::ids::{HolderId, Lsn, ReservationId, ResourceId, Slot};
 use allocdb_core::result::{CommandOutcome, ResultCode};
-use allocdb_core::{ReservationState, ResourceState};
+use allocdb_core::{ReservationState, ResourceState, SlotOverflowKind};
 
 use crate::engine::{EngineMetrics, RecoveryStartupKind, RecoveryStatus, SubmissionErrorCategory};
 
@@ -235,24 +235,38 @@ fn encode_submission_failure(bytes: &mut Vec<u8>, response: SubmissionFailure) {
             bytes.push(2);
             encode_invalid_request_reason(bytes, reason);
         }
+        SubmissionFailureCode::SlotOverflow {
+            kind,
+            request_slot,
+            delta,
+        } => {
+            bytes.push(3);
+            encode_slot_overflow_kind(bytes, kind);
+            bytes.extend_from_slice(&request_slot.get().to_le_bytes());
+            bytes.extend_from_slice(&delta.to_le_bytes());
+        }
         SubmissionFailureCode::CommandTooLarge {
             encoded_len,
             max_command_bytes,
         } => {
-            bytes.push(3);
+            bytes.push(4);
             bytes.extend_from_slice(&encoded_len.to_le_bytes());
             bytes.extend_from_slice(&max_command_bytes.to_le_bytes());
+        }
+        SubmissionFailureCode::LsnExhausted { last_applied_lsn } => {
+            bytes.push(5);
+            bytes.extend_from_slice(&last_applied_lsn.get().to_le_bytes());
         }
         SubmissionFailureCode::Overloaded {
             queue_depth,
             queue_capacity,
         } => {
-            bytes.push(4);
+            bytes.push(6);
             bytes.extend_from_slice(&queue_depth.to_le_bytes());
             bytes.extend_from_slice(&queue_capacity.to_le_bytes());
         }
         SubmissionFailureCode::StorageFailure => {
-            bytes.push(5);
+            bytes.push(7);
         }
     }
 }
@@ -262,15 +276,23 @@ fn decode_submission_failure(cursor: &mut Cursor<'_>) -> Result<SubmissionFailur
     let code = match cursor.read_u8()? {
         1 => SubmissionFailureCode::EngineHalted,
         2 => SubmissionFailureCode::InvalidRequest(decode_invalid_request_reason(cursor)?),
-        3 => SubmissionFailureCode::CommandTooLarge {
+        3 => SubmissionFailureCode::SlotOverflow {
+            kind: decode_slot_overflow_kind(cursor.read_u8()?)?,
+            request_slot: Slot(cursor.read_u64()?),
+            delta: cursor.read_u64()?,
+        },
+        4 => SubmissionFailureCode::CommandTooLarge {
             encoded_len: cursor.read_u64()?,
             max_command_bytes: cursor.read_u64()?,
         },
-        4 => SubmissionFailureCode::Overloaded {
+        5 => SubmissionFailureCode::LsnExhausted {
+            last_applied_lsn: Lsn(cursor.read_u64()?),
+        },
+        6 => SubmissionFailureCode::Overloaded {
             queue_depth: cursor.read_u32()?,
             queue_capacity: cursor.read_u32()?,
         },
-        5 => SubmissionFailureCode::StorageFailure,
+        7 => SubmissionFailureCode::StorageFailure,
         value => {
             return Err(ApiCodecError::InvalidEnumValue {
                 kind: "submission_failure_code",
@@ -578,6 +600,7 @@ fn encode_result_code(result_code: ResultCode) -> u8 {
         ResultCode::OperationConflict => 13,
         ResultCode::InvalidState => 14,
         ResultCode::HolderMismatch => 15,
+        ResultCode::SlotOverflow => 16,
     }
 }
 
@@ -598,8 +621,29 @@ fn decode_result_code(value: u8) -> Result<ResultCode, ApiCodecError> {
         13 => Ok(ResultCode::OperationConflict),
         14 => Ok(ResultCode::InvalidState),
         15 => Ok(ResultCode::HolderMismatch),
+        16 => Ok(ResultCode::SlotOverflow),
         value => Err(ApiCodecError::InvalidEnumValue {
             kind: "result_code",
+            value,
+        }),
+    }
+}
+
+fn encode_slot_overflow_kind(bytes: &mut Vec<u8>, kind: SlotOverflowKind) {
+    bytes.push(match kind {
+        SlotOverflowKind::OperationWindow => 1,
+        SlotOverflowKind::Deadline => 2,
+        SlotOverflowKind::ReservationHistory => 3,
+    });
+}
+
+fn decode_slot_overflow_kind(value: u8) -> Result<SlotOverflowKind, ApiCodecError> {
+    match value {
+        1 => Ok(SlotOverflowKind::OperationWindow),
+        2 => Ok(SlotOverflowKind::Deadline),
+        3 => Ok(SlotOverflowKind::ReservationHistory),
+        value => Err(ApiCodecError::InvalidEnumValue {
+            kind: "slot_overflow_kind",
             value,
         }),
     }

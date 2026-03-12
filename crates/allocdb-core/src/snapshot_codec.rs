@@ -250,6 +250,7 @@ fn decode_result_code(tag: u8) -> Result<ResultCode, SnapshotError> {
         12 => Ok(ResultCode::OperationConflict),
         13 => Ok(ResultCode::InvalidState),
         14 => Ok(ResultCode::HolderMismatch),
+        15 => Ok(ResultCode::SlotOverflow),
         _ => Err(SnapshotError::InvalidStateTag(tag)),
     }
 }
@@ -271,5 +272,6 @@ fn encode_result_code(code: ResultCode) -> u8 {
         ResultCode::OperationConflict => 12,
         ResultCode::InvalidState => 13,
         ResultCode::HolderMismatch => 14,
+        ResultCode::SlotOverflow => 15,
     }
 }

@@ -6,7 +6,7 @@ use crate::config::{Config, ConfigError};
 use crate::ids::{Lsn, Slot};
 use crate::snapshot::SnapshotError;
 use crate::snapshot_file::{SnapshotFile, SnapshotFileError};
-use crate::state_machine::AllocDb;
+use crate::state_machine::{AllocDb, SlotOverflowError, SlotOverflowKind};
 use crate::wal::RecordType;
 use crate::wal_file::{RecoveredWal, WalFile, WalFileError};
 use log::{error, info};
@@ -42,6 +42,12 @@ pub enum ReplayError {
     RewoundRequestSlot {
         previous_request_slot: Slot,
         next_request_slot: Slot,
+    },
+    SlotOverflow {
+        lsn: Lsn,
+        kind: SlotOverflowKind,
+        request_slot: Slot,
+        delta: u64,
     },
 }
 
@@ -250,6 +256,10 @@ where
         match frame.record_type {
             RecordType::ClientCommand => {
                 let request = decode_client_request(&frame.payload)?;
+                validate_replay_slot_math(
+                    db.validate_client_request_slot(frame.request_slot, request.command),
+                    frame.lsn,
+                )?;
                 db.apply_client(context, request);
                 replayed_wal_frame_count = replayed_wal_frame_count.saturating_add(1);
                 replayed_wal_last_lsn = Some(frame.lsn);
@@ -263,6 +273,10 @@ where
             }
             RecordType::InternalCommand => {
                 let command = decode_internal_command(&frame.payload)?;
+                validate_replay_slot_math(
+                    db.validate_internal_request_slot(frame.request_slot, command),
+                    frame.lsn,
+                )?;
                 db.apply_internal(context, command);
                 replayed_wal_frame_count = replayed_wal_frame_count.saturating_add(1);
                 replayed_wal_last_lsn = Some(frame.lsn);
@@ -318,6 +332,18 @@ fn validate_replay_order(
     Ok(())
 }
 
+fn validate_replay_slot_math(
+    result: Result<(), SlotOverflowError>,
+    lsn: Lsn,
+) -> Result<(), ReplayError> {
+    result.map_err(|error| ReplayError::SlotOverflow {
+        lsn,
+        kind: error.kind,
+        request_slot: error.request_slot,
+        delta: error.delta,
+    })
+}
+
 fn log_recovery_failure(error: &RecoveryError, snapshot_file: &SnapshotFile, wal_file: &WalFile) {
     let snapshot_path = snapshot_file.path().display();
     let wal_path = wal_file.path().display();
@@ -359,6 +385,9 @@ fn log_recovery_failure(error: &RecoveryError, snapshot_file: &SnapshotFile, wal
 #[cfg(test)]
 #[path = "recovery_issue_30_tests.rs"]
 mod issue_30_tests;
+#[cfg(test)]
+#[path = "recovery_issue_31_tests.rs"]
+mod issue_31_tests;
 #[cfg(test)]
 #[path = "recovery_tests.rs"]
 mod tests;

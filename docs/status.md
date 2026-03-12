@@ -25,9 +25,11 @@
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
   - current validated chunk: explicit seeded crash-point injection across submit, checkpoint, and
-    recovery boundaries, restart coverage for post-sync submit replay, snapshot-written before WAL
-    rewrite, and replay-interrupted recovery, plus operator-facing runbook guidance aligned with
-    current startup, recovery, overload, and expiration-maintenance behavior
+    recovery boundaries plus checked slot and LSN arithmetic across trusted-core and single-node
+    sequencing paths, including deterministic pre-commit overflow rejection for request slots,
+    fail-closed replay rejection for overflowed WAL commands, restart coverage for post-sync
+    submit replay and replay-interrupted recovery, and explicit `next_lsn` exhaustion handling
+    after `u64::MAX`
 
 ## What Exists
 
@@ -45,11 +47,14 @@
   - typed and encoded request validation before commit
   - bounded submission queue with deterministic overload behavior
   - LSN assignment, WAL append, sync, and live apply
+  - definite pre-commit rejection for request slots whose derived deadline, history, or dedupe
+    windows would overflow `u64`
   - pre-sequencing duplicate lookup for applied and already-queued `operation_id`
   - strict-read fence by applied LSN
   - restart path from snapshot plus WAL
   - explicit definite-vs-indefinite submission error categorization
   - explicit restart-and-retry handling for ambiguous WAL failures within the dedupe window
+  - explicit `lsn_exhausted` write rejection after the engine commits the last representable LSN
   - node-level metrics for queue pressure, write acceptance, startup recovery status, and active
     snapshot anchor
 - Deterministic benchmark harness:
@@ -76,6 +81,8 @@
   - fail-closed recovery on middle-of-log corruption
   - fail-closed recovery on non-monotonic WAL replay metadata and malformed decoded snapshot
     semantics
+  - fail-closed recovery on replayed commands whose derived slot windows overflow configured
+    bounds
   - snapshot encode, decode, capture, restore
   - file-backed snapshot write and load
   - explicit WAL command payload encoding and live-path replay recovery

@@ -6,6 +6,7 @@ use allocdb_core::ids::{HolderId, Lsn, ReservationId, ResourceId, Slot};
 use allocdb_core::result::CommandOutcome;
 use allocdb_core::{
     ReservationLookupError, ReservationRecord, ReservationState, ResourceRecord, ResourceState,
+    SlotOverflowKind,
 };
 
 use crate::engine::{
@@ -120,9 +121,17 @@ pub struct SubmissionFailure {
 pub enum SubmissionFailureCode {
     EngineHalted,
     InvalidRequest(InvalidRequestReason),
+    SlotOverflow {
+        kind: SlotOverflowKind,
+        request_slot: Slot,
+        delta: u64,
+    },
     CommandTooLarge {
         encoded_len: u64,
         max_command_bytes: u64,
+    },
+    LsnExhausted {
+        last_applied_lsn: Lsn,
     },
     Overloaded {
         queue_depth: u32,
@@ -139,6 +148,11 @@ impl SubmissionFailure {
             SubmissionError::InvalidRequest(error) => {
                 SubmissionFailureCode::InvalidRequest(InvalidRequestReason::from_codec_error(error))
             }
+            SubmissionError::SlotOverflow(error) => SubmissionFailureCode::SlotOverflow {
+                kind: error.kind,
+                request_slot: error.request_slot,
+                delta: error.delta,
+            },
             SubmissionError::CommandTooLarge {
                 encoded_len,
                 max_command_bytes,
@@ -147,6 +161,9 @@ impl SubmissionFailure {
                 max_command_bytes: u64::try_from(max_command_bytes)
                     .expect("max command bytes must fit u64"),
             },
+            SubmissionError::LsnExhausted { last_applied_lsn } => {
+                SubmissionFailureCode::LsnExhausted { last_applied_lsn }
+            }
             SubmissionError::Overloaded {
                 queue_depth,
                 queue_capacity,

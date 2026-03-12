@@ -75,7 +75,10 @@ impl AllocDb {
         }
 
         let reservation_id = self.reservation_id_from_lsn(context.lsn);
-        let deadline_slot = Slot(context.request_slot.get() + ttl_slots);
+        let deadline_slot = match Self::deadline_slot(context.request_slot, ttl_slots) {
+            Ok(deadline_slot) => deadline_slot,
+            Err(error) => return Self::slot_overflow_outcome("reserve", error),
+        };
 
         if !self.schedule_expiration(reservation_id, deadline_slot) {
             warn!(
@@ -238,8 +241,10 @@ impl AllocDb {
             "active reservation must reference an existing resource"
         );
 
-        let retire_after_slot =
-            Slot(context.request_slot.get() + self.config.reservation_history_window_slots);
+        let retire_after_slot = match self.reservation_retire_after_slot(context.request_slot) {
+            Ok(retire_after_slot) => retire_after_slot,
+            Err(error) => return Self::slot_overflow_outcome("release", error),
+        };
 
         let reservation = self
             .reservations
@@ -313,8 +318,10 @@ impl AllocDb {
             "active reservation must reference an existing resource"
         );
 
-        let retire_after_slot =
-            Slot(context.request_slot.get() + self.config.reservation_history_window_slots);
+        let retire_after_slot = match self.reservation_retire_after_slot(context.request_slot) {
+            Ok(retire_after_slot) => retire_after_slot,
+            Err(error) => return Self::slot_overflow_outcome("expire", error),
+        };
 
         let reservation = self
             .reservations

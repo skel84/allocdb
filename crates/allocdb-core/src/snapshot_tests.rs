@@ -1,8 +1,9 @@
 use crate::command::{ClientRequest, Command, CommandContext};
 use crate::config::Config;
 use crate::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
+use crate::result::ResultCode;
 use crate::snapshot::{Snapshot, SnapshotError};
-use crate::state_machine::{AllocDb, ReservationLookupError};
+use crate::state_machine::{AllocDb, OperationRecord, ReservationLookupError};
 
 fn config() -> Config {
     Config {
@@ -211,4 +212,30 @@ fn snapshot_decode_accepts_legacy_v1_layout() {
 
 fn encoded_optional_u64_len(value: Option<u64>) -> usize {
     if value.is_some() { 9 } else { 1 }
+}
+
+#[test]
+fn snapshot_round_trips_slot_overflow_operation_result() {
+    let snapshot = Snapshot {
+        last_applied_lsn: Some(Lsn(7)),
+        last_request_slot: Some(Slot(9)),
+        max_retired_reservation_id: None,
+        resources: Vec::new(),
+        reservations: Vec::new(),
+        operations: vec![OperationRecord {
+            operation_id: OperationId(1),
+            command_fingerprint: 42,
+            result_code: ResultCode::SlotOverflow,
+            result_reservation_id: None,
+            result_deadline_slot: None,
+            applied_lsn: Lsn(7),
+            retire_after_slot: Slot(12),
+        }],
+        wheel: vec![Vec::new(); config().wheel_len()],
+    };
+
+    let encoded = snapshot.encode();
+    let decoded = Snapshot::decode(&encoded).unwrap();
+
+    assert_eq!(decoded, snapshot);
 }

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use allocdb_core::ReservationState;
+use allocdb_core::SlotOverflowError;
 use allocdb_core::command::{ClientRequest, Command, CommandContext};
 use allocdb_core::command_codec::{
     CommandCodecError, decode_client_request, encode_client_request, encode_internal_command,
@@ -24,6 +25,9 @@ mod checkpoint;
 #[cfg(test)]
 #[path = "engine_checkpoint_tests.rs"]
 mod checkpoint_tests;
+#[cfg(test)]
+#[path = "engine_issue_31_tests.rs"]
+mod issue_31_tests;
 #[path = "engine_observe.rs"]
 mod observe;
 #[cfg(test)]
@@ -94,6 +98,7 @@ pub enum EnqueueResult {
 pub enum EngineOpenError {
     CoreConfig(ConfigError),
     EngineConfig(EngineConfigError),
+    NextLsnExhausted { last_applied_lsn: Lsn },
     WalFile(WalFileError),
 }
 
@@ -119,9 +124,13 @@ impl From<WalFileError> for EngineOpenError {
 pub enum SubmissionError {
     EngineHalted,
     InvalidRequest(CommandCodecError),
+    SlotOverflow(SlotOverflowError),
     CommandTooLarge {
         encoded_len: usize,
         max_command_bytes: usize,
+    },
+    LsnExhausted {
+        last_applied_lsn: Lsn,
     },
     Overloaded {
         queue_depth: u32,
@@ -150,9 +159,11 @@ impl SubmissionError {
             Self::EngineHalted | Self::WalFile(_) | Self::CrashInjected(_) => {
                 SubmissionErrorCategory::Indefinite
             }
-            Self::InvalidRequest(_) | Self::CommandTooLarge { .. } | Self::Overloaded { .. } => {
-                SubmissionErrorCategory::DefiniteFailure
-            }
+            Self::InvalidRequest(_)
+            | Self::SlotOverflow(_)
+            | Self::CommandTooLarge { .. }
+            | Self::LsnExhausted { .. }
+            | Self::Overloaded { .. } => SubmissionErrorCategory::DefiniteFailure,
         }
     }
 }
@@ -341,6 +352,7 @@ pub struct SingleNodeEngine {
     config: EngineConfig,
     next_lsn: u64,
     accepting_writes: bool,
+    exhausted_lsn: Option<Lsn>,
     active_snapshot_lsn: Option<Lsn>,
     startup_recovery: StartupRecovery,
     // One-shot failure injection used only to exercise ambiguous WAL outcomes in tests.
@@ -452,7 +464,13 @@ impl SingleNodeEngine {
     ) -> Result<Self, EngineOpenError> {
         engine_config.validate()?;
         let wal = WalFile::open(wal_path, engine_config.max_command_bytes)?;
-        let next_lsn = db.last_applied_lsn().map_or(1, |lsn| lsn.get() + 1);
+        let next_lsn = match db.last_applied_lsn() {
+            None => 1,
+            Some(last_applied_lsn) => last_applied_lsn
+                .get()
+                .checked_add(1)
+                .ok_or(EngineOpenError::NextLsnExhausted { last_applied_lsn })?,
+        };
 
         Ok(Self {
             db,
@@ -464,6 +482,7 @@ impl SingleNodeEngine {
             config: engine_config,
             next_lsn,
             accepting_writes: true,
+            exhausted_lsn: None,
             active_snapshot_lsn,
             startup_recovery,
             injected_persist_failure: None,
@@ -591,8 +610,17 @@ impl SingleNodeEngine {
         if !self.accepting_writes {
             return Err(SubmissionError::EngineHalted);
         }
+        if self.queue.len() == 0 {
+            if let Some(error) = self.lsn_exhaustion_error() {
+                return Err(error);
+            }
+        }
 
         self.process_queued_submissions()?;
+        if let Some(error) = self.lsn_exhaustion_error() {
+            return Err(error);
+        }
+
         let due = self.collect_due_expirations(current_wall_clock_slot);
         let expiration_request_slot = self.expiration_request_slot(current_wall_clock_slot);
         let mut processed_count = 0_u32;
@@ -653,6 +681,12 @@ impl SingleNodeEngine {
             });
         }
 
+        if let Some(error) = self.lsn_exhaustion_error() {
+            return Err(error);
+        }
+
+        self.validate_client_request_slot(request_slot, request.command)?;
+
         self.queue
             .push(PendingSubmission {
                 request,
@@ -672,6 +706,9 @@ impl SingleNodeEngine {
     fn process_one(&mut self) -> Result<Option<ProcessedSubmission>, SubmissionError> {
         if !self.accepting_writes {
             return Err(SubmissionError::EngineHalted);
+        }
+        if let Some(error) = self.lsn_exhaustion_error() {
+            return Err(error);
         }
 
         let Some(pending) = self.queue.pop_front() else {
@@ -746,7 +783,7 @@ impl SingleNodeEngine {
         if let Some(plan) = self.maybe_inject_crash(CrashPoint::ClientAfterApply) {
             return Err(SubmissionError::CrashInjected(plan));
         }
-        self.next_lsn += 1;
+        self.advance_next_lsn(applied_lsn);
 
         Ok(Some(ProcessedSubmission {
             operation_id,
@@ -808,6 +845,11 @@ impl SingleNodeEngine {
         if !self.accepting_writes {
             return Err(SubmissionError::EngineHalted);
         }
+        if let Some(error) = self.lsn_exhaustion_error() {
+            return Err(error);
+        }
+
+        self.validate_internal_request_slot(request_slot, command)?;
 
         let applied_lsn = Lsn(self.next_lsn);
         let injected_failure = self.take_injected_persist_failure();
@@ -866,7 +908,7 @@ impl SingleNodeEngine {
         if let Some(plan) = self.maybe_inject_crash(CrashPoint::InternalAfterApply) {
             return Err(SubmissionError::CrashInjected(plan));
         }
-        self.next_lsn += 1;
+        self.advance_next_lsn(applied_lsn);
 
         Ok(SubmissionResult {
             applied_lsn,
@@ -937,6 +979,48 @@ impl SingleNodeEngine {
         }
 
         Ok(())
+    }
+
+    fn validate_client_request_slot(
+        &self,
+        request_slot: Slot,
+        command: Command,
+    ) -> Result<(), SubmissionError> {
+        self.db
+            .validate_client_request_slot(request_slot, command)
+            .map_err(SubmissionError::SlotOverflow)
+    }
+
+    fn validate_internal_request_slot(
+        &self,
+        request_slot: Slot,
+        command: Command,
+    ) -> Result<(), SubmissionError> {
+        self.db
+            .validate_internal_request_slot(request_slot, command)
+            .map_err(SubmissionError::SlotOverflow)
+    }
+
+    fn lsn_exhaustion_error(&self) -> Option<SubmissionError> {
+        self.exhausted_lsn
+            .map(|last_applied_lsn| SubmissionError::LsnExhausted { last_applied_lsn })
+    }
+
+    fn writes_available(&self) -> bool {
+        self.accepting_writes && self.exhausted_lsn.is_none()
+    }
+
+    fn advance_next_lsn(&mut self, applied_lsn: Lsn) {
+        if let Some(next_lsn) = applied_lsn.get().checked_add(1) {
+            self.next_lsn = next_lsn;
+            return;
+        }
+
+        error!(
+            "engine exhausted lsn space, future writes disabled: applied_lsn={}",
+            applied_lsn.get(),
+        );
+        self.exhausted_lsn = Some(applied_lsn);
     }
 
     fn halt_on_wal_error(

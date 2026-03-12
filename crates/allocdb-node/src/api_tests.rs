@@ -6,7 +6,7 @@ use allocdb_core::command::{ClientRequest, Command};
 use allocdb_core::config::Config;
 use allocdb_core::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use allocdb_core::result::ResultCode;
-use allocdb_core::{ReservationState, ResourceState};
+use allocdb_core::{ReservationState, ResourceState, SlotOverflowKind};
 
 use super::{
     ApiCodecError, ApiRequest, ApiResponse, InvalidRequestReason, MetricsRequest, MetricsResponse,
@@ -140,9 +140,28 @@ fn response_codec_round_trips_all_variants() {
             outcome: allocdb_core::result::CommandOutcome::new(ResultCode::Ok),
             from_retry_cache: false,
         })),
+        ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
+            applied_lsn: Lsn(2),
+            outcome: allocdb_core::result::CommandOutcome::new(ResultCode::SlotOverflow),
+            from_retry_cache: true,
+        })),
         ApiResponse::Submit(SubmitResponse::Rejected(super::SubmissionFailure {
             category: SubmissionErrorCategory::DefiniteFailure,
             code: SubmissionFailureCode::InvalidRequest(InvalidRequestReason::InvalidLayout),
+        })),
+        ApiResponse::Submit(SubmitResponse::Rejected(super::SubmissionFailure {
+            category: SubmissionErrorCategory::DefiniteFailure,
+            code: SubmissionFailureCode::SlotOverflow {
+                kind: SlotOverflowKind::Deadline,
+                request_slot: Slot(99),
+                delta: 16,
+            },
+        })),
+        ApiResponse::Submit(SubmitResponse::Rejected(super::SubmissionFailure {
+            category: SubmissionErrorCategory::DefiniteFailure,
+            code: SubmissionFailureCode::LsnExhausted {
+                last_applied_lsn: Lsn(44),
+            },
         })),
         ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
             resource_id: ResourceId(21),

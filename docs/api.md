@@ -145,7 +145,9 @@ rejected {
 Current submission failure codes are:
 
 - `invalid_request(buffer_too_short | invalid_command_tag(tag) | invalid_layout)`
+- `slot_overflow(kind, request_slot, delta)`
 - `command_too_large(encoded_len, max_command_bytes)`
+- `lsn_exhausted(last_applied_lsn)`
 - `overloaded(queue_depth, queue_capacity)`
 - `engine_halted`
 - `storage_failure`
@@ -154,7 +156,9 @@ The required category mapping is:
 
 - definite failure:
   - `invalid_request`
+  - `slot_overflow`
   - `command_too_large`
+  - `lsn_exhausted`
   - `overloaded`
 - indefinite:
   - `engine_halted`
@@ -233,8 +237,9 @@ applied {
 `processed_count` is the number of internal `expire` commands committed in this maintenance tick.
 `last_applied_lsn` is absent when no due expiration was processed.
 
-`rejected(category, code)` reuses the same failure envelope as `submit`. In practice the current
-tick path can return only indefinite failures such as `engine_halted` or `storage_failure`.
+`rejected(category, code)` reuses the same failure envelope as `submit`. The current tick path can
+return the same indefinite failures as `submit`, and it can also return definite failures such as
+`slot_overflow` if the derived expiration retirement slot would exceed `u64::MAX`.
 
 ## Metrics Response
 
