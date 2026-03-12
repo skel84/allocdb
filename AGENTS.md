@@ -48,6 +48,8 @@ Project-specific design and engineering rules live in:
 - Prefer running [`scripts/preflight.sh`](./scripts/preflight.sh) before push or PR updates so the
   local validation path matches CI.
 - Treat CodeRabbit as part of the required review path when it is enabled on the repository.
+  Wait for its status to complete before merge. If it completes without a visible review comment or
+  review thread, request visible output with `@coderabbitai summary`.
   Address every substantive CodeRabbit comment explicitly before merge by either applying the
   change or documenting why it is not being applied. Apply correctness, safety, recovery, test,
   and docs-alignment feedback by default; document why you reject suggestions that would weaken
