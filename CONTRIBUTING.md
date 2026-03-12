@@ -69,7 +69,8 @@ When you pick up an issue:
 - leave it `In Progress` while the PR is open
 - move it to `Done` after merge or explicit closure
 
-Keep only a small number of items in `In Progress` at the same time.
+Limit `In Progress` to 2 items per contributor at a time. If a third item is urgent, either
+finish or hand off one of the existing items first.
 
 ## Pull Request Rules
 
