@@ -492,6 +492,14 @@ fn api_reads_reject_when_engine_is_halted() {
         })),
         ApiResponse::GetResource(ResourceResponse::EngineHalted)
     );
+    assert_eq!(
+        live.handle_api_request(ApiRequest::GetReservation(ReservationRequest {
+            reservation_id: ReservationId(11),
+            current_slot: Slot(1),
+            required_lsn: None,
+        })),
+        ApiResponse::GetReservation(ReservationResponse::EngineHalted)
+    );
     drop(live);
 
     let mut recovered =

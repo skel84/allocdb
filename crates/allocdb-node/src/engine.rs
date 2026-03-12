@@ -588,6 +588,8 @@ impl SingleNodeEngine {
     }
 
     fn collect_due_expirations(&self, current_wall_clock_slot: Slot) -> Vec<DueExpiration> {
+        // Scan the full wheel so delayed ticks catch up on overdue expirations, then truncate to
+        // the configured per-tick bound before committing internal expire commands.
         let mut due = Vec::new();
         for bucket in 0..self.db.config().wheel_len() {
             let bucket_slot = Slot(u64::try_from(bucket).expect("wheel bucket index must fit u64"));

@@ -99,6 +99,7 @@ fn recover_allocdb_replays_wal_without_snapshot() {
     assert_eq!(recovered.replayed_wal_last_lsn, Some(Lsn(2)));
     assert_eq!(recovered.db.snapshot(), live.snapshot());
 
+    drop(wal);
     fs::remove_file(wal_path).unwrap();
 }
 
@@ -153,6 +154,7 @@ fn recover_allocdb_skips_frames_covered_by_snapshot() {
     assert_eq!(recovered.replayed_wal_last_lsn, Some(Lsn(3)));
     assert_eq!(recovered.db.snapshot(), live.snapshot());
 
+    drop(wal);
     fs::remove_file(wal_path).unwrap();
     fs::remove_file(snapshot_path).unwrap();
 }
@@ -200,6 +202,7 @@ fn recover_allocdb_truncates_torn_tail() {
         ResourceState::Available
     );
 
+    drop(wal);
     fs::remove_file(wal_path).unwrap();
 }
 
@@ -220,6 +223,7 @@ fn recover_allocdb_marks_empty_snapshot_as_loaded() {
     assert_eq!(recovered.replayed_wal_frame_count, 0);
     assert_eq!(recovered.replayed_wal_last_lsn, None);
 
+    drop(wal);
     fs::remove_file(wal_path).unwrap();
     fs::remove_file(snapshot_path).unwrap();
 }
@@ -265,6 +269,7 @@ fn recover_allocdb_replays_internal_commands() {
         ResourceState::Available
     );
 
+    drop(wal);
     fs::remove_file(wal_path).unwrap();
 }
 
@@ -311,5 +316,6 @@ fn recover_allocdb_fails_closed_on_mid_log_corruption() {
         }) if offset == first_len
     ));
 
+    drop(wal);
     fs::remove_file(wal_path).unwrap();
 }

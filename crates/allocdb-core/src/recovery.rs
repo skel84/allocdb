@@ -110,7 +110,8 @@ pub fn recover_allocdb(
     })
     .inspect(|result| {
         info!(
-            "recovery complete: loaded_snapshot_lsn={:?} replayed_wal_frame_count={} replayed_wal_last_lsn={:?}",
+            "recovery complete: loaded_snapshot={} loaded_snapshot_lsn={:?} replayed_wal_frame_count={} replayed_wal_last_lsn={:?}",
+            result.loaded_snapshot,
             result.loaded_snapshot_lsn,
             result.replayed_wal_frame_count,
             result.replayed_wal_last_lsn,
