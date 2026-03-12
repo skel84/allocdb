@@ -105,6 +105,9 @@ Addressing CodeRabbit means one of:
 - short reason when not applied
 
 Do not leave substantive CodeRabbit comments unresolved or silently ignored.
+When leaving PR comments for review follow-ups, keep them brief: identify the change, note the
+validation command rerun, and avoid pasting full validation output unless the output itself is
+important to the discussion.
 
 ## Merge Policy
 
