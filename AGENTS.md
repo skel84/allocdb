@@ -45,7 +45,9 @@ Project-specific design and engineering rules live in:
   issue-less.
 - Keep each PR scoped to one planned task such as `M2-T08`, or one tightly related bundle small
   enough to review in one pass.
-- Treat CodeRabbit as advisory but mandatory to triage. Apply correctness, safety, recovery, test,
+- Treat CodeRabbit as part of the required review path when it is enabled on the repository.
+  Address every substantive CodeRabbit comment explicitly before merge by either applying the
+  change or documenting why it is not being applied. Apply correctness, safety, recovery, test,
   and docs-alignment feedback by default; document why you reject suggestions that would weaken
   determinism, boundedness, or trusted-core discipline.
 - After review-driven edits, rerun the relevant validation commands before considering the work

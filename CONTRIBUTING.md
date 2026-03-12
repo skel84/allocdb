@@ -72,17 +72,21 @@ Add narrower commands too when they strengthen confidence for the specific chang
 
 - human review focuses first on correctness, regressions, missing tests, recovery behavior, and
   docs drift
-- CodeRabbit is advisory, but every substantial suggestion must be triaged explicitly
+- CodeRabbit is part of the review path when enabled on the repository
+- every CodeRabbit suggestion or comment that affects the PR must be addressed explicitly before
+  merge
 - apply CodeRabbit suggestions by default when they improve correctness, safety, testing,
   observability, or documentation
 - reject CodeRabbit suggestions when they add churn without value or weaken determinism,
   boundedness, dependency discipline, or trusted-core isolation
 
-Keep a short triage note in the PR description or comments:
+Addressing CodeRabbit means one of:
 
 - `applied`
 - `not applied`
 - short reason when not applied
+
+Do not leave substantive CodeRabbit comments unresolved or silently ignored.
 
 ## Merge Policy
 
@@ -93,6 +97,19 @@ Until the repository has more human reviewers, self-merge is acceptable only aft
 - CodeRabbit feedback is triaged
 
 When the team grows, switch to at least one human approval before merge.
+
+## Repository Guardrails
+
+The GitHub repository is configured so that `main`:
+
+- requires pull requests before merge
+- requires the `checks` CI job and uses strict status checks
+- requires resolved review conversations
+- requires linear history
+- disallows force pushes and branch deletion
+
+When enabled on the repository, CodeRabbit is part of the normal review path and its feedback must
+be addressed before merge.
 
 ## Labels And Milestones
 
