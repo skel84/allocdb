@@ -69,11 +69,11 @@ Current implementation anchor:
 ```text
 client
   -> read request
-  -> wait until applied_lsn >= required_lsn
-  -> answer from in-memory state
+  -> check applied_lsn >= required_lsn
+  -> answer from in-memory state or return fence_not_applied
 ```
 
-For a single node, this is enough for strict reads.
+For a single node, this is enough for strict reads in the current alpha.
 
 If the live engine halts after a WAL-path ambiguity, reads must fail closed until recovery
 reconstructs memory from durable state.

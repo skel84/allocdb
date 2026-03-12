@@ -24,9 +24,10 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: fail-closed recovery on semantically invalid WAL ordering and
-    malformed decoded snapshots, including typed restore/replay errors, explicit recovery logging,
-    and bounded retired-reservation watermark preservation across snapshot restore
+  - current validated chunk: operator-facing runbook for the single-node alpha, including startup
+    mode classification, fail-closed recovery handling, overload/backpressure guidance, expiration
+    maintenance expectations, and validation commands aligned with current engine and recovery
+    behavior
 
 ## What Exists
 
@@ -66,6 +67,9 @@
     restore through bounded retired-watermark metadata
   - bounded `tick_expirations` maintenance request for live TTL enforcement
   - metrics exposure through the same API boundary
+- Operator documentation:
+  - operator-facing runbook for single-node startup, restart, checkpoint, overload, expiration
+    maintenance, and corruption/fail-closed handling
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -96,7 +100,7 @@
 - `M4-T02`: inject reproducible crash points around WAL, apply, snapshot, and recovery boundaries
   on top of the promoted simulation harness
 - follow with `M4-T03` storage-fault coverage using the same deterministic driver
-- resume `M5-T04` operator guidance after the simulation evidence set is broader
+- keep the operator runbook aligned as new simulation and storage-fault evidence lands
 
 ## How To Check Progress
 
