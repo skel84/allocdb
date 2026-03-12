@@ -25,9 +25,6 @@ mod checkpoint_tests;
 #[path = "engine_observe.rs"]
 mod observe;
 #[cfg(test)]
-#[path = "experiments/simulation_harness_spike_tests.rs"]
-mod simulation_harness_spike_tests;
-#[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;
 pub use checkpoint::{CheckpointError, CheckpointResult};
