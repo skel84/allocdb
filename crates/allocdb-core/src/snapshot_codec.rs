@@ -13,6 +13,10 @@ pub(super) fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
     bytes.extend_from_slice(&VERSION.to_le_bytes());
     encode_optional_u64(&mut bytes, snapshot.last_applied_lsn.map(Lsn::get));
     encode_optional_u64(&mut bytes, snapshot.last_request_slot.map(Slot::get));
+    encode_optional_u128(
+        &mut bytes,
+        snapshot.max_retired_reservation_id.map(ReservationId::get),
+    );
     encode_u32(
         &mut bytes,
         u32::try_from(snapshot.resources.len()).expect("resource count must fit u32"),
@@ -86,12 +90,17 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, SnapshotError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION {
+    if version != 1 && version != VERSION {
         return Err(SnapshotError::InvalidVersion(version));
     }
 
     let last_applied_lsn = cursor.read_optional_u64()?.map(Lsn);
     let last_request_slot = cursor.read_optional_u64()?.map(Slot);
+    let max_retired_reservation_id = if version == 1 {
+        None
+    } else {
+        cursor.read_optional_u128()?.map(ReservationId)
+    };
     let resource_count =
         usize::try_from(cursor.read_u32()?).map_err(|_| SnapshotError::CountTooLarge)?;
     let reservation_count =
@@ -156,6 +165,7 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, SnapshotError> {
     Ok(Snapshot {
         last_applied_lsn,
         last_request_slot,
+        max_retired_reservation_id,
         resources,
         reservations,
         operations,

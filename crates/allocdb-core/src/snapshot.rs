@@ -1,5 +1,5 @@
 use crate::config::{Config, ConfigError};
-use crate::ids::{Lsn, Slot};
+use crate::ids::{Lsn, ReservationId, Slot};
 use crate::state_machine::{AllocDb, OperationRecord, ReservationRecord, ResourceRecord};
 
 #[path = "snapshot_codec.rs"]
@@ -11,12 +11,13 @@ mod cursor;
 mod tests;
 
 const MAGIC: u32 = 0x4144_4253;
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
     pub last_applied_lsn: Option<Lsn>,
     pub last_request_slot: Option<Slot>,
+    pub max_retired_reservation_id: Option<ReservationId>,
     pub resources: Vec<ResourceRecord>,
     pub reservations: Vec<ReservationRecord>,
     pub operations: Vec<OperationRecord>,
@@ -77,6 +78,7 @@ impl AllocDb {
         Snapshot {
             last_applied_lsn: self.last_applied_lsn,
             last_request_slot: self.last_request_slot,
+            max_retired_reservation_id: self.max_retired_reservation_id,
             resources,
             reservations,
             operations,
@@ -94,6 +96,7 @@ impl AllocDb {
         let Snapshot {
             last_applied_lsn,
             last_request_slot,
+            max_retired_reservation_id,
             resources,
             reservations,
             operations,
@@ -133,6 +136,7 @@ impl AllocDb {
             &mut operation_retire_entries,
         );
         db.wheel = wheel;
+        db.max_retired_reservation_id = max_retired_reservation_id;
         db.last_applied_lsn = last_applied_lsn;
         db.last_request_slot = last_request_slot;
         db.assert_invariants();

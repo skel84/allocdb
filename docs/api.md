@@ -207,6 +207,11 @@ retire_after_slot : u64 | none
 ```
 
 `retired` is distinct from `not_found` because bounded history is part of the product contract.
+The live reservation record remains queryable until `retire_after_slot`; after that, the engine
+may drop the full record but must keep returning `retired` for shard-local `reservation_id`
+values at or below its retired watermark. This watermark is conservative: once full history is
+gone, the API no longer distinguishes an aged-out reservation from an older shard-local
+`reservation_id` below that watermark.
 
 If the live engine has halted after a WAL-path ambiguity, reads must fail closed with
 `engine_halted` until recovery rebuilds memory from durable state.

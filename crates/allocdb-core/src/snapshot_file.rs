@@ -218,6 +218,7 @@ mod tests {
         let first = Snapshot {
             last_applied_lsn: None,
             last_request_slot: None,
+            max_retired_reservation_id: None,
             resources: Vec::new(),
             reservations: Vec::new(),
             operations: Vec::new(),

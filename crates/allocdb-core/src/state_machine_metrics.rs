@@ -41,14 +41,19 @@ impl AllocDb {
     ///
     /// # Errors
     ///
-    /// Returns [`ReservationLookupError::NotFound`] if the reservation does not exist and
-    /// [`ReservationLookupError::Retired`] if it has aged out of the configured history window.
+    /// Returns [`ReservationLookupError::Retired`] if the live reservation has aged out of the
+    /// configured history window or if the lookup falls below the bounded retired watermark after
+    /// the full record has been dropped. Returns [`ReservationLookupError::NotFound`] only for
+    /// reservation IDs that remain outside that retained retired range.
     pub fn reservation(
         &self,
         reservation_id: ReservationId,
         current_slot: Slot,
     ) -> Result<ReservationRecord, ReservationLookupError> {
         let Some(record) = self.reservations.get(reservation_id).copied() else {
+            if self.retired_reservation_lookup_contains(reservation_id) {
+                return Err(ReservationLookupError::Retired);
+            }
             return Err(ReservationLookupError::NotFound);
         };
 

@@ -1,8 +1,8 @@
 use crate::command::{ClientRequest, Command, CommandContext};
 use crate::config::Config;
-use crate::ids::{ClientId, HolderId, Lsn, OperationId, ResourceId, Slot};
+use crate::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use crate::snapshot::{Snapshot, SnapshotError};
-use crate::state_machine::AllocDb;
+use crate::state_machine::{AllocDb, ReservationLookupError};
 
 fn config() -> Config {
     Config {
@@ -63,6 +63,7 @@ fn snapshot_decode_rejects_corruption() {
     let mut bytes = Snapshot {
         last_applied_lsn: None,
         last_request_slot: None,
+        max_retired_reservation_id: None,
         resources: Vec::new(),
         reservations: Vec::new(),
         operations: Vec::new(),
@@ -82,6 +83,7 @@ fn from_snapshot_rejects_wheel_size_mismatch() {
     let snapshot = Snapshot {
         last_applied_lsn: None,
         last_request_slot: None,
+        max_retired_reservation_id: None,
         resources: Vec::new(),
         reservations: Vec::new(),
         operations: Vec::new(),
@@ -90,4 +92,84 @@ fn from_snapshot_rejects_wheel_size_mismatch() {
 
     let restored = AllocDb::from_snapshot(config(), snapshot);
     assert!(matches!(restored, Err(SnapshotError::InvalidLayout)));
+}
+
+#[test]
+fn snapshot_restores_retired_lookup_watermark() {
+    let mut db = AllocDb::new(config()).unwrap();
+    db.apply_client(
+        context(1, 1),
+        ClientRequest {
+            operation_id: OperationId(1),
+            client_id: ClientId(7),
+            command: Command::CreateResource {
+                resource_id: ResourceId(11),
+            },
+        },
+    );
+    db.apply_client(
+        context(2, 2),
+        ClientRequest {
+            operation_id: OperationId(2),
+            client_id: ClientId(7),
+            command: Command::Reserve {
+                resource_id: ResourceId(11),
+                holder_id: HolderId(5),
+                ttl_slots: 3,
+            },
+        },
+    );
+    db.apply_client(
+        context(3, 3),
+        ClientRequest {
+            operation_id: OperationId(3),
+            client_id: ClientId(7),
+            command: Command::Release {
+                reservation_id: ReservationId(2),
+                holder_id: HolderId(5),
+            },
+        },
+    );
+    db.apply_client(
+        context(4, 8),
+        ClientRequest {
+            operation_id: OperationId(4),
+            client_id: ClientId(7),
+            command: Command::CreateResource {
+                resource_id: ResourceId(12),
+            },
+        },
+    );
+
+    assert_eq!(
+        db.reservation(ReservationId(2), Slot(8)),
+        Err(ReservationLookupError::Retired)
+    );
+
+    let restored =
+        AllocDb::from_snapshot(config(), Snapshot::decode(&db.snapshot().encode()).unwrap())
+            .unwrap();
+
+    assert_eq!(
+        restored.reservation(ReservationId(2), Slot(8)),
+        Err(ReservationLookupError::Retired)
+    );
+}
+
+#[test]
+fn snapshot_decode_accepts_legacy_v1_layout() {
+    let snapshot = Snapshot {
+        last_applied_lsn: None,
+        last_request_slot: None,
+        max_retired_reservation_id: None,
+        resources: Vec::new(),
+        reservations: Vec::new(),
+        operations: Vec::new(),
+        wheel: vec![Vec::new(); config().wheel_len()],
+    };
+    let mut bytes = snapshot.encode();
+    bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
+    bytes.remove(8);
+
+    assert_eq!(Snapshot::decode(&bytes).unwrap(), snapshot);
 }
