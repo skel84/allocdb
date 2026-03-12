@@ -368,7 +368,7 @@ cargo run -p allocdb-bench -- --scenario all
 Inspect the current recovery and halt log signatures in source:
 
 ```sh
-rg -n "recovery complete|recovery failed while loading snapshot|recovery rejected semantically invalid snapshot|recovery rejected wal replay ordering|halting engine on WAL error|halting engine on internal WAL error" \
+rg -n "recovery complete|recovery aborted due to invalid configuration|recovery failed while loading snapshot|recovery rejected semantically invalid snapshot|recovery failed while scanning wal|recovery rejected wal payload|recovery rejected wal replay ordering|halting engine on WAL error|halting engine on internal WAL error" \
   crates/allocdb-core/src/recovery.rs \
   crates/allocdb-node/src/engine.rs
 ```
