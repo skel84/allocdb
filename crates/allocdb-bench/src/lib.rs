@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use allocdb_core::command::{ClientRequest, Command};
@@ -29,6 +30,7 @@ const DEFAULT_QUEUE_CAPACITY: u32 = 8;
 const DEFAULT_EXPIRATIONS_PER_TICK: u32 = 8;
 const BENCH_CLIENT_ID: ClientId = ClientId(7);
 const RETRY_CONFLICT_RESOURCE_OFFSET: u128 = 1_000_000;
+static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScenarioSelection {
@@ -1049,10 +1051,12 @@ impl ScenarioWorkspace {
                 message: error.to_string(),
             })?
             .as_nanos();
+        let workspace_id = NEXT_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
         let wal_path = std::env::temp_dir().join(format!(
-            "allocdb-bench-{}-{}-{}.wal",
+            "allocdb-bench-{}-{}-{}-{}.wal",
             scenario.as_str(),
             std::process::id(),
+            workspace_id,
             timestamp
         ));
         Ok(Self { wal_path })
