@@ -4,6 +4,7 @@ use crate::fixed_map::{FixedMap, FixedMapError};
 use crate::ids::{HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use crate::result::{CommandOutcome, ResultCode};
 use crate::retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
+use log::warn;
 
 #[path = "state_machine_apply.rs"]
 mod apply;
@@ -11,6 +12,9 @@ mod apply;
 mod execution;
 #[path = "state_machine_invariants.rs"]
 mod invariants;
+#[cfg(test)]
+#[path = "state_machine_issue_31_tests.rs"]
+mod issue_31_tests;
 #[cfg(test)]
 #[path = "state_machine_issue_32_tests.rs"]
 mod issue_32_tests;
@@ -80,6 +84,20 @@ pub struct OperationRecord {
 pub enum ReservationLookupError {
     NotFound,
     Retired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlotOverflowKind {
+    OperationWindow,
+    Deadline,
+    ReservationHistory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlotOverflowError {
+    pub kind: SlotOverflowKind,
+    pub request_slot: Slot,
+    pub delta: u64,
 }
 
 #[derive(Debug)]
@@ -176,6 +194,61 @@ impl AllocDb {
 
     fn reservation_id_from_lsn(&self, lsn: Lsn) -> ReservationId {
         ReservationId((u128::from(self.config.shard_id) << 64) | u128::from(lsn.get()))
+    }
+
+    /// Validates client-visible additive slot derivations before sequencing.
+    /// # Errors
+    /// Returns [`SlotOverflowError`] if the request slot cannot represent the command's derived
+    /// deadline/history slot or the operation dedupe window.
+    pub fn validate_client_request_slot(
+        &self,
+        request_slot: Slot,
+        command: Command,
+    ) -> Result<(), SlotOverflowError> {
+        self.validate_command_slot(request_slot, command)?;
+        let _ = self.operation_retire_after_slot(request_slot)?;
+        Ok(())
+    }
+
+    /// Validates additive slot derivations for one internal command before WAL append or replay.
+    /// # Errors
+    /// Returns [`SlotOverflowError`] if the command's derived deadline/history slot would exceed
+    /// `u64::MAX`.
+    pub fn validate_internal_request_slot(
+        &self,
+        request_slot: Slot,
+        command: Command,
+    ) -> Result<(), SlotOverflowError> {
+        self.validate_command_slot(request_slot, command)
+    }
+
+    pub(crate) fn deadline_slot(
+        request_slot: Slot,
+        ttl_slots: u64,
+    ) -> Result<Slot, SlotOverflowError> {
+        Self::checked_slot_add(request_slot, ttl_slots, SlotOverflowKind::Deadline)
+    }
+
+    pub(crate) fn reservation_retire_after_slot(
+        &self,
+        request_slot: Slot,
+    ) -> Result<Slot, SlotOverflowError> {
+        Self::checked_slot_add(
+            request_slot,
+            self.config.reservation_history_window_slots,
+            SlotOverflowKind::ReservationHistory,
+        )
+    }
+
+    pub(crate) fn operation_retire_after_slot(
+        &self,
+        request_slot: Slot,
+    ) -> Result<Slot, SlotOverflowError> {
+        Self::checked_slot_add(
+            request_slot,
+            self.config.operation_window_slots(),
+            SlotOverflowKind::OperationWindow,
+        )
     }
 
     fn wheel_bucket_index(&self, slot: Slot) -> usize {
@@ -296,5 +369,51 @@ impl AllocDb {
         }
 
         reservation_id <= max_retired_reservation_id
+    }
+
+    pub(crate) fn slot_overflow_outcome(
+        operation: &'static str,
+        error: SlotOverflowError,
+    ) -> CommandOutcome {
+        warn!(
+            "{operation} rejected slot_overflow kind={:?} request_slot={} delta={}",
+            error.kind,
+            error.request_slot.get(),
+            error.delta,
+        );
+        CommandOutcome::new(ResultCode::SlotOverflow)
+    }
+
+    fn validate_command_slot(
+        &self,
+        request_slot: Slot,
+        command: Command,
+    ) -> Result<(), SlotOverflowError> {
+        match command {
+            Command::Reserve { ttl_slots, .. } => {
+                let _ = Self::deadline_slot(request_slot, ttl_slots)?;
+            }
+            Command::Release { .. } | Command::Expire { .. } => {
+                let _ = self.reservation_retire_after_slot(request_slot)?;
+            }
+            Command::CreateResource { .. } | Command::Confirm { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn checked_slot_add(
+        request_slot: Slot,
+        delta: u64,
+        kind: SlotOverflowKind,
+    ) -> Result<Slot, SlotOverflowError> {
+        request_slot
+            .get()
+            .checked_add(delta)
+            .map(Slot)
+            .ok_or(SlotOverflowError {
+                kind,
+                request_slot,
+                delta,
+            })
     }
 }

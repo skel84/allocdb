@@ -1,7 +1,6 @@
 use log::{debug, warn};
 
 use crate::command::{ClientRequest, Command, CommandContext};
-use crate::ids::Slot;
 use crate::result::{CommandOutcome, ResultCode};
 use crate::state_machine::{AllocDb, OperationRecord};
 
@@ -17,6 +16,11 @@ impl AllocDb {
         context: CommandContext,
         request: ClientRequest,
     ) -> CommandOutcome {
+        if let Err(error) = self.validate_client_request_slot(context.request_slot, request.command)
+        {
+            return Self::slot_overflow_outcome("apply_client", error);
+        }
+
         self.begin_apply(context);
         self.retire_state(context.request_slot);
 
@@ -55,6 +59,12 @@ impl AllocDb {
             return CommandOutcome::new(ResultCode::OperationTableFull);
         }
 
+        let operation_retire_after_slot =
+            match self.operation_retire_after_slot(context.request_slot) {
+                Ok(retire_after_slot) => retire_after_slot,
+                Err(error) => return Self::slot_overflow_outcome("apply_client", error),
+            };
+
         let outcome = self.apply_command(context, request.command);
         let operation_record = OperationRecord {
             operation_id: request.operation_id,
@@ -63,9 +73,7 @@ impl AllocDb {
             result_reservation_id: outcome.reservation_id,
             result_deadline_slot: outcome.deadline_slot,
             applied_lsn: context.lsn,
-            retire_after_slot: Slot(
-                context.request_slot.get() + self.config.operation_window_slots(),
-            ),
+            retire_after_slot: operation_retire_after_slot,
         };
         self.insert_operation(operation_record);
         self.push_operation_retirement(
@@ -83,6 +91,10 @@ impl AllocDb {
     /// Panics if log sequence numbers or request slots move backwards, or if existing state has
     /// already violated internal invariants.
     pub fn apply_internal(&mut self, context: CommandContext, command: Command) -> CommandOutcome {
+        if let Err(error) = self.validate_internal_request_slot(context.request_slot, command) {
+            return Self::slot_overflow_outcome("apply_internal", error);
+        }
+
         self.begin_apply(context);
         self.retire_state(context.request_slot);
         let outcome = self.apply_command(context, command);

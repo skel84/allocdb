@@ -51,7 +51,7 @@ impl SingleNodeEngine {
             queue_depth: u32::try_from(self.queue.len()).expect("queue depth must fit u32"),
             queue_capacity: u32::try_from(self.queue.capacity())
                 .expect("queue capacity must fit u32"),
-            accepting_writes: self.accepting_writes,
+            accepting_writes: self.writes_available(),
             recovery: RecoveryStatus {
                 startup_kind: self.recovery_startup_kind(),
                 loaded_snapshot_lsn: self.startup_recovery.loaded_snapshot_lsn,

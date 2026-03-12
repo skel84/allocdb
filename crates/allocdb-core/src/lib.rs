@@ -18,5 +18,5 @@ pub use ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, S
 pub use result::{CommandOutcome, ResultCode};
 pub use state_machine::{
     AllocDb, HealthMetrics, OperationRecord, ReservationLookupError, ReservationRecord,
-    ReservationState, ResourceRecord, ResourceState,
+    ReservationState, ResourceRecord, ResourceState, SlotOverflowError, SlotOverflowKind,
 };

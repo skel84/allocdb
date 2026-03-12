@@ -162,9 +162,14 @@ The current v1 result-code set is:
 - `operation_conflict`
 - `invalid_state`
 - `holder_mismatch`
+- `slot_overflow`
 
 `operation_table_full` is a pre-commit failure: the allocator cannot accept a new deduped client
 command because it has no bounded space to remember the outcome.
+
+`slot_overflow` is the trusted-core guard result when a derived deadline or retirement slot would
+exceed `u64::MAX`. The single-node engine rejects the same condition before WAL commit as a
+definite submission failure.
 
 ### Create Resource
 
@@ -357,7 +362,10 @@ The v1 rule is:
 
 Current single-node engine rule:
 
-- malformed request, payload-too-large, and overload errors are definite pre-commit failures
+- malformed request, payload-too-large, overload, and slot-overflow errors are definite
+  pre-commit failures
+- `lsn_exhausted` is a definite write rejection once the engine has committed `u64::MAX` and no
+  further LSN can be assigned
 - WAL write failure halts the live engine and is an indefinite submission failure
 - after a WAL-path failure, the live engine refuses further writes with `engine_halted`
 - clients resolve that ambiguity by recovering the node, then retrying the same `operation_id`
