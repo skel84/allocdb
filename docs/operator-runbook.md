@@ -266,8 +266,8 @@ Current fail-closed behavior:
 
 The code logs these events at `error` level with these exact signatures:
 
-- `halting engine on WAL error, accepting_writes set to false`
-- `halting engine on internal WAL error, accepting_writes set to false`
+- `halting engine on WAL error, accepting_writes set to false: operation_id={} request_slot={} applied_lsn={} phase={} error={error:?}`
+- `halting engine on internal WAL error, accepting_writes set to false: request_slot={} applied_lsn={} phase={} error={error:?}`
 
 ### Ambiguous Write Retry Rule
 
