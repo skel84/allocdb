@@ -1,0 +1,11 @@
+[package]
+name = "allocdb-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+allocdb-core = { path = "../allocdb-core" }
+
+[lints]
+workspace = true

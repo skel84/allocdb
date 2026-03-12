@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/allocdb-core"]
+members = ["crates/allocdb-core", "crates/allocdb-node"]
 resolver = "2"
 
 [workspace.package]

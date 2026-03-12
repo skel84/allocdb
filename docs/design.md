@@ -39,7 +39,8 @@ The first implementation target is intentionally narrow:
 
 Current implementation anchor:
 
-- `crates/allocdb-core` contains the first trusted-core slice
+- `crates/allocdb-core` contains the trusted-core allocator and durability logic
+- `crates/allocdb-node` contains the first in-process single-node submission wrapper
 
 ## Document Map
 

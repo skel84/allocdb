@@ -14,6 +14,10 @@ Current trusted-core boundary:
 
 Everything else should be treated as outside the trusted core unless explicitly promoted into it.
 
+Current non-core node wrapper:
+
+- `crates/allocdb-node`
+
 Design target:
 
 - fixed-capacity resource storage
@@ -44,11 +48,12 @@ Current observability surface:
   product needs read-version preconditions beyond reservation identity
 - classify torn EOF tails separately from durable-log corruption in every recovery path
 - expose logical slot lag and expiration backlog through a bounded health snapshot
+- expose queue depth and write-acceptance state through the single-node engine wrapper
 
 Next hardening steps before alpha are:
 
-- add queue-pressure metrics once the bounded submission path exists
 - surface recovery status alongside the current lag and backlog signals
+- tighten checkpoint coordination between snapshot creation and WAL truncation
 
 ## Dependency Policy
 

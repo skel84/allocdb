@@ -15,6 +15,16 @@ pub struct HealthMetrics {
 
 impl AllocDb {
     #[must_use]
+    pub fn last_applied_lsn(&self) -> Option<Lsn> {
+        self.last_applied_lsn
+    }
+
+    #[must_use]
+    pub fn last_request_slot(&self) -> Option<Slot> {
+        self.last_request_slot
+    }
+
+    #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
     }

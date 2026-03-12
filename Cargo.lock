@@ -11,6 +11,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocdb-node"
+version = "0.1.0"
+dependencies = [
+ "allocdb-core",
+]
+
+[[package]]
 name = "crc32c"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

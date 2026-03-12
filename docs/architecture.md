@@ -58,6 +58,10 @@ Rules:
 - live execution and replay use the same apply logic
 - publish never rewrites the result after the command is applied
 
+Current implementation anchor:
+
+- `allocdb_node::SingleNodeEngine` in `crates/allocdb-node/src/engine.rs`
+
 ## Read Path
 
 ```text
@@ -68,6 +72,10 @@ client
 ```
 
 For a single node, this is enough for strict reads.
+
+Current implementation anchor:
+
+- `SingleNodeEngine::enforce_read_fence(required_lsn)` in `crates/allocdb-node/src/engine_observe.rs`
 
 ## Expiration Path
 
@@ -151,6 +159,7 @@ Required operational signals:
 Current implementation anchor:
 
 - `AllocDb::health_metrics(current_wall_clock_slot)` in `crates/allocdb-core/src/state_machine_metrics.rs`
+- `SingleNodeEngine::metrics(current_wall_clock_slot)` in `crates/allocdb-node/src/engine_observe.rs`
 
 Delayed expiration is acceptable. Premature reuse is not.
 
