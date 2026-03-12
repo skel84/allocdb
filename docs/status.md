@@ -24,9 +24,9 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: deterministic simulated slot-driver support in `allocdb-node`,
-    including seeded same-slot scheduling, explicit logical-slot advancement, restart-path
-    regression coverage, and doc updates for the promoted simulation harness
+  - current validated chunk: keep retired reservation lookups distinct from `not_found` across
+    later writes and snapshot restore using bounded retired-watermark metadata, with core/API
+    regression coverage and docs alignment
 
 ## What Exists
 
@@ -62,6 +62,8 @@
   - binary request and response codec with fixed-width little-endian encoding
   - explicit wire-level mapping for definite vs indefinite submission failures
   - strict-read fence responses plus halt-safe read rejection for resource and reservation queries
+  - retired reservation lookups remain distinct from `not_found` across later writes and snapshot
+    restore through bounded retired-watermark metadata
   - bounded `tick_expirations` maintenance request for live TTL enforcement
   - metrics exposure through the same API boundary
 - Durability primitives:
@@ -80,10 +82,10 @@
   - seeded same-slot ready-set scheduling with reproducible transcripts
   - checkpoint, restart, and injected persist-failure helpers over the real `SingleNodeEngine`
 - Validation:
-  - `cargo test -p allocdb-node simulation`
+  - `cargo test -p allocdb-core retired_reservation_lookup_survives_unrelated_later_write`
+  - `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
+  - `cargo test -p allocdb-node api_reservation_reports_retired_history`
   - `cargo run -p allocdb-bench -- --scenario all`
-  - `cargo test -p allocdb-core repeated_removals_preserve_lookup_for_operation_like_hashes`
-  - `cargo test -p allocdb-core operation_table_utilization_drops_after_retry_window_retirement`
   - `scripts/preflight.sh`
 
 ## Current Focus
