@@ -19,14 +19,5 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Run formatting check
-        run: cargo fmt --all --check
-
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Run tests
-        run: cargo test
-
-      - name: Run repository guardrails
-        run: scripts/check_repo.sh
+      - name: Run preflight
+        run: scripts/preflight.sh

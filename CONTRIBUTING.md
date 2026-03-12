@@ -59,7 +59,13 @@ Examples:
 
 ## Required Validation
 
-Run the relevant commands before opening or merging a PR:
+Run the local preflight before opening or merging a PR:
+
+- `scripts/preflight.sh`
+
+That command is the preferred local path because CI runs the same script.
+
+It currently runs:
 
 - `cargo fmt --all --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
@@ -67,6 +73,14 @@ Run the relevant commands before opening or merging a PR:
 - `scripts/check_repo.sh`
 
 Add narrower commands too when they strengthen confidence for the specific change.
+
+## Local Hooks
+
+Install the repository-managed hooks once per clone:
+
+- `scripts/install-hooks.sh`
+
+This configures git to use `.githooks/` and runs `scripts/preflight.sh` on `pre-push`.
 
 ## Review Policy
 
@@ -92,6 +106,7 @@ Do not leave substantive CodeRabbit comments unresolved or silently ignored.
 
 Until the repository has more human reviewers, self-merge is acceptable only after:
 
+- `scripts/preflight.sh` passes locally
 - required checks pass
 - review comments are addressed
 - CodeRabbit feedback is triaged

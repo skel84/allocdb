@@ -45,6 +45,8 @@ Project-specific design and engineering rules live in:
   issue-less.
 - Keep each PR scoped to one planned task such as `M2-T08`, or one tightly related bundle small
   enough to review in one pass.
+- Prefer running [`scripts/preflight.sh`](./scripts/preflight.sh) before push or PR updates so the
+  local validation path matches CI.
 - Treat CodeRabbit as part of the required review path when it is enabled on the repository.
   Address every substantive CodeRabbit comment explicitly before merge by either applying the
   change or documenting why it is not being applied. Apply correctness, safety, recovery, test,

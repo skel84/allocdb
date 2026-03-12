@@ -6,10 +6,8 @@
 
 ## Validation
 
-- [ ] `cargo fmt --all --check`
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-- [ ] `cargo test`
-- [ ] `scripts/check_repo.sh`
+- [ ] `scripts/preflight.sh`
+- [ ] narrower targeted commands added when they materially strengthen confidence
 
 ## Docs
 
