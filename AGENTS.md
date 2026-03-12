@@ -43,6 +43,12 @@ Project-specific design and engineering rules live in:
 - After GitHub workflow setup, do substantive work on issue branches, not directly on `main`.
 - Every substantial change should link to a tracked GitHub issue or explicitly explain why it is
   issue-less.
+- Use the GitHub Project `AllocDB` as the operational work board. Keep planned work on the board,
+  not only in milestone pages or local docs.
+- When you start active work on an issue, move its project status to `In Progress`. Leave it there
+  through implementation and PR review, and move it to `Done` only after merge or explicit
+  completion.
+- Treat milestones as roadmap buckets and the GitHub Project as the live execution queue.
 - Keep each PR scoped to one planned task such as `M2-T08`, or one tightly related bundle small
   enough to review in one pass.
 - Prefer running [`scripts/preflight.sh`](./scripts/preflight.sh) before push or PR updates so the
