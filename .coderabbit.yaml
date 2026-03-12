@@ -3,14 +3,14 @@ language: en-US
 reviews:
   profile: chill
   high_level_summary: true
-  high_level_summary_in_walkthrough: true
+  high_level_summary_in_walkthrough: true # Keep the summary visible in the walkthrough.
   review_status: true
-  review_details: true
-  collapse_walkthrough: false
-  in_progress_fortune: false
-  poem: false
+  review_details: true # Show the full review details instead of status-only output.
+  collapse_walkthrough: false # Leave the walkthrough expanded so the review is easy to inspect.
+  in_progress_fortune: false # Drop decorative in-progress chatter from PR comments.
+  poem: false # Keep the review output factual and compact.
   auto_review:
     enabled: true
 
 chat:
-  auto_reply: true
+  auto_reply: true # Allow explicit review and summary requests from PR comments.
