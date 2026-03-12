@@ -58,6 +58,45 @@ fn create(resource_id: u128, operation_id: u128) -> ClientRequest {
     }
 }
 
+fn reserve(
+    resource_id: u128,
+    operation_id: u128,
+    holder_id: u128,
+    ttl_slots: u64,
+) -> ClientRequest {
+    ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::Reserve {
+            resource_id: ResourceId(resource_id),
+            holder_id: HolderId(holder_id),
+            ttl_slots,
+        },
+    }
+}
+
+fn confirm(reservation_id: ReservationId, operation_id: u128, holder_id: u128) -> ClientRequest {
+    ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::Confirm {
+            reservation_id,
+            holder_id: HolderId(holder_id),
+        },
+    }
+}
+
+fn release(reservation_id: ReservationId, operation_id: u128, holder_id: u128) -> ClientRequest {
+    ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::Release {
+            reservation_id,
+            holder_id: HolderId(holder_id),
+        },
+    }
+}
+
 #[test]
 fn engine_config_rejects_zero_bounds() {
     assert_eq!(
@@ -340,20 +379,7 @@ fn expiration_tick_commits_internal_expire_and_frees_overdue_resource() {
     let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
 
     engine.submit(Slot(1), create(11, 1)).unwrap();
-    let reserved = engine
-        .submit(
-            Slot(2),
-            ClientRequest {
-                operation_id: OperationId(2),
-                client_id: ClientId(7),
-                command: Command::Reserve {
-                    resource_id: ResourceId(11),
-                    holder_id: HolderId(9),
-                    ttl_slots: 3,
-                },
-            },
-        )
-        .unwrap();
+    let reserved = engine.submit(Slot(2), reserve(11, 2, 9, 3)).unwrap();
 
     let tick = engine.tick_expirations(Slot(20)).unwrap();
 
@@ -394,6 +420,162 @@ fn expiration_tick_commits_internal_expire_and_frees_overdue_resource() {
             RecordType::ClientCommand,
             RecordType::InternalCommand,
         ]
+    );
+
+    fs::remove_file(wal_path).unwrap();
+}
+
+#[test]
+fn expiration_tick_drains_queued_confirm_before_expiring_same_reservation() {
+    let wal_path = test_path("expiration-tick-queued-confirm");
+    let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+
+    engine.submit(Slot(1), create(11, 1)).unwrap();
+    let reserved = engine.submit(Slot(2), reserve(11, 2, 9, 3)).unwrap();
+    let reservation_id = reserved
+        .outcome
+        .reservation_id
+        .expect("reserve must return reservation id");
+
+    let queued = engine
+        .enqueue_client(Slot(4), confirm(reservation_id, 3, 9))
+        .unwrap();
+    assert_eq!(queued, EnqueueResult::Queued);
+
+    let tick = engine.tick_expirations(Slot(20)).unwrap();
+
+    assert_eq!(tick.processed_count, 0);
+    assert_eq!(tick.last_applied_lsn, None);
+    assert!(engine.process_next().unwrap().is_none());
+    assert_eq!(
+        engine.db().resource(ResourceId(11)).unwrap().current_state,
+        ResourceState::Confirmed
+    );
+    assert_eq!(
+        engine
+            .db()
+            .reservation(reservation_id, Slot(20))
+            .unwrap()
+            .state,
+        ReservationState::Confirmed
+    );
+
+    let recovered_wal = WalFile::open(&wal_path, engine_config().max_command_bytes)
+        .unwrap()
+        .recover()
+        .unwrap();
+    assert_eq!(
+        recovered_wal
+            .scan_result
+            .frames
+            .iter()
+            .map(|frame| frame.record_type)
+            .collect::<Vec<_>>(),
+        vec![
+            RecordType::ClientCommand,
+            RecordType::ClientCommand,
+            RecordType::ClientCommand,
+        ]
+    );
+    assert_eq!(
+        recovered_wal
+            .scan_result
+            .frames
+            .iter()
+            .map(|frame| frame.request_slot)
+            .collect::<Vec<_>>(),
+        vec![Slot(1), Slot(2), Slot(4)]
+    );
+
+    fs::remove_file(wal_path).unwrap();
+}
+
+#[test]
+fn expiration_tick_preserves_monotonic_slots_after_draining_queued_release() {
+    let wal_path = test_path("expiration-tick-queued-release");
+    let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+
+    engine.submit(Slot(1), create(11, 1)).unwrap();
+    let first_reserved = engine.submit(Slot(2), reserve(11, 2, 9, 3)).unwrap();
+    let first_reservation_id = first_reserved
+        .outcome
+        .reservation_id
+        .expect("reserve must return reservation id");
+
+    engine.submit(Slot(3), create(12, 3)).unwrap();
+    let second_reserved = engine.submit(Slot(4), reserve(12, 4, 10, 3)).unwrap();
+    let second_reservation_id = second_reserved
+        .outcome
+        .reservation_id
+        .expect("reserve must return reservation id");
+
+    let queued = engine
+        .enqueue_client(Slot(25), release(first_reservation_id, 5, 9))
+        .unwrap();
+    assert_eq!(queued, EnqueueResult::Queued);
+
+    let tick = engine.tick_expirations(Slot(20)).unwrap();
+
+    assert_eq!(tick.processed_count, 1);
+    assert_eq!(tick.last_applied_lsn, Some(Lsn(6)));
+    assert!(engine.process_next().unwrap().is_none());
+    assert_eq!(
+        engine.metrics(Slot(20)).core.last_request_slot,
+        Some(Slot(25))
+    );
+    assert_eq!(
+        engine
+            .db()
+            .reservation(first_reservation_id, Slot(25))
+            .unwrap()
+            .state,
+        ReservationState::Released
+    );
+    assert_eq!(
+        engine
+            .db()
+            .reservation(second_reservation_id, Slot(25))
+            .unwrap()
+            .state,
+        ReservationState::Expired
+    );
+    assert_eq!(
+        engine.db().resource(ResourceId(11)).unwrap().current_state,
+        ResourceState::Available
+    );
+    assert_eq!(
+        engine.db().resource(ResourceId(12)).unwrap().current_state,
+        ResourceState::Available
+    );
+
+    let recovered_wal = WalFile::open(&wal_path, engine_config().max_command_bytes)
+        .unwrap()
+        .recover()
+        .unwrap();
+    assert_eq!(
+        recovered_wal
+            .scan_result
+            .frames
+            .iter()
+            .map(|frame| frame.record_type)
+            .collect::<Vec<_>>(),
+        vec![
+            RecordType::ClientCommand,
+            RecordType::ClientCommand,
+            RecordType::ClientCommand,
+            RecordType::ClientCommand,
+            RecordType::ClientCommand,
+            RecordType::InternalCommand,
+        ]
+    );
+    assert_eq!(
+        recovered_wal
+            .scan_result
+            .frames
+            .iter()
+            .map(|frame| frame.request_slot)
+            .collect::<Vec<_>>(),
+        vec![Slot(1), Slot(2), Slot(3), Slot(4), Slot(25), Slot(25)]
     );
 
     fs::remove_file(wal_path).unwrap();

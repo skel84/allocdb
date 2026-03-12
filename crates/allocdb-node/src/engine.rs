@@ -13,7 +13,7 @@ use allocdb_core::snapshot_file::SnapshotFile;
 use allocdb_core::state_machine::AllocDb;
 use allocdb_core::wal::{Frame, RecordType};
 use allocdb_core::wal_file::{WalFile, WalFileError};
-use log::error;
+use log::{error, trace};
 
 use crate::bounded_queue::{BoundedQueue, BoundedQueueError};
 
@@ -24,6 +24,9 @@ mod checkpoint;
 mod checkpoint_tests;
 #[path = "engine_observe.rs"]
 mod observe;
+#[cfg(test)]
+#[path = "experiments/simulation_harness_spike_tests.rs"]
+mod simulation_harness_spike_tests;
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;
@@ -430,7 +433,8 @@ impl SingleNodeEngine {
         Ok(self.process_one()?.map(|processed| processed.result))
     }
 
-    /// Commits up to one bounded batch of due expiration commands for the provided logical slot.
+    /// Drains already-queued client submissions, then commits up to one bounded batch of due
+    /// expiration commands for the provided logical slot.
     ///
     /// # Errors
     ///
@@ -443,12 +447,14 @@ impl SingleNodeEngine {
             return Err(SubmissionError::EngineHalted);
         }
 
+        self.process_queued_submissions()?;
         let due = self.collect_due_expirations(current_wall_clock_slot);
+        let expiration_request_slot = self.expiration_request_slot(current_wall_clock_slot);
         let mut processed_count = 0_u32;
         let mut last_applied_lsn = None;
         for target in due {
             let result = self.apply_internal_command(
-                current_wall_clock_slot,
+                expiration_request_slot,
                 Command::Expire {
                     reservation_id: target.reservation_id,
                     deadline_slot: target.deadline_slot,
@@ -462,6 +468,17 @@ impl SingleNodeEngine {
             processed_count,
             last_applied_lsn,
         })
+    }
+
+    fn process_queued_submissions(&mut self) -> Result<(), SubmissionError> {
+        let mut drained_count = 0_u32;
+        while self.process_one()?.is_some() {
+            drained_count = drained_count.saturating_add(1);
+        }
+        if drained_count > 0 {
+            trace!("drained queued submissions before expiration tick: count={drained_count}");
+        }
+        Ok(())
     }
 
     fn enqueue_validated(
@@ -618,6 +635,14 @@ impl SingleNodeEngine {
                 .expect("validated max_expirations_per_tick must fit usize"),
         );
         due
+    }
+
+    fn expiration_request_slot(&self, current_wall_clock_slot: Slot) -> Slot {
+        self.db
+            .last_request_slot()
+            .map_or(current_wall_clock_slot, |last_request_slot| {
+                Slot(current_wall_clock_slot.get().max(last_request_slot.get()))
+            })
     }
 
     fn apply_internal_command(
