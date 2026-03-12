@@ -51,9 +51,15 @@ Current observability surface:
 - expose operation-table utilization so dedupe-window pressure is visible before hard rejection
 - expose queue depth and write-acceptance state through the single-node engine wrapper
 
+Current durability shape before alpha:
+
+- the WAL is one append-only file on the live path
+- checkpoints rewrite retained WAL history through a temp-file and rename path
+- retained WAL keeps one-checkpoint overlap and appends a `snapshot_marker` at the active snapshot
+  anchor
+
 Next hardening steps before alpha are:
 
-- formalize snapshot-safe WAL truncation with an overlapping checkpoint rule
 - surface recovery status alongside the current lag and backlog signals
 - preserve definite-vs-indefinite submission categories in the external wire protocol
 

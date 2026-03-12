@@ -558,7 +558,7 @@ Test evidence:
 
 Goal:
 
-- append validated frames to segmented WAL files
+- append validated frames to the live WAL file
 
 Blocked by:
 
@@ -577,7 +577,7 @@ Test evidence:
 
 Goal:
 
-- scan WAL segments and stop at the last valid boundary
+- scan WAL history and stop at the last valid boundary
 
 Blocked by:
 

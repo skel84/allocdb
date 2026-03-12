@@ -15,11 +15,17 @@ use allocdb_core::wal_file::{WalFile, WalFileError};
 
 use crate::bounded_queue::{BoundedQueue, BoundedQueueError};
 
+#[path = "engine_checkpoint.rs"]
+mod checkpoint;
+#[cfg(test)]
+#[path = "engine_checkpoint_tests.rs"]
+mod checkpoint_tests;
 #[path = "engine_observe.rs"]
 mod observe;
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;
+pub use checkpoint::{CheckpointError, CheckpointResult};
 pub use observe::{EngineMetrics, ReadError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,6 +179,7 @@ pub struct SingleNodeEngine {
     config: EngineConfig,
     next_lsn: u64,
     accepting_writes: bool,
+    active_snapshot_lsn: Option<Lsn>,
 }
 
 impl SingleNodeEngine {
@@ -188,7 +195,7 @@ impl SingleNodeEngine {
         wal_path: impl AsRef<Path>,
     ) -> Result<Self, EngineOpenError> {
         let db = AllocDb::new(core_config)?;
-        Self::from_parts(db, engine_config, wal_path)
+        Self::from_parts(db, engine_config, wal_path, None)
     }
 
     /// Recovers one engine from snapshot plus WAL, then reopens the live WAL path for new writes.
@@ -211,7 +218,13 @@ impl SingleNodeEngine {
         let wal = WalFile::open(wal_path.as_ref(), engine_config.max_command_bytes)
             .map_err(EngineOpenError::from)?;
         let recovered = recover_allocdb(core_config, &snapshot_file, &wal)?;
-        Self::from_parts(recovered.db, engine_config, wal_path).map_err(RecoverEngineError::from)
+        Self::from_parts(
+            recovered.db,
+            engine_config,
+            wal_path,
+            recovered.loaded_snapshot_lsn,
+        )
+        .map_err(RecoverEngineError::from)
     }
 
     /// Builds one engine around an existing allocator state, for example after recovery.
@@ -228,6 +241,7 @@ impl SingleNodeEngine {
         db: AllocDb,
         engine_config: EngineConfig,
         wal_path: impl AsRef<Path>,
+        active_snapshot_lsn: Option<Lsn>,
     ) -> Result<Self, EngineOpenError> {
         engine_config.validate()?;
         let wal = WalFile::open(wal_path, engine_config.max_command_bytes)?;
@@ -243,6 +257,7 @@ impl SingleNodeEngine {
             config: engine_config,
             next_lsn,
             accepting_writes: true,
+            active_snapshot_lsn,
         })
     }
 
