@@ -582,7 +582,7 @@ fn api_submit_maps_crash_injected_commit_to_indefinite_storage_failure_wire_valu
             code: SubmissionFailureCode::StorageFailure,
         }))
     );
-    assert_eq!(encode_response(&response), vec![2, 2, 5]);
+    assert_eq!(encode_response(&response), vec![2, 2, 7]);
 
     fs::remove_file(&wal_path).unwrap();
 }
