@@ -110,5 +110,7 @@ snapshots are the stronger regression signal because they are deterministic.
 - Prefer comparing one scenario at a time when investigating regressions.
 - Oversized knob combinations fail fast before engine startup. The harness caps derived core table
   capacities at 65,536 entries so bad CLI inputs do not turn into accidental OOMs.
+- The high-retry scenario also rejects configurations that would generate more than 1,000,000
+  worst-case submissions, so retry-cache stress stays bounded in runtime and WAL growth.
 - Treat this harness as part of the single-node validation path, not as a substitute for the later
   deterministic simulator.

@@ -32,6 +32,8 @@ const DEFAULT_EXPIRATIONS_PER_TICK: u32 = 8;
 // Keep the benchmark harness safely local. Larger fixed-capacity tables can turn a bad CLI
 // invocation into multi-gigabyte allocations before the engine ever reports a useful error.
 const MAX_DERIVED_TABLE_CAPACITY: u32 = 65_536;
+// Keep retry-pressure runs reviewable and bounded in runtime/WAL churn as well as in memory.
+const MAX_RETRY_PRESSURE_TOTAL_OPERATIONS: u64 = 1_000_000;
 const BENCH_CLIENT_ID: ClientId = ClientId(7);
 const RETRY_CONFLICT_RESOURCE_OFFSET: u128 = 1_000_000;
 static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -183,6 +185,21 @@ fn validate_retry_derived_capacities(options: BenchmarkOptions) -> Result<(), Be
             format!(
                 "must be at most {} so the derived resource-table capacity stays within safe benchmark limit {MAX_DERIVED_TABLE_CAPACITY}",
                 MAX_DERIVED_TABLE_CAPACITY - RETRY_RESOURCE_HEADROOM
+            ),
+        ));
+    }
+
+    let total_operations = checked_high_retry_total_operations(options).ok_or_else(|| {
+        invalid_option(
+            "retry_table_capacity/retry_duplicate_fanout/retry_full_rejection_attempts",
+            "overflowed the derived high-retry total operation count",
+        )
+    })?;
+    if total_operations > MAX_RETRY_PRESSURE_TOTAL_OPERATIONS {
+        return Err(invalid_option(
+            "retry_table_capacity/retry_duplicate_fanout/retry_full_rejection_attempts",
+            format!(
+                "derive {total_operations} total high-retry operations beyond safe benchmark limit {MAX_RETRY_PRESSURE_TOTAL_OPERATIONS}"
             ),
         ));
     }
@@ -498,12 +515,8 @@ fn run_high_retry_pressure(
 
     Ok(HighRetryPressureReport {
         elapsed,
-        total_operations: u64::from(options.retry_table_capacity)
-            + u64::from(options.retry_table_capacity)
-                .saturating_mul(u64::from(options.retry_duplicate_fanout))
-                .saturating_mul(2)
-            + u64::from(options.retry_full_rejection_attempts)
-            + 1,
+        total_operations: checked_high_retry_total_operations(options)
+            .expect("validated benchmark options must keep high-retry operation count in range"),
         table_capacity: options.retry_table_capacity,
         duplicate_fanout: options.retry_duplicate_fanout,
         cached_duplicate_hits: progress.duplicate_cached,
@@ -547,6 +560,16 @@ fn checked_retry_resource_capacity(table_capacity: u32) -> Option<u32> {
 fn retry_resource_capacity(table_capacity: u32) -> u32 {
     checked_retry_resource_capacity(table_capacity)
         .expect("validated benchmark options must keep retry resource capacity in range")
+}
+
+fn checked_high_retry_total_operations(options: BenchmarkOptions) -> Option<u64> {
+    let capacity = u64::from(options.retry_table_capacity);
+    let duplicate_fanout = u64::from(options.retry_duplicate_fanout);
+    let rejection_attempts = u64::from(options.retry_full_rejection_attempts);
+    capacity
+        .checked_add(capacity.checked_mul(duplicate_fanout)?.checked_mul(2)?)?
+        .checked_add(rejection_attempts)?
+        .checked_add(1)
 }
 
 fn format_one_resource_many_contenders_report(

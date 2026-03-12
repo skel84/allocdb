@@ -228,11 +228,11 @@ impl<K: FixedKey, V> FixedMap<K, V> {
                     break;
                 }
                 Bucket::Occupied { key, slot } => {
-                    let key_hash = key.hash64();
                     let ideal = self.bucket_index(key);
                     let distance_current = self.probe_distance(ideal, current);
                     let distance_gap = self.probe_distance(ideal, gap);
                     if trace_enabled {
+                        let key_hash = key.hash64();
                         log::trace!(
                             "close_deletion_gap: inspect gap={gap} current={current} bucket=occupied key_hash={key_hash} slot={slot} ideal={ideal} distance_current={distance_current} distance_gap={distance_gap}"
                         );
@@ -242,6 +242,7 @@ impl<K: FixedKey, V> FixedMap<K, V> {
                     // the current gap.
                     if distance_current > distance_gap {
                         if trace_enabled {
+                            let key_hash = key.hash64();
                             log::trace!(
                                 "close_deletion_gap: move gap={gap} current={current} key_hash={key_hash} slot={slot} ideal={ideal} distance_current={distance_current} distance_gap={distance_gap}"
                             );

@@ -74,6 +74,20 @@ fn benchmark_options_reject_oversized_derived_capacities() {
             ..
         })
     ));
+
+    let oversized_retry_pressure = BenchmarkOptions {
+        retry_table_capacity: 50_000,
+        retry_duplicate_fanout: 20,
+        retry_full_rejection_attempts: 1,
+        ..BenchmarkOptions::default()
+    };
+    assert!(matches!(
+        oversized_retry_pressure.validate(),
+        Err(BenchmarkError::InvalidOption {
+            option: "retry_table_capacity/retry_duplicate_fanout/retry_full_rejection_attempts",
+            ..
+        })
+    ));
 }
 
 #[test]
