@@ -48,6 +48,14 @@ pub enum DecodeError {
 pub struct ScanResult {
     pub frames: Vec<Frame>,
     pub valid_up_to: usize,
+    pub stop_reason: ScanStopReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanStopReason {
+    CleanEof,
+    TornTail { offset: usize },
+    Corruption { offset: usize, error: DecodeError },
 }
 
 impl Frame {
@@ -170,14 +178,24 @@ impl Frame {
 pub fn scan_frames(bytes: &[u8]) -> ScanResult {
     let mut frames = Vec::new();
     let mut offset = 0usize;
+    let mut stop_reason = ScanStopReason::CleanEof;
 
     while offset < bytes.len() {
         let remaining = &bytes[offset..];
-        let Ok(frame_len) = Frame::encoded_len(remaining) else {
-            break;
+        let frame_len = match Frame::encoded_len(remaining) {
+            Ok(frame_len) => frame_len,
+            Err(DecodeError::BufferTooShort) => {
+                stop_reason = ScanStopReason::TornTail { offset };
+                break;
+            }
+            Err(error) => {
+                stop_reason = ScanStopReason::Corruption { offset, error };
+                break;
+            }
         };
 
         if remaining.len() < frame_len {
+            stop_reason = ScanStopReason::TornTail { offset };
             break;
         }
 
@@ -186,19 +204,27 @@ pub fn scan_frames(bytes: &[u8]) -> ScanResult {
                 frames.push(frame);
                 offset += frame_len;
             }
-            Err(_) => break,
+            Err(DecodeError::BufferTooShort) => {
+                stop_reason = ScanStopReason::TornTail { offset };
+                break;
+            }
+            Err(error) => {
+                stop_reason = ScanStopReason::Corruption { offset, error };
+                break;
+            }
         }
     }
 
     ScanResult {
         frames,
         valid_up_to: offset,
+        stop_reason,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeError, Frame, HEADER_LEN, RecordType, scan_frames};
+    use super::{DecodeError, Frame, HEADER_LEN, RecordType, ScanStopReason, scan_frames};
     use crate::ids::{Lsn, Slot};
 
     fn frame(lsn: u64, slot: u64, payload: &[u8]) -> Frame {
@@ -251,6 +277,12 @@ mod tests {
         assert_eq!(scanned.frames.len(), 1);
         assert_eq!(scanned.frames[0].lsn, Lsn(1));
         assert_eq!(scanned.valid_up_to, frame(1, 1, b"one").encode().len());
+        assert_eq!(
+            scanned.stop_reason,
+            ScanStopReason::TornTail {
+                offset: scanned.valid_up_to,
+            }
+        );
     }
 
     #[test]
@@ -265,5 +297,12 @@ mod tests {
         assert_eq!(scanned.frames.len(), 1);
         assert_eq!(scanned.frames[0].lsn, Lsn(1));
         assert_eq!(scanned.valid_up_to, frame(1, 1, b"one").encode().len());
+        assert_eq!(
+            scanned.stop_reason,
+            ScanStopReason::Corruption {
+                offset: scanned.valid_up_to,
+                error: DecodeError::InvalidMagic(0x4144_4200),
+            }
+        );
     }
 }

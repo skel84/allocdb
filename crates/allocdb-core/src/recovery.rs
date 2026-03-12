@@ -109,10 +109,10 @@ mod tests {
     use crate::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
     use crate::snapshot_file::SnapshotFile;
     use crate::state_machine::{AllocDb, ResourceState};
-    use crate::wal::{Frame, RecordType};
-    use crate::wal_file::WalFile;
+    use crate::wal::{DecodeError, Frame, RecordType};
+    use crate::wal_file::{WalFile, WalFileError};
 
-    use super::recover_allocdb;
+    use super::{RecoveryError, recover_allocdb};
 
     fn test_path(name: &str, extension: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -333,6 +333,53 @@ mod tests {
             recovered.db.resource(ResourceId(11)).unwrap().current_state,
             ResourceState::Available
         );
+
+        fs::remove_file(wal_path).unwrap();
+    }
+
+    #[test]
+    fn recover_allocdb_fails_closed_on_mid_log_corruption() {
+        let wal_path = test_path("recover-mid-log-corruption", "wal");
+        let snapshot_path = test_path("recover-mid-log-corruption", "snapshot");
+        let mut wal = WalFile::open(&wal_path, 512).unwrap();
+
+        let create = ClientRequest {
+            operation_id: OperationId(1),
+            client_id: ClientId(7),
+            command: Command::CreateResource {
+                resource_id: ResourceId(11),
+            },
+        };
+        let reserve = ClientRequest {
+            operation_id: OperationId(2),
+            client_id: ClientId(7),
+            command: Command::Reserve {
+                resource_id: ResourceId(11),
+                holder_id: HolderId(5),
+                ttl_slots: 3,
+            },
+        };
+
+        wal.append_frame(&client_frame(1, 1, create)).unwrap();
+        wal.append_frame(&client_frame(2, 2, reserve)).unwrap();
+        wal.sync().unwrap();
+
+        let mut bytes = fs::read(&wal_path).unwrap();
+        let first_len = client_frame(1, 1, create).encode().len();
+        let last_index = bytes.len() - 1;
+        bytes[last_index] ^= 0xff;
+        fs::write(&wal_path, bytes).unwrap();
+
+        let error =
+            recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &wal).unwrap_err();
+
+        assert!(matches!(
+            error,
+            RecoveryError::WalFile(WalFileError::Corruption {
+                offset,
+                error: DecodeError::InvalidChecksum,
+            }) if offset == first_len
+        ));
 
         fs::remove_file(wal_path).unwrap();
     }

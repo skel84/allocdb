@@ -26,7 +26,9 @@ Required properties:
 - fixed upper bound on payload size
 - manual binary encoding with explicit endianness
 - CRC32C on each frame
-- stop recovery at the first torn or invalid frame
+- classify WAL recovery stop reasons as `clean_eof`, `torn_tail`, or `corruption`
+- auto-truncate only incomplete EOF torn tails
+- fail closed on middle-of-log corruption
 - no `serde` or format whose layout is implicit
 
 Current implementation anchor:
@@ -38,7 +40,8 @@ Current implementation anchor:
 The current code covers frame encoding, decoding, checksum validation, and in-memory recovery
 scanning up to the last valid frame boundary, explicit command-payload encoding for client and
 internal commands, plus file-backed append, sync, recovery scan, and truncate-to-valid-prefix
-behavior for one WAL file.
+behavior for one WAL file. Recovery distinguishes a crash-torn tail from durable-log corruption:
+only torn tails are truncated automatically.
 
 ## Snapshots
 
@@ -84,6 +87,9 @@ Recovery is:
 6. resume accepting traffic
 
 If a WAL tail is torn after crash, recovery truncates at the last valid frame boundary.
+
+If recovery detects a checksum or framing error before EOF, the node fails closed and surfaces the
+corruption instead of rewriting the WAL.
 
 ## Design Notes
 

@@ -6,25 +6,29 @@
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
   - `M1` pure state machine: implemented
-  - `M1H` constant-time core hardening: planned, not started
+  - `M1H` constant-time core hardening: in progress
   - `M2` durability primitives: partially implemented
   - `M3+` submission pipeline, simulation, alpha hardening, replication design: not started
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
   - `d87c9a7` `Add repo guardrails and status tracking`
-  - current chunk: snapshot file IO, explicit WAL payload encoding, and replay recovery
+  - `79ae34f` `Add snapshot persistence and replay recovery`
+  - `1583d67` `Use fixed-capacity maps in allocator core`
+  - current validated chunk: fail-closed WAL corruption classification and recovery diagnostics
 
 ## What Exists
 
 - Trusted-core crate: `crates/allocdb-core`
 - In-memory deterministic allocator:
-  - fixed-capacity resource, reservation, and operation stores
+  - deterministic fixed-capacity open-addressed resource, reservation, and operation tables
+  - bounded reservation and operation retirement queues
   - bounded timing-wheel expiration index
   - `create_resource`, `reserve`, `confirm`, `release`, `expire`
 - Durability primitives:
   - WAL frame codec and recovery scan
-  - file-backed WAL append, sync, recovery, truncate-to-valid-prefix
+  - file-backed WAL append, sync, recovery, and torn-tail truncation
+  - fail-closed recovery on middle-of-log corruption
   - snapshot encode, decode, capture, restore
   - file-backed snapshot write and load
   - explicit WAL command payload encoding and live-path replay recovery
@@ -36,11 +40,10 @@
 
 ## Current Focus
 
-- replace sorted `Vec` lookups with deterministic fixed-capacity open-addressed tables
-- separate lookup tables from retirement order so retirement work is proportional to expired items
-- harden WAL recovery to distinguish EOF torn tails from middle-of-log corruption
 - decide whether version-guarded `conditional_confirm` belongs in v1 or is deferred
 - define `logical_slot_lag` and expiration backlog as first-class operational signals
+- tighten WAL/snapshot checkpoint coordination on top of the current recovery path
+- start the bounded submission pipeline once `M1H` closes
 
 ## How To Check Progress
 

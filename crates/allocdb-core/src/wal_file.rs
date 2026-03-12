@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::wal::{Frame, ScanResult, scan_frames};
+use crate::wal::{DecodeError, Frame, ScanResult, ScanStopReason, scan_frames};
 
 #[derive(Debug)]
 pub struct WalFile {
@@ -20,6 +20,10 @@ pub struct RecoveredWal {
 #[derive(Debug)]
 pub enum WalFileError {
     Io(std::io::Error),
+    Corruption {
+        offset: usize,
+        error: DecodeError,
+    },
     PayloadTooLarge {
         payload_len: usize,
         max_payload_bytes: usize,
@@ -99,28 +103,30 @@ impl WalFile {
     /// Truncates the file to the last valid frame boundary discovered by recovery scanning.
     ///
     /// # Errors
-    ///
-    /// Returns [`WalFileError::Io`] if the file cannot be reopened, truncated, or synced.
+    /// Returns [`WalFileError::Corruption`] if recovery finds a middle-of-log corruption, or
+    /// [`WalFileError::Io`] if the file cannot be reopened, truncated, or synced.
     ///
     /// # Panics
     ///
     /// Panics only if the discovered valid prefix cannot fit into `u64`.
     pub fn truncate_to_valid_prefix(&self) -> Result<RecoveredWal, WalFileError> {
         let recovered = recover_path(&self.path)?;
-        if recovered.file_len
-            > u64::try_from(recovered.scan_result.valid_up_to)
-                .expect("valid WAL prefix must fit into u64")
-        {
-            let mut file = OpenOptions::new().write(true).open(&self.path)?;
-            file.set_len(
-                u64::try_from(recovered.scan_result.valid_up_to)
-                    .expect("valid WAL prefix must fit into u64"),
-            )?;
-            file.seek(SeekFrom::Start(
-                u64::try_from(recovered.scan_result.valid_up_to)
-                    .expect("valid WAL prefix must fit into u64"),
-            ))?;
-            file.sync_data()?;
+        let valid_prefix =
+            u64::try_from(recovered.scan_result.valid_up_to).expect("valid WAL prefix must fit");
+
+        match recovered.scan_result.stop_reason {
+            ScanStopReason::CleanEof => {}
+            ScanStopReason::TornTail { .. } => {
+                if recovered.file_len > valid_prefix {
+                    let mut file = OpenOptions::new().write(true).open(&self.path)?;
+                    file.set_len(valid_prefix)?;
+                    file.seek(SeekFrom::Start(valid_prefix))?;
+                    file.sync_data()?;
+                }
+            }
+            ScanStopReason::Corruption { offset, error } => {
+                return Err(WalFileError::Corruption { offset, error });
+            }
         }
 
         Ok(recovered)
@@ -145,7 +151,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::ids::{Lsn, Slot};
-    use crate::wal::{Frame, RecordType};
+    use crate::wal::{DecodeError, Frame, RecordType, ScanStopReason};
 
     use super::{WalFile, WalFileError};
 
@@ -200,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_file_recovery_ignores_torn_tail() {
+    fn wal_file_recovery_reports_torn_tail() {
         let path = test_path("torn-tail");
         let mut wal = WalFile::open(&path, 64).unwrap();
         wal.append_frame(&frame(1, 1, b"one")).unwrap();
@@ -218,6 +224,12 @@ mod tests {
         let recovered = wal.recover().unwrap();
         assert_eq!(recovered.scan_result.frames.len(), 1);
         assert_eq!(recovered.scan_result.frames[0].lsn, Lsn(1));
+        assert_eq!(
+            recovered.scan_result.stop_reason,
+            ScanStopReason::TornTail {
+                offset: recovered.scan_result.valid_up_to,
+            }
+        );
 
         fs::remove_file(path).unwrap();
     }
@@ -246,6 +258,42 @@ mod tests {
             new_len,
             u64::try_from(recovered.scan_result.valid_up_to).unwrap()
         );
+        assert_eq!(
+            recovered.scan_result.stop_reason,
+            ScanStopReason::TornTail {
+                offset: recovered.scan_result.valid_up_to,
+            }
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn wal_file_truncate_rejects_mid_log_corruption() {
+        let path = test_path("mid-log-corruption");
+        let mut wal = WalFile::open(&path, 64).unwrap();
+        wal.append_frame(&frame(1, 1, b"one")).unwrap();
+        wal.append_frame(&frame(2, 2, b"two")).unwrap();
+        wal.sync().unwrap();
+
+        let mut bytes = fs::read(&path).unwrap();
+        let first_len = frame(1, 1, b"one").encode().len();
+        let last_index = bytes.len() - 1;
+        assert!(last_index >= first_len);
+        bytes[last_index] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+
+        let original_len = fs::metadata(&path).unwrap().len();
+        let error = wal.truncate_to_valid_prefix().unwrap_err();
+
+        assert!(matches!(
+            error,
+            WalFileError::Corruption {
+                offset,
+                error: DecodeError::InvalidChecksum,
+            } if offset == first_len
+        ));
+        assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
 
         fs::remove_file(path).unwrap();
     }
