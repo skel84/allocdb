@@ -34,9 +34,22 @@ pub enum SnapshotError {
     InvalidStateTag(u8),
     CountTooLarge,
     InvalidLayout,
-    ResourceTableOverCapacity { count: usize, max: usize },
-    ReservationTableOverCapacity { count: usize, max: usize },
-    OperationTableOverCapacity { count: usize, max: usize },
+    InconsistentWatermarks {
+        last_applied_lsn: Option<Lsn>,
+        last_request_slot: Option<Slot>,
+    },
+    ResourceTableOverCapacity {
+        count: usize,
+        max: usize,
+    },
+    ReservationTableOverCapacity {
+        count: usize,
+        max: usize,
+    },
+    OperationTableOverCapacity {
+        count: usize,
+        max: usize,
+    },
     DuplicateResourceId(crate::ids::ResourceId),
     DuplicateReservationId(crate::ids::ReservationId),
     DuplicateOperationId(crate::ids::OperationId),
@@ -124,6 +137,7 @@ impl AllocDb {
         if wheel.len() != db.config.wheel_len() {
             return Err(SnapshotError::InvalidLayout);
         }
+        validate_progress_watermarks(last_applied_lsn, last_request_slot)?;
 
         let max_resources =
             usize::try_from(db.config.max_resources).expect("validated max_resources must fit");
@@ -164,6 +178,20 @@ where
 {
     if count > max {
         return Err(error(count, max));
+    }
+
+    Ok(())
+}
+
+fn validate_progress_watermarks(
+    last_applied_lsn: Option<Lsn>,
+    last_request_slot: Option<Slot>,
+) -> Result<(), SnapshotError> {
+    if last_applied_lsn.is_some() != last_request_slot.is_some() {
+        return Err(SnapshotError::InconsistentWatermarks {
+            last_applied_lsn,
+            last_request_slot,
+        });
     }
 
     Ok(())

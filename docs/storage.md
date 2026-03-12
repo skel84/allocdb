@@ -32,7 +32,7 @@ Required properties:
 - classify WAL recovery stop reasons as `clean_eof`, `torn_tail`, or `corruption`
 - auto-truncate only incomplete EOF torn tails
 - fail closed on middle-of-log corruption
-- fail closed on semantically invalid replay ordering such as non-monotonic `lsn` or
+- fail closed on semantically invalid replay ordering such as non-monotonic `lsn` or rewound
   `request_slot`
 - no `serde` or format whose layout is implicit
 
@@ -76,8 +76,9 @@ Current implementation anchor:
 
 The current code covers snapshot encode, decode, allocator-state capture, and allocator restore
 from one decoded snapshot, plus file-backed snapshot write and load with temp-file and rename
-discipline. Restore validates configured table capacities, duplicate IDs, wheel bounds, and
-trusted-core resource/reservation invariants before admitting decoded contents into live state.
+discipline. Restore validates configured table capacities, duplicate IDs, wheel bounds, replay
+watermark consistency, and trusted-core resource/reservation invariants before admitting decoded
+contents into live state.
 
 Recovery implementation anchors:
 
