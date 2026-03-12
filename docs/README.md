@@ -19,6 +19,7 @@
 - [Architecture](./architecture.md)
 - [Fault Model](./fault-model.md)
 - [Replication Notes](./replication.md)
+- [Benchmark Harness](./benchmark-harness.md)
 - [Roadmap](./roadmap.md)
 - [Current Status](./status.md)
 - [Work Breakdown](./work-breakdown.md)

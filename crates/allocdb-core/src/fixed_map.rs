@@ -213,13 +213,10 @@ impl<K: FixedKey, V> FixedMap<K, V> {
                 }
                 Bucket::Occupied { key, slot } => {
                     let ideal = self.bucket_index(key);
-                    if self.probe_distance(ideal, current) == 0 {
-                        self.buckets[gap] = Bucket::Empty;
-                        break;
+                    if self.probe_distance(ideal, current) > self.probe_distance(ideal, gap) {
+                        self.buckets[gap] = Bucket::Occupied { key, slot };
+                        gap = current;
                     }
-
-                    self.buckets[gap] = Bucket::Occupied { key, slot };
-                    gap = current;
                     current = self.next_bucket(current);
                 }
             }
@@ -277,6 +274,15 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct OperationLikeKey(u128);
+
+    impl FixedKey for OperationLikeKey {
+        fn hash64(self) -> u64 {
+            super::hash_u128(self.0)
+        }
+    }
+
     #[test]
     fn insert_get_and_remove_round_trip() {
         let mut map = FixedMap::with_capacity(4);
@@ -315,5 +321,20 @@ mod tests {
         assert_eq!(map.remove(CollidingKey(1)), Some(10));
         assert_eq!(map.get(CollidingKey(2)), Some(&20));
         assert_eq!(map.get(CollidingKey(3)), Some(&30));
+    }
+
+    #[test]
+    fn repeated_removals_preserve_lookup_for_operation_like_hashes() {
+        let mut map = FixedMap::with_capacity(32);
+        for value in 1..=32_u128 {
+            map.insert(OperationLikeKey(value), value).unwrap();
+        }
+
+        for removed in 1..=24_u128 {
+            assert_eq!(map.remove(OperationLikeKey(removed)), Some(removed));
+            for remaining in (removed + 1)..=32_u128 {
+                assert_eq!(map.get(OperationLikeKey(remaining)), Some(&remaining));
+            }
+        }
     }
 }
