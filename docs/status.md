@@ -11,7 +11,8 @@
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
-  - current chunk: status tracking, repo guardrails, and trusted-core module split
+  - `d87c9a7` `Add repo guardrails and status tracking`
+  - current chunk: snapshot file IO, explicit WAL payload encoding, and replay recovery
 
 ## What Exists
 
@@ -24,6 +25,8 @@
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, truncate-to-valid-prefix
   - snapshot encode, decode, capture, restore
+  - file-backed snapshot write and load
+  - explicit WAL command payload encoding and live-path replay recovery
 - Validation:
   - `cargo fmt --all`
   - `cargo clippy --all-targets --all-features -- -D warnings`
@@ -34,7 +37,7 @@
 
 - keep the trusted core split into reviewable modules
 - enforce architecture and size guardrails automatically
-- continue M2 with snapshot file IO or move into M3 submission/idempotent ingress
+- continue M2 with richer recovery cases or move into M3 submission/idempotent ingress
 
 ## How To Check Progress
 

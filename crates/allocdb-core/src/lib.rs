@@ -1,8 +1,11 @@
 pub mod command;
+pub mod command_codec;
 pub mod config;
 pub mod ids;
+pub mod recovery;
 pub mod result;
 pub mod snapshot;
+pub mod snapshot_file;
 pub mod state_machine;
 pub mod wal;
 pub mod wal_file;
