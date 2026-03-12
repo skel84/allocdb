@@ -6,6 +6,7 @@ use crate::snapshot_file::{SnapshotFile, SnapshotFileError};
 use crate::state_machine::AllocDb;
 use crate::wal::RecordType;
 use crate::wal_file::{RecoveredWal, WalFile, WalFileError};
+use log::info;
 
 #[derive(Debug)]
 pub struct RecoveryResult {
@@ -103,6 +104,11 @@ pub fn recover_allocdb(
         loaded_snapshot_lsn,
         replayed_wal_frame_count,
         replayed_wal_last_lsn,
+    })
+    .inspect(|_| {
+        info!(
+            "recovery complete: loaded_snapshot_lsn={loaded_snapshot_lsn:?} replayed_wal_frame_count={replayed_wal_frame_count} replayed_wal_last_lsn={replayed_wal_last_lsn:?}",
+        );
     })
 }
 
@@ -301,6 +307,8 @@ mod tests {
             recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &wal).unwrap();
 
         assert_eq!(recovered.recovered_wal.scan_result.frames.len(), 1);
+        assert_eq!(recovered.replayed_wal_frame_count, 1);
+        assert_eq!(recovered.replayed_wal_last_lsn, Some(Lsn(1)));
         assert_eq!(
             recovered.db.resource(ResourceId(11)).unwrap().current_state,
             ResourceState::Available
@@ -344,6 +352,8 @@ mod tests {
         let recovered =
             recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &wal).unwrap();
 
+        assert_eq!(recovered.replayed_wal_frame_count, 3);
+        assert_eq!(recovered.replayed_wal_last_lsn, Some(Lsn(3)));
         assert_eq!(
             recovered.db.resource(ResourceId(11)).unwrap().current_state,
             ResourceState::Available
