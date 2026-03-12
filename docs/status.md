@@ -24,9 +24,9 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: deterministic benchmark harness for one-resource-many-contenders and
-    high-retry-pressure scenarios, including docs and invariant checks around retry-cache and
-    bounded operation-table behavior
+  - current validated chunk: fail-closed recovery on semantically invalid WAL ordering and
+    malformed decoded snapshots, including typed restore/replay errors, explicit recovery logging,
+    and regression coverage for duplicate IDs, over-capacity snapshots, and rewound replay slots
 
 ## What Exists
 
@@ -68,12 +68,16 @@
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
   - fail-closed recovery on middle-of-log corruption
+  - fail-closed recovery on non-monotonic WAL replay metadata and malformed decoded snapshot
+    semantics
   - snapshot encode, decode, capture, restore
   - file-backed snapshot write and load
   - explicit WAL command payload encoding and live-path replay recovery
   - checkpoint path that writes the new snapshot first, then rewrites retained WAL history
   - one-checkpoint WAL overlap and `snapshot_marker` retention for safe checkpoint replacement
 - Validation:
+  - `cargo test -p allocdb-core snapshot -- --nocapture`
+  - `cargo test -p allocdb-core recovery -- --nocapture`
   - `cargo run -p allocdb-bench -- --scenario all`
   - `cargo test -p allocdb-core repeated_removals_preserve_lookup_for_operation_like_hashes`
   - `cargo test -p allocdb-core operation_table_utilization_drops_after_retry_window_retirement`
