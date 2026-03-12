@@ -2,11 +2,17 @@ use core::cmp::Ordering;
 
 use crate::command::{Command, CommandContext};
 use crate::config::{Config, ConfigError};
+use crate::fixed_map::{FixedMap, FixedMapError};
 use crate::ids::{HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use crate::result::{CommandOutcome, ResultCode};
+use crate::retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
 
 #[path = "state_machine_apply.rs"]
 mod apply;
+#[path = "state_machine_execution.rs"]
+mod execution;
+#[path = "state_machine_retire.rs"]
+mod retire;
 #[cfg(test)]
 #[path = "state_machine_tests.rs"]
 mod tests;
@@ -66,9 +72,11 @@ pub enum ReservationLookupError {
 #[derive(Debug)]
 pub struct AllocDb {
     pub(crate) config: Config,
-    pub(crate) resources: Vec<ResourceRecord>,
-    pub(crate) reservations: Vec<ReservationRecord>,
-    pub(crate) operations: Vec<OperationRecord>,
+    pub(crate) resources: FixedMap<ResourceId, ResourceRecord>,
+    pub(crate) reservations: FixedMap<ReservationId, ReservationRecord>,
+    pub(crate) operations: FixedMap<OperationId, OperationRecord>,
+    pub(crate) reservation_retire_queue: RetireQueue<ReservationId>,
+    pub(crate) operation_retire_queue: RetireQueue<OperationId>,
     pub(crate) wheel: Vec<Vec<ReservationId>>,
     pub(crate) last_applied_lsn: Option<Lsn>,
     pub(crate) last_request_slot: Option<Slot>,
@@ -96,15 +104,23 @@ impl AllocDb {
         }
 
         Ok(Self {
-            resources: Vec::with_capacity(
+            resources: FixedMap::with_capacity(
                 usize::try_from(config.max_resources)
                     .expect("validated max_resources must fit usize"),
             ),
-            reservations: Vec::with_capacity(
+            reservations: FixedMap::with_capacity(
                 usize::try_from(config.max_reservations)
                     .expect("validated max_reservations must fit usize"),
             ),
-            operations: Vec::with_capacity(
+            operations: FixedMap::with_capacity(
+                usize::try_from(config.max_operations)
+                    .expect("validated max_operations must fit usize"),
+            ),
+            reservation_retire_queue: RetireQueue::with_capacity(
+                usize::try_from(config.max_reservations)
+                    .expect("validated max_reservations must fit usize"),
+            ),
+            operation_retire_queue: RetireQueue::with_capacity(
                 usize::try_from(config.max_operations)
                     .expect("validated max_operations must fit usize"),
             ),
@@ -122,8 +138,7 @@ impl AllocDb {
 
     #[must_use]
     pub fn resource(&self, resource_id: ResourceId) -> Option<ResourceRecord> {
-        self.resource_index(resource_id)
-            .map(|index| self.resources[index])
+        self.resources.get(resource_id).copied()
     }
 
     /// Looks up one reservation while respecting the bounded reservation-history window.
@@ -137,11 +152,10 @@ impl AllocDb {
         reservation_id: ReservationId,
         current_slot: Slot,
     ) -> Result<ReservationRecord, ReservationLookupError> {
-        let Some(index) = self.reservation_index(reservation_id) else {
+        let Some(record) = self.reservations.get(reservation_id).copied() else {
             return Err(ReservationLookupError::NotFound);
         };
 
-        let record = self.reservations[index];
         if Self::reservation_is_retired(record, current_slot) {
             return Err(ReservationLookupError::Retired);
         }
@@ -156,12 +170,11 @@ impl AllocDb {
         operation_id: OperationId,
         current_slot: Slot,
     ) -> Option<OperationRecord> {
-        self.operation_index(operation_id).and_then(|index| {
-            let record = self.operations[index];
+        self.operations.get(operation_id).and_then(|record| {
             if current_slot.get() > record.retire_after_slot.get() {
                 None
             } else {
-                Some(record)
+                Some(*record)
             }
         })
     }
@@ -199,17 +212,6 @@ impl AllocDb {
     fn retire_state(&mut self, current_slot: Slot) {
         self.retire_reservations(current_slot);
         self.retire_operations(current_slot);
-    }
-
-    fn retire_reservations(&mut self, current_slot: Slot) {
-        self.reservations.retain(|record| {
-            !matches!(record.retire_after_slot, Some(slot) if current_slot.get() > slot.get())
-        });
-    }
-
-    fn retire_operations(&mut self, current_slot: Slot) {
-        self.operations
-            .retain(|record| current_slot.get() <= record.retire_after_slot.get());
     }
 
     fn reservation_is_retired(record: ReservationRecord, current_slot: Slot) -> bool {
@@ -257,47 +259,67 @@ impl AllocDb {
         }
     }
 
-    fn resource_index(&self, resource_id: ResourceId) -> Option<usize> {
-        self.resources
-            .binary_search_by_key(&resource_id, |record| record.resource_id)
-            .ok()
+    pub(crate) fn insert_resource(&mut self, record: ResourceRecord) {
+        match self.resources.insert(record.resource_id, record) {
+            Ok(()) => {}
+            Err(FixedMapError::DuplicateKey | FixedMapError::Full) => {
+                panic!("resource inserts must respect capacity and uniqueness")
+            }
+        }
     }
 
-    fn reservation_index(&self, reservation_id: ReservationId) -> Option<usize> {
-        self.reservations
-            .binary_search_by_key(&reservation_id, |record| record.reservation_id)
-            .ok()
+    pub(crate) fn insert_reservation(&mut self, record: ReservationRecord) {
+        match self.reservations.insert(record.reservation_id, record) {
+            Ok(()) => {}
+            Err(FixedMapError::DuplicateKey | FixedMapError::Full) => {
+                panic!("reservation inserts must respect capacity and uniqueness")
+            }
+        }
     }
 
-    fn operation_index(&self, operation_id: OperationId) -> Option<usize> {
-        self.operations
-            .binary_search_by_key(&operation_id, |record| record.operation_id)
-            .ok()
+    pub(crate) fn insert_operation(&mut self, record: OperationRecord) {
+        match self.operations.insert(record.operation_id, record) {
+            Ok(()) => {}
+            Err(FixedMapError::DuplicateKey | FixedMapError::Full) => {
+                panic!("operation inserts must respect capacity and uniqueness")
+            }
+        }
     }
 
-    fn insert_resource(&mut self, record: ResourceRecord) {
-        let insertion_point = self
-            .resources
-            .partition_point(|existing| existing.resource_id < record.resource_id);
-        self.resources.insert(insertion_point, record);
+    pub(crate) fn push_reservation_retirement(
+        &mut self,
+        reservation_id: ReservationId,
+        retire_after_slot: Slot,
+    ) {
+        match self.reservation_retire_queue.push(RetireEntry {
+            key: reservation_id,
+            retire_after_slot,
+        }) {
+            Ok(()) => {}
+            Err(RetireQueueError::Full) => {
+                panic!("reservation retire queue must stay within reservation capacity")
+            }
+        }
     }
 
-    fn insert_reservation(&mut self, record: ReservationRecord) {
-        let insertion_point = self
-            .reservations
-            .partition_point(|existing| existing.reservation_id < record.reservation_id);
-        self.reservations.insert(insertion_point, record);
-    }
-
-    fn insert_operation(&mut self, record: OperationRecord) {
-        let insertion_point = self
-            .operations
-            .partition_point(|existing| existing.operation_id < record.operation_id);
-        self.operations.insert(insertion_point, record);
+    pub(crate) fn push_operation_retirement(
+        &mut self,
+        operation_id: OperationId,
+        retire_after_slot: Slot,
+    ) {
+        match self.operation_retire_queue.push(RetireEntry {
+            key: operation_id,
+            retire_after_slot,
+        }) {
+            Ok(()) => {}
+            Err(RetireQueueError::Full) => {
+                panic!("operation retire queue must stay within operation capacity")
+            }
+        }
     }
 
     pub(crate) fn assert_invariants(&self) {
-        for resource in &self.resources {
+        for resource in self.resources.iter() {
             match resource.current_state {
                 ResourceState::Available => assert!(resource.current_reservation_id.is_none()),
                 ResourceState::Reserved | ResourceState::Confirmed => {
@@ -305,8 +327,9 @@ impl AllocDb {
                         .current_reservation_id
                         .expect("non-available resources must reference an active reservation");
                     let reservation = self
-                        .reservation_index(reservation_id)
-                        .map(|index| self.reservations[index])
+                        .reservations
+                        .get(reservation_id)
+                        .copied()
                         .expect("active resource reservation must exist");
                     assert_eq!(reservation.resource_id, resource.resource_id);
                     match resource.current_state {
@@ -322,12 +345,13 @@ impl AllocDb {
             }
         }
 
-        for reservation in &self.reservations {
+        for reservation in self.reservations.iter() {
             match reservation.state {
                 ReservationState::Reserved => {
                     let resource = self
-                        .resource_index(reservation.resource_id)
-                        .map(|index| self.resources[index])
+                        .resources
+                        .get(reservation.resource_id)
+                        .copied()
                         .expect("reserved reservation resource must exist");
                     assert_eq!(resource.current_state, ResourceState::Reserved);
                     assert_eq!(
@@ -343,8 +367,9 @@ impl AllocDb {
                 }
                 ReservationState::Confirmed => {
                     let resource = self
-                        .resource_index(reservation.resource_id)
-                        .map(|index| self.resources[index])
+                        .resources
+                        .get(reservation.resource_id)
+                        .copied()
                         .expect("confirmed reservation resource must exist");
                     assert_eq!(resource.current_state, ResourceState::Confirmed);
                     assert_eq!(
@@ -361,8 +386,9 @@ impl AllocDb {
                 ReservationState::Released | ReservationState::Expired => {
                     assert!(reservation.retire_after_slot.is_some());
                     let resource = self
-                        .resource_index(reservation.resource_id)
-                        .map(|index| self.resources[index])
+                        .resources
+                        .get(reservation.resource_id)
+                        .copied()
                         .expect("terminal reservation resource must exist");
                     assert!(
                         resource.current_reservation_id != Some(reservation.reservation_id),

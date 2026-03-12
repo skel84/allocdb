@@ -65,12 +65,21 @@ impl AllocDb {
     /// Captures a snapshot of the current trusted-core state.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
+        let mut resources: Vec<_> = self.resources.iter().copied().collect();
+        resources.sort_unstable_by_key(|record| record.resource_id.get());
+
+        let mut reservations: Vec<_> = self.reservations.iter().copied().collect();
+        reservations.sort_unstable_by_key(|record| record.reservation_id.get());
+
+        let mut operations: Vec<_> = self.operations.iter().copied().collect();
+        operations.sort_unstable_by_key(|record| record.operation_id.get());
+
         Snapshot {
             last_applied_lsn: self.last_applied_lsn,
             last_request_slot: self.last_request_slot,
-            resources: self.resources.clone(),
-            reservations: self.reservations.clone(),
-            operations: self.operations.clone(),
+            resources,
+            reservations,
+            operations,
             wheel: self.wheel.clone(),
         }
     }
@@ -82,20 +91,50 @@ impl AllocDb {
     /// Returns [`SnapshotError`] when configuration validation fails or when snapshot layout does
     /// not match the configured timing wheel.
     pub fn from_snapshot(config: Config, snapshot: Snapshot) -> Result<Self, SnapshotError> {
-        config.validate()?;
-        if snapshot.wheel.len() != config.wheel_len() {
+        let Snapshot {
+            last_applied_lsn,
+            last_request_slot,
+            resources,
+            reservations,
+            operations,
+            wheel,
+        } = snapshot;
+
+        let mut db = Self::new(config)?;
+        if wheel.len() != db.config.wheel_len() {
             return Err(SnapshotError::InvalidLayout);
         }
 
-        let db = Self {
-            config,
-            resources: snapshot.resources,
-            reservations: snapshot.reservations,
-            operations: snapshot.operations,
-            wheel: snapshot.wheel,
-            last_applied_lsn: snapshot.last_applied_lsn,
-            last_request_slot: snapshot.last_request_slot,
-        };
+        for record in resources {
+            db.insert_resource(record);
+        }
+        let mut reservation_retire_entries = Vec::new();
+        for record in reservations {
+            if let Some(retire_after_slot) = record.retire_after_slot {
+                reservation_retire_entries.push((
+                    record.reservation_id,
+                    retire_after_slot,
+                    record.created_lsn.get(),
+                ));
+            }
+            db.insert_reservation(record);
+        }
+        let mut operation_retire_entries = Vec::new();
+        for record in operations {
+            operation_retire_entries.push((
+                record.operation_id,
+                record.retire_after_slot,
+                record.applied_lsn.get(),
+            ));
+            db.insert_operation(record);
+        }
+        db.rebuild_retire_queues(
+            &mut reservation_retire_entries,
+            &mut operation_retire_entries,
+        );
+        db.wheel = wheel;
+        db.last_applied_lsn = last_applied_lsn;
+        db.last_request_slot = last_request_slot;
         db.assert_invariants();
         Ok(db)
     }

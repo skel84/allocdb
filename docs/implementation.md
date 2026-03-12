@@ -31,20 +31,18 @@ Practical Rust rules:
 - if hashing is needed, use a fixed-seed deterministic table with an explicit probe bound
 - avoid per-command heap allocation in the steady-state hot path
 
-Current prototype:
+Current implementation:
 
-- sorted fixed-capacity `Vec` stores for resources, reservations, and operations
+- deterministic fixed-capacity open-addressed tables for resources, reservations, and operations
 - preallocated timing-wheel buckets with explicit per-bucket capacity
+- bounded retirement queues so reservation and operation retirement drains expired fronts instead
+  of scanning whole tables
 
-This was the right first step because it kept the core deterministic and easy to inspect while the
-semantics were still settling.
+The next hardening steps before alpha are:
 
-Next hardening step before alpha:
-
-- replace sorted `Vec` lookup paths with deterministic fixed-capacity open-addressed tables
-- keep randomized `HashMap`-style behavior out of the trusted core
-- separate lookup from retirement order so retirement drains expired fronts instead of scanning
-  whole tables
+- decide whether version-guarded `conditional_confirm` belongs in v1
+- classify torn EOF tails separately from durable-log corruption in every recovery path
+- expose logical slot lag and expiration backlog as first-class metrics outside the trusted core
 
 ## Dependency Policy
 

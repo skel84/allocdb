@@ -1,9 +1,11 @@
 pub mod command;
 pub mod command_codec;
 pub mod config;
+mod fixed_map;
 pub mod ids;
 pub mod recovery;
 pub mod result;
+mod retire_queue;
 pub mod snapshot;
 pub mod snapshot_file;
 pub mod state_machine;
