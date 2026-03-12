@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "allocdb-bench"
+version = "0.1.0"
+dependencies = [
+ "allocdb-core",
+ "allocdb-node",
+]
+
+[[package]]
 name = "allocdb-core"
 version = "0.1.0"
 dependencies = [

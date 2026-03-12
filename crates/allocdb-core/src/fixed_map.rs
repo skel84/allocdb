@@ -197,8 +197,14 @@ impl<K: FixedKey, V> FixedMap<K, V> {
     }
 
     fn close_deletion_gap(&mut self, removed_bucket: usize) {
+        let trace_enabled = log::log_enabled!(log::Level::Trace);
         let mut gap = removed_bucket;
         let mut current = self.next_bucket(gap);
+        if trace_enabled {
+            log::trace!(
+                "close_deletion_gap: start removed_bucket={removed_bucket} gap={gap} current={current}"
+            );
+        }
 
         loop {
             match self
@@ -208,15 +214,39 @@ impl<K: FixedKey, V> FixedMap<K, V> {
                 .expect("bucket index must exist")
             {
                 Bucket::Empty => {
+                    if trace_enabled {
+                        log::trace!(
+                            "close_deletion_gap: inspect gap={gap} current={current} bucket=empty"
+                        );
+                    }
                     self.buckets[gap] = Bucket::Empty;
+                    if trace_enabled {
+                        log::trace!(
+                            "close_deletion_gap: exit removed_bucket={removed_bucket} final_gap={gap} current={current}"
+                        );
+                    }
                     break;
                 }
                 Bucket::Occupied { key, slot } => {
                     let ideal = self.bucket_index(key);
+                    let distance_current = self.probe_distance(ideal, current);
+                    let distance_gap = self.probe_distance(ideal, gap);
+                    if trace_enabled {
+                        let key_hash = key.hash64();
+                        log::trace!(
+                            "close_deletion_gap: inspect gap={gap} current={current} bucket=occupied key_hash={key_hash} slot={slot} ideal={ideal} distance_current={distance_current} distance_gap={distance_gap}"
+                        );
+                    }
                     // Keep scanning until the cluster ends. A key sitting in its ideal bucket does
                     // not terminate the repair because later wrapped keys can still probe through
                     // the current gap.
-                    if self.probe_distance(ideal, gap) < self.probe_distance(ideal, current) {
+                    if distance_current > distance_gap {
+                        if trace_enabled {
+                            let key_hash = key.hash64();
+                            log::trace!(
+                                "close_deletion_gap: move gap={gap} current={current} key_hash={key_hash} slot={slot} ideal={ideal} distance_current={distance_current} distance_gap={distance_gap}"
+                            );
+                        }
                         self.buckets[gap] = Bucket::Occupied { key, slot };
                         gap = current;
                     }
@@ -278,6 +308,15 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct OperationLikeKey(u128);
+
+    impl FixedKey for OperationLikeKey {
+        fn hash64(self) -> u64 {
+            super::hash_u128(self.0)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct PositionedKey {
         id: u64,
         hash: u64,
@@ -327,6 +366,21 @@ mod tests {
         assert_eq!(map.remove(CollidingKey(1)), Some(10));
         assert_eq!(map.get(CollidingKey(2)), Some(&20));
         assert_eq!(map.get(CollidingKey(3)), Some(&30));
+    }
+
+    #[test]
+    fn repeated_removals_preserve_lookup_for_operation_like_hashes() {
+        let mut map = FixedMap::with_capacity(32);
+        for value in 1..=32_u128 {
+            map.insert(OperationLikeKey(value), value).unwrap();
+        }
+
+        for removed in 1..=24_u128 {
+            assert_eq!(map.remove(OperationLikeKey(removed)), Some(removed));
+            for remaining in (removed + 1)..=32_u128 {
+                assert_eq!(map.get(OperationLikeKey(remaining)), Some(&remaining));
+            }
+        }
     }
 
     #[test]

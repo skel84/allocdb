@@ -14,9 +14,10 @@ Current trusted-core boundary:
 
 Everything else should be treated as outside the trusted core unless explicitly promoted into it.
 
-Current non-core node wrapper:
+Current non-core crates:
 
 - `crates/allocdb-node`
+- `crates/allocdb-bench`
 
 Design target:
 
@@ -53,6 +54,8 @@ Current observability surface:
   anchor through the single-node engine wrapper
 - expose a transport-neutral alpha API with explicit submission failure categories, strict-read
   fence responses, and binary request/response codecs outside the trusted core
+- provide one deterministic benchmark harness for hot-spot contention and retry-window pressure
+  outside the trusted core
 
 Current durability shape before alpha:
 
@@ -63,7 +66,6 @@ Current durability shape before alpha:
 
 Next hardening steps before alpha are:
 
-- add the benchmark harness for contention and dedupe-window pressure
 - write the operator runbook for startup, recovery, overload, and corruption handling
 
 ## Dependency Policy

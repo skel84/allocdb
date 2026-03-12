@@ -24,14 +24,15 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: transport-neutral alpha API surface with submit, strict/halt-safe
-    reads, bounded expiration ticks, recovery startup reporting, and metrics request/response
-    handling
+  - current validated chunk: deterministic benchmark harness for one-resource-many-contenders and
+    high-retry-pressure scenarios, including docs and invariant checks around retry-cache and
+    bounded operation-table behavior
 
 ## What Exists
 
 - Trusted-core crate: `crates/allocdb-core`
 - Single-node wrapper crate: `crates/allocdb-node`
+- Benchmark harness crate: `crates/allocdb-bench`
 - In-memory deterministic allocator:
   - deterministic fixed-capacity open-addressed resource, reservation, and operation tables
   - bounded reservation and operation retirement queues
@@ -50,6 +51,12 @@
   - explicit restart-and-retry handling for ambiguous WAL failures within the dedupe window
   - node-level metrics for queue pressure, write acceptance, startup recovery status, and active
     snapshot anchor
+- Deterministic benchmark harness:
+  - CLI entrypoint at `cargo run -p allocdb-bench -- --scenario all`
+  - one-resource-many-contenders scenario for hot-spot reserve contention
+  - high-retry-pressure scenario for duplicate replay, conflict replay, full dedupe table
+    rejection, and post-window recovery
+  - scenario reports include elapsed time, throughput, metrics snapshots, and WAL byte counts
 - Alpha API surface:
   - transport-neutral request and response types in `crates/allocdb-node::api`
   - binary request and response codec with fixed-width little-endian encoding
@@ -67,13 +74,17 @@
   - checkpoint path that writes the new snapshot first, then rewrites retained WAL history
   - one-checkpoint WAL overlap and `snapshot_marker` retention for safe checkpoint replacement
 - Validation:
+  - `cargo run -p allocdb-bench -- --scenario all`
+  - `cargo test -p allocdb-core repeated_removals_preserve_lookup_for_operation_like_hashes`
+  - `cargo test -p allocdb-core operation_table_utilization_drops_after_retry_window_retirement`
   - `scripts/preflight.sh`
 
 ## Current Focus
 
-- `M5-T03`: add the benchmark harness for contention and boundedness behavior
-- open the next tracked issue for `M5-T03`
-- follow with `M5-T04` operator runbook once benchmark and fault-run evidence is available
+- `M5-T04`: write the operator runbook for startup, recovery, overload, and corruption handling
+- use benchmark harness evidence from `docs/benchmark-harness.md` to ground operator guidance
+- follow with `M4` deterministic simulation work after the single-node alpha evidence set is
+  documented
 
 ## How To Check Progress
 

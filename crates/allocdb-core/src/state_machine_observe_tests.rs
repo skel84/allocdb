@@ -149,3 +149,50 @@ fn health_metrics_report_due_expiration_backlog() {
     assert_eq!(cleared.operation_table_capacity, 16);
     assert_eq!(cleared.operation_table_utilization_pct, 12);
 }
+
+#[test]
+fn operation_table_utilization_drops_after_retry_window_retirement() {
+    let mut db = AllocDb::new(Config {
+        shard_id: 0,
+        max_resources: 136,
+        max_reservations: 1,
+        max_operations: 128,
+        max_ttl_slots: 4,
+        max_client_retry_window_slots: 4,
+        reservation_history_window_slots: 2,
+        max_expiration_bucket_len: 1,
+    })
+    .unwrap();
+
+    for value in 1..=128_u128 {
+        db.apply_client(
+            context(u64::try_from(value).unwrap(), 1),
+            ClientRequest {
+                operation_id: OperationId(value),
+                client_id: ClientId(7),
+                command: Command::CreateResource {
+                    resource_id: ResourceId(value),
+                },
+            },
+        );
+    }
+
+    let filled = db.health_metrics(Slot(1));
+    assert_eq!(filled.operation_table_used, 128);
+
+    let recovered = db.apply_client(
+        context(129, 10),
+        ClientRequest {
+            operation_id: OperationId(129),
+            client_id: ClientId(7),
+            command: Command::CreateResource {
+                resource_id: ResourceId(129),
+            },
+        },
+    );
+    assert_eq!(recovered.result_code, ResultCode::Ok);
+
+    let retired = db.health_metrics(Slot(10));
+    assert_eq!(retired.operation_table_used, 1);
+    assert_eq!(retired.operation_table_capacity, 128);
+}

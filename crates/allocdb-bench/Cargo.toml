@@ -1,0 +1,12 @@
+[package]
+name = "allocdb-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+allocdb-core = { path = "../allocdb-core" }
+allocdb-node = { path = "../allocdb-node" }
+
+[lints]
+workspace = true
