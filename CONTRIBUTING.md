@@ -12,8 +12,9 @@ The default path for substantive work is:
 4. run the required validation locally
 5. open a pull request
 6. triage human review and CodeRabbit feedback
-7. rerun validation after review-driven changes
-8. merge only when the branch is green and the review notes are resolved
+7. wait for the CodeRabbit review to complete and produce visible output
+8. rerun validation after review-driven changes
+9. merge only when the branch is green and the review notes are resolved
 
 Do not use `main` as the day-to-day development branch.
 
@@ -87,6 +88,9 @@ This configures git to use `.githooks/` and runs `scripts/preflight.sh` on `pre-
 - human review focuses first on correctness, regressions, missing tests, recovery behavior, and
   docs drift
 - CodeRabbit is part of the review path when enabled on the repository
+- wait for CodeRabbit status to complete before merge
+- if CodeRabbit completes without a visible review comment or review thread, request visible output
+  with `@coderabbitai summary` before merge
 - every CodeRabbit suggestion or comment that affects the PR must be addressed explicitly before
   merge
 - apply CodeRabbit suggestions by default when they improve correctness, safety, testing,
@@ -108,6 +112,7 @@ Until the repository has more human reviewers, self-merge is acceptable only aft
 
 - `scripts/preflight.sh` passes locally
 - required checks pass
+- CodeRabbit status is complete and its visible output has been reviewed
 - review comments are addressed
 - CodeRabbit feedback is triaged
 
@@ -124,7 +129,8 @@ The GitHub repository is configured so that `main`:
 - disallows force pushes and branch deletion
 
 When enabled on the repository, CodeRabbit is part of the normal review path and its feedback must
-be addressed before merge.
+be addressed before merge. The repository-level CodeRabbit configuration lives in
+`.coderabbit.yaml`.
 
 ## Labels And Milestones
 

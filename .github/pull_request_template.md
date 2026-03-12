@@ -15,5 +15,7 @@
 
 ## CodeRabbit Triage
 
+- [ ] CodeRabbit status completed
+- [ ] requested `@coderabbitai summary` if no visible review comment or thread appeared
 - [ ] applied relevant correctness, safety, recovery, testing, and docs suggestions
 - [ ] documented any intentionally rejected suggestions
