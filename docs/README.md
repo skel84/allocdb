@@ -11,6 +11,7 @@
 
 - [Product Scope](./product.md)
 - [Semantics and API](./semantics.md)
+- [Alpha API](./api.md)
 - [PRD Overview](./prd.md)
 
 ## Engineering Docs
@@ -45,5 +46,4 @@
 
 ## Planned Follow-Ups
 
-- `api.md` for wire protocol and error schema
 - split `replication.md` into protocol/recovery/validation docs after single-node semantics are stable

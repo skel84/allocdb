@@ -51,6 +51,8 @@ Current observability surface:
 - expose operation-table utilization so dedupe-window pressure is visible before hard rejection
 - expose queue depth, write-acceptance state, startup recovery status, and the active snapshot
   anchor through the single-node engine wrapper
+- expose a transport-neutral alpha API with explicit submission failure categories, strict-read
+  fence responses, and binary request/response codecs outside the trusted core
 
 Current durability shape before alpha:
 
@@ -61,8 +63,8 @@ Current durability shape before alpha:
 
 Next hardening steps before alpha are:
 
-- expose the minimal alpha API around the current single-node engine and metrics surface
-- preserve definite-vs-indefinite submission categories in the external wire protocol
+- add the benchmark harness for contention and dedupe-window pressure
+- write the operator runbook for startup, recovery, overload, and corruption handling
 
 ## Dependency Policy
 
@@ -134,6 +136,6 @@ Current guardrail targets:
 
 The next useful detailed docs are:
 
-1. `api.md` for wire protocol and error codes
-2. `replication.md` only after the single-node semantics are fixed
-3. `roadmap.md` and `work-breakdown.md` for execution planning
+1. `replication.md` only after the single-node semantics are fixed
+2. `roadmap.md` and `work-breakdown.md` for execution planning
+3. operator-facing runbook details once the alpha surface is complete

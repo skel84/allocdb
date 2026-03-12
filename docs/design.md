@@ -7,6 +7,7 @@ Draft. This file is the top-level engineering overview for the v1 design.
 For the detailed design docs, read:
 
 - [Semantics and API](./semantics.md)
+- [Alpha API](./api.md)
 - [Architecture](./architecture.md)
 - [Fault Model](./fault-model.md)
 - [Replication Notes](./replication.md)
@@ -45,6 +46,7 @@ Current implementation anchor:
 ## Document Map
 
 - [semantics.md](./semantics.md): domain model, identifiers, invariants, commands, retention
+- [api.md](./api.md): transport-neutral alpha request/response surface and wire error schema
 - [architecture.md](./architecture.md): single-node pipeline, logical time, bounds, scheduler
 - [fault-model.md](./fault-model.md): crash, clock, storage, and bounded-overload assumptions
 - [replication.md](./replication.md): deferred distributed design areas and boundaries
