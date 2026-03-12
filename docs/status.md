@@ -10,7 +10,7 @@
   - `M0` semantics freeze: complete enough for core work
   - `M1` pure state machine: implemented
   - `M1H` constant-time core hardening: complete
-  - `M2` durability primitives: partially implemented
+  - `M2` durability and recovery: implemented
   - `M3` submission pipeline: in progress
   - `M4+` simulation, alpha hardening, replication design: not started
 - Latest completed implementation chunks:
@@ -22,8 +22,8 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: explicit submission error categories and dedupe-window utilization
-    signal
+  - current validated chunk: safe checkpoint coordination with one-checkpoint WAL overlap and
+    snapshot-marker retention
 
 ## What Exists
 
@@ -51,20 +51,17 @@
   - snapshot encode, decode, capture, restore
   - file-backed snapshot write and load
   - explicit WAL command payload encoding and live-path replay recovery
+  - checkpoint path that writes the new snapshot first, then rewrites retained WAL history
+  - one-checkpoint WAL overlap and `snapshot_marker` retention for safe checkpoint replacement
 - Validation:
-  - `cargo fmt --all`
-  - `cargo clippy --all-targets --all-features -- -D warnings`
-  - `cargo test`
-  - `scripts/check_repo.sh`
+  - `scripts/preflight.sh`
 
 ## Current Focus
 
-- `M2-T08`: tighten WAL/snapshot checkpoint coordination on top of the current recovery path
-- `M2-T08`: implement a safe truncation rule that preserves overlap through the previous
-  checkpoint anchor
 - `M3-T06`: finish the remaining submission semantics around indefinite outcomes after write/sync
   failure
 - `M5-T02`: expose recovery status alongside the current queue-pressure and core-health signals
+- prepare the wire/API side of the single-node alpha on top of the now-complete durability layer
 
 ## How To Check Progress
 

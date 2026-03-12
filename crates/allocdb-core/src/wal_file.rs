@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -44,11 +44,7 @@ impl WalFile {
     /// Returns [`WalFileError`] if the file cannot be opened or created.
     pub fn open(path: impl AsRef<Path>, max_payload_bytes: usize) -> Result<Self, WalFileError> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)?;
+        let file = open_append_file(&path)?;
 
         Ok(Self {
             path,
@@ -69,12 +65,7 @@ impl WalFile {
     /// Returns [`WalFileError::PayloadTooLarge`] if the frame payload exceeds the configured bound,
     /// or [`WalFileError::Io`] if the append fails.
     pub fn append_frame(&mut self, frame: &Frame) -> Result<(), WalFileError> {
-        if frame.payload.len() > self.max_payload_bytes {
-            return Err(WalFileError::PayloadTooLarge {
-                payload_len: frame.payload.len(),
-                max_payload_bytes: self.max_payload_bytes,
-            });
-        }
+        self.validate_payload_len(frame)?;
 
         let encoded = frame.encode();
         self.file.write_all(&encoded)?;
@@ -131,6 +122,57 @@ impl WalFile {
 
         Ok(recovered)
     }
+
+    /// Replaces the on-disk WAL contents with one new ordered frame set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalFileError::PayloadTooLarge`] if any frame exceeds the configured payload
+    /// bound, or [`WalFileError::Io`] if the temp-file rewrite, rename, or reopen fails.
+    pub fn replace_with_frames(&mut self, frames: &[Frame]) -> Result<(), WalFileError> {
+        for frame in frames {
+            self.validate_payload_len(frame)?;
+        }
+
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let temp_path = self.temp_path();
+        {
+            let mut temp_file = File::create(&temp_path)?;
+            for frame in frames {
+                temp_file.write_all(&frame.encode())?;
+            }
+            temp_file.sync_data()?;
+        }
+
+        fs::rename(&temp_path, &self.path)?;
+        sync_parent_dir(&self.path)?;
+        self.file = open_append_file(&self.path)?;
+        Ok(())
+    }
+
+    fn validate_payload_len(&self, frame: &Frame) -> Result<(), WalFileError> {
+        if frame.payload.len() > self.max_payload_bytes {
+            return Err(WalFileError::PayloadTooLarge {
+                payload_len: frame.payload.len(),
+                max_payload_bytes: self.max_payload_bytes,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn temp_path(&self) -> PathBuf {
+        let mut temp_path = self.path.clone();
+        let extension = temp_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map_or_else(|| "tmp".to_owned(), |value| format!("{value}.tmp"));
+        temp_path.set_extension(extension);
+        temp_path
+    }
 }
 
 fn recover_path(path: &Path) -> Result<RecoveredWal, WalFileError> {
@@ -142,6 +184,27 @@ fn recover_path(path: &Path) -> Result<RecoveredWal, WalFileError> {
         scan_result,
         file_len: u64::try_from(bytes.len()).expect("file length must fit into u64"),
     })
+}
+
+fn open_append_file(path: &Path) -> Result<File, std::io::Error> {
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        OpenOptions::new().read(true).open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -294,6 +357,24 @@ mod tests {
             } if offset == first_len
         ));
         assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn wal_file_replace_with_frames_rewrites_contents() {
+        let path = test_path("rewrite");
+        let mut wal = WalFile::open(&path, 64).unwrap();
+        wal.append_frame(&frame(1, 1, b"one")).unwrap();
+        wal.append_frame(&frame(2, 2, b"two")).unwrap();
+        wal.sync().unwrap();
+
+        let rewritten = vec![frame(2, 2, b"two"), frame(3, 3, b"three")];
+        wal.replace_with_frames(&rewritten).unwrap();
+
+        let recovered = wal.recover().unwrap();
+        assert_eq!(recovered.scan_result.frames, rewritten);
+        assert_eq!(recovered.scan_result.stop_reason, ScanStopReason::CleanEof);
 
         fs::remove_file(path).unwrap();
     }

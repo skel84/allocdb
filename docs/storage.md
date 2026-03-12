@@ -6,7 +6,10 @@ This document defines the v1 WAL, snapshot, and crash-recovery model.
 
 ## WAL
 
-Use segmented append-only WAL files.
+The current implementation uses one append-only WAL file.
+
+Segmented WAL retention remains a plausible future refinement, but v1 now achieves safe checkpoint
+coordination by rewriting the retained WAL prefix through a temp-file and rename path.
 
 Each frame includes:
 
@@ -39,9 +42,9 @@ Current implementation anchor:
 
 The current code covers frame encoding, decoding, checksum validation, and in-memory recovery
 scanning up to the last valid frame boundary, explicit command-payload encoding for client and
-internal commands, plus file-backed append, sync, recovery scan, and truncate-to-valid-prefix
-behavior for one WAL file. Recovery distinguishes a crash-torn tail from durable-log corruption:
-only torn tails are truncated automatically.
+internal commands, file-backed append, sync, recovery scan, truncate-to-valid-prefix behavior for
+one WAL file, and safe WAL rewrite during checkpoint retention. Recovery distinguishes a
+crash-torn tail from durable-log corruption: only torn tails are truncated automatically.
 
 ## Snapshots
 
@@ -80,7 +83,7 @@ Recovery implementation anchors:
 Recovery is:
 
 1. load the latest valid snapshot
-2. scan later WAL segments in LSN order
+2. scan later WAL frames in LSN order
 3. verify checksums
 4. replay frames into a fresh state machine
 5. rebuild transient scheduler state from persisted state
@@ -98,19 +101,21 @@ Current behavior:
 - recovery loads the latest snapshot first
 - replay skips WAL frames at or below the snapshot's `last_applied_lsn`
 - snapshot writing is atomic at the file level through temp-file, fsync, and rename discipline
+- the engine tracks the active snapshot anchor explicitly in memory
+- each successful checkpoint rewrites the WAL through a temp-file and rename path
+- rewritten WAL retains frames with `lsn > previous_snapshot_lsn`, preserving one-checkpoint
+  overlap
+- rewritten WAL appends a `snapshot_marker` frame at the active snapshot anchor so the retained WAL
+  makes the current checkpoint boundary explicit
 
-Current limitation:
+Crash-safety rule:
 
-- the system does not yet perform snapshot-driven WAL prefix truncation after a successful
-  checkpoint
-- because the current WAL implementation is one file, safe truncation requires either a prefix
-  rewrite or segmented WAL files; suffix truncation is not enough
-
-Required follow-up rule:
-
-- any future checkpoint truncation must leave overlapping history through the previously successful
-  snapshot anchor, so a crash during or after snapshot replacement never strands recovery without a
-  durable path back to the latest stable checkpoint
+- snapshot replacement happens before WAL rewrite, so a crash after the new snapshot becomes
+  durable but before WAL rewrite completes still recovers from the new snapshot plus the old WAL
+- WAL rewrite uses temp-file, fsync, rename, and directory-sync discipline, so a crash during
+  rewrite leaves either the old retained WAL or the fully rewritten retained WAL
+- any future segmented implementation must preserve the same one-checkpoint overlap rule; suffix
+  truncation alone is not enough
 
 ## Design Notes
 
