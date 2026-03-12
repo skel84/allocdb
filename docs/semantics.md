@@ -363,6 +363,8 @@ Current single-node engine rule:
 - if the failed attempt did not reach durable WAL, the retry executes once as a fresh command
 - `engine_halted` remains an indefinite submission failure because the halted node refuses to claim
   whether a prior ambiguous write committed
+- while the engine is halted, live reads also fail closed because in-memory state may lag durable
+  WAL until recovery rebuilds the node
 - the retry contract only holds while the dedupe retention window is still open
 - the future wire protocol must preserve that distinction explicitly instead of flattening all
   submission errors into one generic failure class

@@ -24,8 +24,9 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: transport-neutral alpha API surface with submit, read, and metrics
-    request/response handling
+  - current validated chunk: transport-neutral alpha API surface with submit, strict/halt-safe
+    reads, bounded expiration ticks, recovery startup reporting, and metrics request/response
+    handling
 
 ## What Exists
 
@@ -53,7 +54,8 @@
   - transport-neutral request and response types in `crates/allocdb-node::api`
   - binary request and response codec with fixed-width little-endian encoding
   - explicit wire-level mapping for definite vs indefinite submission failures
-  - strict-read fence responses for resource and reservation queries
+  - strict-read fence responses plus halt-safe read rejection for resource and reservation queries
+  - bounded `tick_expirations` maintenance request for live TTL enforcement
   - metrics exposure through the same API boundary
 - Durability primitives:
   - WAL frame codec and recovery scan

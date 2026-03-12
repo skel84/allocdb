@@ -75,6 +75,9 @@ client
 
 For a single node, this is enough for strict reads.
 
+If the live engine halts after a WAL-path ambiguity, reads must fail closed until recovery
+reconstructs memory from durable state.
+
 Current implementation anchor:
 
 - `SingleNodeEngine::enforce_read_fence(required_lsn)` in `crates/allocdb-node/src/engine_observe.rs`
@@ -94,6 +97,11 @@ Rules:
 - the scheduler never mutates allocation state directly
 - at most `MAX_EXPIRATIONS_PER_TICK` expirations are enqueued
 - lag must be observable as an explicit metric outside the trusted core
+
+Current implementation anchor:
+
+- `SingleNodeEngine::tick_expirations(current_wall_clock_slot)` in
+  `crates/allocdb-node/src/engine.rs`
 
 ## Time and TTL Model
 

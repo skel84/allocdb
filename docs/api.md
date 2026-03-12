@@ -43,6 +43,7 @@ The current request set is:
 - `get_resource`
 - `get_reservation`
 - `get_metrics`
+- `tick_expirations`
 
 ### Submit
 
@@ -96,6 +97,18 @@ get_metrics {
 
 The caller provides wall-clock progress so the engine can derive `logical_slot_lag` and
 `expiration_backlog` deterministically.
+
+### Tick Expirations
+
+```text
+tick_expirations {
+  current_wall_clock_slot : u64
+}
+```
+
+This request drives the bounded expiration scheduler for one maintenance tick. The node inspects
+due reservations, commits up to `MAX_EXPIRATIONS_PER_TICK` internal `expire` commands through the
+WAL, and applies them through the normal executor path.
 
 ## Submission Responses
 
@@ -158,6 +171,7 @@ failures.
 
 - `found(resource_view)`
 - `not_found`
+- `engine_halted`
 - `fence_not_applied(required_lsn, last_applied_lsn)`
 
 Current `resource_view` fields are:
@@ -176,6 +190,7 @@ version                 : u64
 - `found(reservation_view)`
 - `not_found`
 - `retired`
+- `engine_halted`
 - `fence_not_applied(required_lsn, last_applied_lsn)`
 
 Current `reservation_view` fields are:
@@ -192,6 +207,29 @@ retire_after_slot : u64 | none
 ```
 
 `retired` is distinct from `not_found` because bounded history is part of the product contract.
+
+If the live engine has halted after a WAL-path ambiguity, reads must fail closed with
+`engine_halted` until recovery rebuilds memory from durable state.
+
+## Expiration Tick Responses
+
+`tick_expirations` returns one of:
+
+- `applied(processed_count, last_applied_lsn)`
+- `rejected(category, code)`
+
+```text
+applied {
+  processed_count   : u32
+  last_applied_lsn  : u64 | none
+}
+```
+
+`processed_count` is the number of internal `expire` commands committed in this maintenance tick.
+`last_applied_lsn` is absent when no due expiration was processed.
+
+`rejected(category, code)` reuses the same failure envelope as `submit`. In practice the current
+tick path can return only indefinite failures such as `engine_halted` or `storage_failure`.
 
 ## Metrics Response
 
@@ -220,6 +258,9 @@ metrics {
   }
 }
 ```
+
+`loaded_snapshot_lsn` remains optional. An empty durable snapshot reports `startup_kind =
+snapshot_only` with `loaded_snapshot_lsn = none`.
 
 ## Wire Discipline
 

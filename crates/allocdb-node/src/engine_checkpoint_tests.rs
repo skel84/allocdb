@@ -37,6 +37,7 @@ fn engine_config() -> EngineConfig {
     EngineConfig {
         max_submission_queue: 2,
         max_command_bytes: 512,
+        max_expirations_per_tick: 1,
     }
 }
 
