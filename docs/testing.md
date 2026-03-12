@@ -93,8 +93,8 @@ The selected shape is:
   driver events
 - use a seed only to choose ordering among ready actions at the same logical slot
 
-The spike evidence lives in `crates/allocdb-node/src/experiments/simulation_harness_spike_tests.rs`.
-That experiment showed:
+The promoted `M4-T01` harness now lives in `crates/allocdb-node/src/simulation.rs`, with
+regression coverage in `crates/allocdb-node/src/simulation_tests.rs`. The current evidence shows:
 
 - the same seed reproduces the same same-slot action order and LSN transcript
 - advancing the simulated slot without ticking produces deterministic expiration backlog
@@ -110,9 +110,9 @@ What to reuse in follow-up tasks:
 
 What not to promote directly:
 
-- the spike's ad hoc helper surface
-- the specific throwaway PRNG
-- the current one-file experiment layout
+- the original spike's ad hoc helper surface
+- any scheduler choice that is not covered by deterministic transcript tests
+- one-off layouts that hide the reusable harness from follow-on simulation tasks
 
 This direction keeps trusted-core churn low because the real engine already exposes the slot,
 checkpoint, recovery, and failure-injection seams the simulator needs. It also avoids trait-heavy

@@ -149,6 +149,7 @@ fn recover_allocdb_rejects_semantically_invalid_snapshot() {
         .write_snapshot(&Snapshot {
             last_applied_lsn: None,
             last_request_slot: None,
+            max_retired_reservation_id: None,
             resources: vec![
                 ResourceRecord {
                     resource_id: ResourceId(11),

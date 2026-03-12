@@ -14,6 +14,9 @@ mod invariants;
 #[cfg(test)]
 #[path = "state_machine_issue_32_tests.rs"]
 mod issue_32_tests;
+#[cfg(test)]
+#[path = "state_machine_issue_33_tests.rs"]
+mod issue_33_tests;
 #[path = "state_machine_metrics.rs"]
 mod metrics;
 #[cfg(test)]
@@ -85,6 +88,7 @@ pub struct AllocDb {
     pub(crate) resources: FixedMap<ResourceId, ResourceRecord>,
     pub(crate) reservations: FixedMap<ReservationId, ReservationRecord>,
     pub(crate) operations: FixedMap<OperationId, OperationRecord>,
+    pub(crate) max_retired_reservation_id: Option<ReservationId>,
     pub(crate) reservation_retire_queue: RetireQueue<ReservationId>,
     pub(crate) operation_retire_queue: RetireQueue<OperationId>,
     pub(crate) wheel: Vec<Vec<ReservationId>>,
@@ -136,6 +140,7 @@ impl AllocDb {
             ),
             wheel,
             config,
+            max_retired_reservation_id: None,
             last_applied_lsn: None,
             last_request_slot: None,
         })
@@ -267,5 +272,29 @@ impl AllocDb {
                 panic!("operation retire queue must stay within operation capacity")
             }
         }
+    }
+
+    pub(crate) fn record_retired_reservation_id(&mut self, reservation_id: ReservationId) {
+        match self.max_retired_reservation_id {
+            Some(current_max) if reservation_id <= current_max => {}
+            _ => self.max_retired_reservation_id = Some(reservation_id),
+        }
+    }
+
+    pub(crate) fn retired_reservation_lookup_contains(
+        &self,
+        reservation_id: ReservationId,
+    ) -> bool {
+        let Some(max_retired_reservation_id) = self.max_retired_reservation_id else {
+            return false;
+        };
+
+        let reservation_shard_id =
+            u64::try_from(reservation_id.get() >> 64).expect("reservation shard id must fit u64");
+        if reservation_shard_id != self.config.shard_id {
+            return false;
+        }
+
+        reservation_id <= max_retired_reservation_id
     }
 }

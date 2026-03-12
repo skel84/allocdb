@@ -136,6 +136,8 @@ Rules:
 - active reservations occupy entries until they terminate
 - terminal reservations keep their entry until `retire_after_slot`
 - retirement frees the slot for reuse
+- retirement also advances a bounded retired-lookup watermark so later reservation lookups stay
+  distinct from `not_found` after the full record is dropped
 
 This keeps history bounded and prevents the product-level history policy from silently making the
 core unbounded.

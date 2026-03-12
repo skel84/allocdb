@@ -12,7 +12,7 @@
   - `M1H` constant-time core hardening: complete
   - `M2` durability and recovery: implemented
   - `M3` submission pipeline: implemented
-  - `M4` simulation: not started
+  - `M4` simulation: in progress
   - `M5` single-node alpha surface: in progress
   - `M6` replication design: not started
 - Latest completed implementation chunks:
@@ -26,7 +26,7 @@
   - `82cb8d8` `Add single-node submission engine crate`
   - current validated chunk: fail-closed recovery on semantically invalid WAL ordering and
     malformed decoded snapshots, including typed restore/replay errors, explicit recovery logging,
-    and regression coverage for duplicate IDs, over-capacity snapshots, and rewound replay slots
+    and bounded retired-reservation watermark preservation across snapshot restore
 
 ## What Exists
 
@@ -62,6 +62,8 @@
   - binary request and response codec with fixed-width little-endian encoding
   - explicit wire-level mapping for definite vs indefinite submission failures
   - strict-read fence responses plus halt-safe read rejection for resource and reservation queries
+  - retired reservation lookups remain distinct from `not_found` across later writes and snapshot
+    restore through bounded retired-watermark metadata
   - bounded `tick_expirations` maintenance request for live TTL enforcement
   - metrics exposure through the same API boundary
 - Durability primitives:
@@ -75,20 +77,26 @@
   - explicit WAL command payload encoding and live-path replay recovery
   - checkpoint path that writes the new snapshot first, then rewrites retained WAL history
   - one-checkpoint WAL overlap and `snapshot_marker` retention for safe checkpoint replacement
+- Deterministic simulation support:
+  - reusable simulation harness in `crates/allocdb-node/src/simulation.rs`
+  - explicit simulated slot advancement under test control, with no wall-clock reads in the
+    exercised engine path
+  - seeded same-slot ready-set scheduling with reproducible transcripts
+  - checkpoint, restart, and injected persist-failure helpers over the real `SingleNodeEngine`
 - Validation:
   - `cargo test -p allocdb-core snapshot -- --nocapture`
   - `cargo test -p allocdb-core recovery -- --nocapture`
+  - `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
+  - `cargo test -p allocdb-node api_reservation_reports_retired_history`
   - `cargo run -p allocdb-bench -- --scenario all`
-  - `cargo test -p allocdb-core repeated_removals_preserve_lookup_for_operation_like_hashes`
-  - `cargo test -p allocdb-core operation_table_utilization_drops_after_retry_window_retirement`
   - `scripts/preflight.sh`
 
 ## Current Focus
 
-- `M5-T04`: write the operator runbook for startup, recovery, overload, and corruption handling
-- use benchmark harness evidence from `docs/benchmark-harness.md` to ground operator guidance
-- follow with `M4` deterministic simulation work after the single-node alpha evidence set is
-  documented
+- `M4-T02`: inject reproducible crash points around WAL, apply, snapshot, and recovery boundaries
+  on top of the promoted simulation harness
+- follow with `M4-T03` storage-fault coverage using the same deterministic driver
+- resume `M5-T04` operator guidance after the simulation evidence set is broader
 
 ## How To Check Progress
 

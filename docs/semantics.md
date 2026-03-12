@@ -305,7 +305,9 @@ Rules:
 - strict reads are tied to an applied LSN
 - active reservations are always queryable
 - terminal reservations remain queryable until `retire_after_slot`
-- after retirement, reads return `reservation_retired`
+- after the live record retires, reads return `reservation_retired` via bounded retained metadata
+- that retained metadata is conservative: once full history is dropped, older shard-local
+  `reservation_id` values at or below the retired watermark also read as `reservation_retired`
 
 ## Consistency and Idempotency
 

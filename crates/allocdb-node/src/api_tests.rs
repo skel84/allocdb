@@ -401,6 +401,26 @@ fn api_reservation_reports_retired_history() {
         ApiResponse::GetReservation(ReservationResponse::Retired)
     );
 
+    let later_write = engine.handle_api_request(ApiRequest::Submit(
+        SubmitRequest::from_client_request(Slot(8), create_request(12, 4)),
+    ));
+    assert!(matches!(
+        later_write,
+        ApiResponse::Submit(SubmitResponse::Committed(_))
+    ));
+
+    let after_later_write =
+        engine.handle_api_request(ApiRequest::GetReservation(ReservationRequest {
+            reservation_id: ReservationId(2),
+            current_slot: Slot(8),
+            required_lsn: Some(Lsn(4)),
+        }));
+
+    assert_eq!(
+        after_later_write,
+        ApiResponse::GetReservation(ReservationResponse::Retired)
+    );
+
     drop(engine);
     fs::remove_file(&wal_path).unwrap();
 }

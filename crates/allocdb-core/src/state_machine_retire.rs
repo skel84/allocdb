@@ -24,6 +24,7 @@ impl AllocDb {
                     removed.is_some(),
                     "queued reservation retirement must remove one entry"
                 );
+                self.record_retired_reservation_id(entry.key);
             }
         }
     }
