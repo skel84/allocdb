@@ -13,7 +13,7 @@ use allocdb_core::snapshot_file::SnapshotFile;
 use allocdb_core::state_machine::AllocDb;
 use allocdb_core::wal::{Frame, RecordType};
 use allocdb_core::wal_file::{WalFile, WalFileError};
-use log::error;
+use log::{error, trace};
 
 use crate::bounded_queue::{BoundedQueue, BoundedQueueError};
 
@@ -468,7 +468,13 @@ impl SingleNodeEngine {
     }
 
     fn process_queued_submissions(&mut self) -> Result<(), SubmissionError> {
-        while self.process_one()?.is_some() {}
+        let mut drained_count = 0_u32;
+        while self.process_one()?.is_some() {
+            drained_count = drained_count.saturating_add(1);
+        }
+        if drained_count > 0 {
+            trace!("drained queued submissions before expiration tick: count={drained_count}");
+        }
         Ok(())
     }
 
