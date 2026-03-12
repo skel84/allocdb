@@ -430,7 +430,8 @@ impl SingleNodeEngine {
         Ok(self.process_one()?.map(|processed| processed.result))
     }
 
-    /// Commits up to one bounded batch of due expiration commands for the provided logical slot.
+    /// Drains already-queued client submissions, then commits up to one bounded batch of due
+    /// expiration commands for the provided logical slot.
     ///
     /// # Errors
     ///
@@ -443,12 +444,14 @@ impl SingleNodeEngine {
             return Err(SubmissionError::EngineHalted);
         }
 
+        self.process_queued_submissions()?;
         let due = self.collect_due_expirations(current_wall_clock_slot);
+        let expiration_request_slot = self.expiration_request_slot(current_wall_clock_slot);
         let mut processed_count = 0_u32;
         let mut last_applied_lsn = None;
         for target in due {
             let result = self.apply_internal_command(
-                current_wall_clock_slot,
+                expiration_request_slot,
                 Command::Expire {
                     reservation_id: target.reservation_id,
                     deadline_slot: target.deadline_slot,
@@ -462,6 +465,11 @@ impl SingleNodeEngine {
             processed_count,
             last_applied_lsn,
         })
+    }
+
+    fn process_queued_submissions(&mut self) -> Result<(), SubmissionError> {
+        while self.process_one()?.is_some() {}
+        Ok(())
     }
 
     fn enqueue_validated(
@@ -618,6 +626,14 @@ impl SingleNodeEngine {
                 .expect("validated max_expirations_per_tick must fit usize"),
         );
         due
+    }
+
+    fn expiration_request_slot(&self, current_wall_clock_slot: Slot) -> Slot {
+        self.db
+            .last_request_slot()
+            .map_or(current_wall_clock_slot, |last_request_slot| {
+                Slot(current_wall_clock_slot.get().max(last_request_slot.get()))
+            })
     }
 
     fn apply_internal_command(
