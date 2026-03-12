@@ -9,7 +9,7 @@ use super::{
     ApiRequest, ApiResponse, InvalidRequestReason, MetricsRequest, MetricsResponse,
     ReservationRequest, ReservationResponse, ReservationView, ResourceRequest, ResourceResponse,
     ResourceView, SubmissionCommitted, SubmissionFailure, SubmissionFailureCode, SubmitRequest,
-    SubmitResponse,
+    SubmitResponse, TickExpirationsApplied, TickExpirationsRequest, TickExpirationsResponse,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +51,10 @@ pub fn encode_request(request: &ApiRequest) -> Result<Vec<u8>, ApiCodecError> {
             bytes.push(4);
             bytes.extend_from_slice(&request.current_wall_clock_slot.get().to_le_bytes());
         }
+        ApiRequest::TickExpirations(request) => {
+            bytes.push(5);
+            bytes.extend_from_slice(&request.current_wall_clock_slot.get().to_le_bytes());
+        }
     }
     Ok(bytes)
 }
@@ -77,6 +81,9 @@ pub fn decode_request(bytes: &[u8]) -> Result<ApiRequest, ApiCodecError> {
             reservation_id: ReservationId(cursor.read_u128()?),
         }),
         4 => ApiRequest::GetMetrics(MetricsRequest {
+            current_wall_clock_slot: Slot(cursor.read_u64()?),
+        }),
+        5 => ApiRequest::TickExpirations(TickExpirationsRequest {
             current_wall_clock_slot: Slot(cursor.read_u64()?),
         }),
         value => return Err(ApiCodecError::InvalidRequestTag(value)),
@@ -132,6 +139,20 @@ pub fn encode_response(response: &ApiResponse) -> Vec<u8> {
             bytes.push(10);
             encode_metrics(&mut bytes, response.metrics);
         }
+        ApiResponse::GetResource(ResourceResponse::EngineHalted) => {
+            bytes.push(11);
+        }
+        ApiResponse::GetReservation(ReservationResponse::EngineHalted) => {
+            bytes.push(12);
+        }
+        ApiResponse::TickExpirations(TickExpirationsResponse::Applied(response)) => {
+            bytes.push(13);
+            encode_tick_expirations_applied(&mut bytes, *response);
+        }
+        ApiResponse::TickExpirations(TickExpirationsResponse::Rejected(response)) => {
+            bytes.push(14);
+            encode_submission_failure(&mut bytes, *response);
+        }
     }
     bytes
 }
@@ -174,6 +195,14 @@ pub fn decode_response(bytes: &[u8]) -> Result<ApiResponse, ApiCodecError> {
         10 => ApiResponse::GetMetrics(MetricsResponse {
             metrics: decode_metrics(&mut cursor)?,
         }),
+        11 => ApiResponse::GetResource(ResourceResponse::EngineHalted),
+        12 => ApiResponse::GetReservation(ReservationResponse::EngineHalted),
+        13 => ApiResponse::TickExpirations(TickExpirationsResponse::Applied(
+            decode_tick_expirations_applied(&mut cursor)?,
+        )),
+        14 => ApiResponse::TickExpirations(TickExpirationsResponse::Rejected(
+            decode_submission_failure(&mut cursor)?,
+        )),
         value => return Err(ApiCodecError::InvalidResponseTag(value)),
     };
     cursor.finish()?;
@@ -327,6 +356,20 @@ fn decode_read_fence(cursor: &mut Cursor<'_>) -> Result<(Lsn, Option<Lsn>), ApiC
         Lsn(cursor.read_u64()?),
         cursor.read_optional_u64()?.map(Lsn),
     ))
+}
+
+fn encode_tick_expirations_applied(bytes: &mut Vec<u8>, response: TickExpirationsApplied) {
+    bytes.extend_from_slice(&response.processed_count.to_le_bytes());
+    encode_optional_lsn(bytes, response.last_applied_lsn);
+}
+
+fn decode_tick_expirations_applied(
+    cursor: &mut Cursor<'_>,
+) -> Result<TickExpirationsApplied, ApiCodecError> {
+    Ok(TickExpirationsApplied {
+        processed_count: cursor.read_u32()?,
+        last_applied_lsn: cursor.read_optional_u64()?.map(Lsn),
+    })
 }
 
 fn encode_metrics(bytes: &mut Vec<u8>, metrics: EngineMetrics) {

@@ -1,11 +1,12 @@
 use std::path::Path;
 
-use allocdb_core::command::{ClientRequest, CommandContext};
+use allocdb_core::ReservationState;
+use allocdb_core::command::{ClientRequest, Command, CommandContext};
 use allocdb_core::command_codec::{
-    CommandCodecError, decode_client_request, encode_client_request,
+    CommandCodecError, decode_client_request, encode_client_request, encode_internal_command,
 };
 use allocdb_core::config::{Config, ConfigError};
-use allocdb_core::ids::{Lsn, OperationId, Slot};
+use allocdb_core::ids::{Lsn, OperationId, ReservationId, Slot};
 use allocdb_core::recovery::{RecoveryError, recover_allocdb};
 use allocdb_core::result::{CommandOutcome, ResultCode};
 use allocdb_core::snapshot_file::SnapshotFile;
@@ -33,6 +34,7 @@ pub use observe::{EngineMetrics, ReadError, RecoveryStartupKind, RecoveryStatus}
 pub struct EngineConfig {
     pub max_submission_queue: u32,
     pub max_command_bytes: usize,
+    pub max_expirations_per_tick: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +57,10 @@ impl EngineConfig {
             return Err(EngineConfigError::ZeroCapacity("max_command_bytes"));
         }
 
+        if self.max_expirations_per_tick == 0 {
+            return Err(EngineConfigError::ZeroCapacity("max_expirations_per_tick"));
+        }
+
         Ok(())
     }
 }
@@ -64,6 +70,12 @@ pub struct SubmissionResult {
     pub applied_lsn: Lsn,
     pub outcome: CommandOutcome,
     pub from_retry_cache: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpirationTickResult {
+    pub processed_count: u32,
+    pub last_applied_lsn: Option<Lsn>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,6 +179,7 @@ struct PendingSubmission {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StartupRecovery {
+    loaded_snapshot: bool,
     loaded_snapshot_lsn: Option<Lsn>,
     replayed_wal_frame_count: u32,
     replayed_wal_last_lsn: Option<Lsn>,
@@ -175,6 +188,7 @@ struct StartupRecovery {
 impl StartupRecovery {
     const fn fresh_start() -> Self {
         Self {
+            loaded_snapshot: false,
             loaded_snapshot_lsn: None,
             replayed_wal_frame_count: 0,
             replayed_wal_last_lsn: None,
@@ -183,7 +197,7 @@ impl StartupRecovery {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PersistFailurePhase {
+pub(crate) enum PersistFailurePhase {
     BeforeAppend,
     AfterAppend,
 }
@@ -193,6 +207,12 @@ struct ProcessedSubmission {
     operation_id: OperationId,
     command_fingerprint: u128,
     result: SubmissionResult,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct DueExpiration {
+    deadline_slot: Slot,
+    reservation_id: ReservationId,
 }
 
 #[derive(Debug)]
@@ -257,6 +277,7 @@ impl SingleNodeEngine {
             wal_path,
             recovered.loaded_snapshot_lsn,
             StartupRecovery {
+                loaded_snapshot: recovered.loaded_snapshot,
                 loaded_snapshot_lsn: recovered.loaded_snapshot_lsn,
                 replayed_wal_frame_count: recovered.replayed_wal_frame_count,
                 replayed_wal_last_lsn: recovered.replayed_wal_last_lsn,
@@ -409,6 +430,40 @@ impl SingleNodeEngine {
         Ok(self.process_one()?.map(|processed| processed.result))
     }
 
+    /// Commits up to one bounded batch of due expiration commands for the provided logical slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmissionError`] if the engine is halted or if any WAL append/sync fails.
+    pub fn tick_expirations(
+        &mut self,
+        current_wall_clock_slot: Slot,
+    ) -> Result<ExpirationTickResult, SubmissionError> {
+        if !self.accepting_writes {
+            return Err(SubmissionError::EngineHalted);
+        }
+
+        let due = self.collect_due_expirations(current_wall_clock_slot);
+        let mut processed_count = 0_u32;
+        let mut last_applied_lsn = None;
+        for target in due {
+            let result = self.apply_internal_command(
+                current_wall_clock_slot,
+                Command::Expire {
+                    reservation_id: target.reservation_id,
+                    deadline_slot: target.deadline_slot,
+                },
+            )?;
+            processed_count = processed_count.saturating_add(1);
+            last_applied_lsn = Some(result.applied_lsn);
+        }
+
+        Ok(ExpirationTickResult {
+            processed_count,
+            last_applied_lsn,
+        })
+    }
+
     fn enqueue_validated(
         &mut self,
         request_slot: Slot,
@@ -532,6 +587,83 @@ impl SingleNodeEngine {
         }))
     }
 
+    fn collect_due_expirations(&self, current_wall_clock_slot: Slot) -> Vec<DueExpiration> {
+        let mut due = Vec::new();
+        for bucket in 0..self.db.config().wheel_len() {
+            let bucket_slot = Slot(u64::try_from(bucket).expect("wheel bucket index must fit u64"));
+            for reservation_id in self.db.due_reservations(bucket_slot) {
+                let Ok(record) = self
+                    .db
+                    .reservation(*reservation_id, current_wall_clock_slot)
+                else {
+                    continue;
+                };
+
+                if record.state == ReservationState::Reserved
+                    && record.deadline_slot.get() <= current_wall_clock_slot.get()
+                {
+                    due.push(DueExpiration {
+                        deadline_slot: record.deadline_slot,
+                        reservation_id: *reservation_id,
+                    });
+                }
+            }
+        }
+
+        due.sort_unstable();
+        due.truncate(
+            usize::try_from(self.config.max_expirations_per_tick)
+                .expect("validated max_expirations_per_tick must fit usize"),
+        );
+        due
+    }
+
+    fn apply_internal_command(
+        &mut self,
+        request_slot: Slot,
+        command: Command,
+    ) -> Result<SubmissionResult, SubmissionError> {
+        if !self.accepting_writes {
+            return Err(SubmissionError::EngineHalted);
+        }
+
+        let applied_lsn = Lsn(self.next_lsn);
+        let frame = Frame {
+            lsn: applied_lsn,
+            request_slot,
+            record_type: RecordType::InternalCommand,
+            payload: encode_internal_command(command),
+        };
+
+        if let Err(error) = self.wal.append_frame(&frame) {
+            return Err(self.halt_on_internal_wal_error(
+                request_slot,
+                applied_lsn,
+                "append",
+                error,
+            ));
+        }
+
+        if let Err(error) = self.wal.sync() {
+            return Err(self.halt_on_internal_wal_error(request_slot, applied_lsn, "sync", error));
+        }
+
+        let outcome = self.db.apply_internal(
+            CommandContext {
+                lsn: applied_lsn,
+                request_slot,
+            },
+            command,
+        );
+        self.next_lsn += 1;
+
+        Ok(SubmissionResult {
+            applied_lsn,
+            outcome,
+            from_retry_cache: false,
+        })
+    }
+
     fn process_until_operation(
         &mut self,
         operation_id: OperationId,
@@ -616,12 +748,30 @@ impl SingleNodeEngine {
         SubmissionError::WalFile(error)
     }
 
+    fn halt_on_internal_wal_error(
+        &mut self,
+        request_slot: Slot,
+        applied_lsn: Lsn,
+        phase: &'static str,
+        error: impl Into<WalFileError>,
+    ) -> SubmissionError {
+        let error = error.into();
+        error!(
+            "halting engine on internal WAL error, accepting_writes set to false: request_slot={} applied_lsn={} phase={} error={error:?}",
+            request_slot.get(),
+            applied_lsn.get(),
+            phase,
+        );
+        self.accepting_writes = false;
+        SubmissionError::WalFile(error)
+    }
+
     fn take_injected_persist_failure(&mut self) -> Option<PersistFailurePhase> {
         self.injected_persist_failure.take()
     }
 
     #[cfg(test)]
-    fn inject_next_persist_failure(&mut self, phase: PersistFailurePhase) {
+    pub(crate) fn inject_next_persist_failure(&mut self, phase: PersistFailurePhase) {
         self.injected_persist_failure = Some(phase);
     }
 }

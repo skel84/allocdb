@@ -31,6 +31,7 @@ pub struct EngineMetrics {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadError {
+    EngineHalted,
     RequiredLsnNotApplied {
         required_lsn: Lsn,
         last_applied_lsn: Option<Lsn>,
@@ -68,6 +69,10 @@ impl SingleNodeEngine {
     ///
     /// Returns [`ReadError`] if the required LSN has not yet been applied locally.
     pub fn enforce_read_fence(&self, required_lsn: Lsn) -> Result<(), ReadError> {
+        if !self.accepting_writes {
+            return Err(ReadError::EngineHalted);
+        }
+
         if required_lsn.get() == 0 {
             return Ok(());
         }
@@ -85,13 +90,13 @@ impl SingleNodeEngine {
 
     fn recovery_startup_kind(&self) -> RecoveryStartupKind {
         match (
-            self.startup_recovery.loaded_snapshot_lsn,
+            self.startup_recovery.loaded_snapshot,
             self.startup_recovery.replayed_wal_frame_count,
         ) {
-            (None, 0) => RecoveryStartupKind::FreshStart,
-            (None, _) => RecoveryStartupKind::WalOnly,
-            (Some(_), 0) => RecoveryStartupKind::SnapshotOnly,
-            (Some(_), _) => RecoveryStartupKind::SnapshotAndWal,
+            (false, 0) => RecoveryStartupKind::FreshStart,
+            (false, _) => RecoveryStartupKind::WalOnly,
+            (true, 0) => RecoveryStartupKind::SnapshotOnly,
+            (true, _) => RecoveryStartupKind::SnapshotAndWal,
         }
     }
 }

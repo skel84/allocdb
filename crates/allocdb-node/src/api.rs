@@ -9,8 +9,8 @@ use allocdb_core::{
 };
 
 use crate::engine::{
-    EngineMetrics, ReadError, SingleNodeEngine, SubmissionError, SubmissionErrorCategory,
-    SubmissionResult,
+    EngineMetrics, ExpirationTickResult, ReadError, SingleNodeEngine, SubmissionError,
+    SubmissionErrorCategory, SubmissionResult,
 };
 
 #[path = "api_codec.rs"]
@@ -27,6 +27,7 @@ pub enum ApiRequest {
     GetResource(ResourceRequest),
     GetReservation(ReservationRequest),
     GetMetrics(MetricsRequest),
+    TickExpirations(TickExpirationsRequest),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,12 +73,18 @@ pub struct MetricsRequest {
     pub current_wall_clock_slot: Slot,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TickExpirationsRequest {
+    pub current_wall_clock_slot: Slot,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApiResponse {
     Submit(SubmitResponse),
     GetResource(ResourceResponse),
     GetReservation(ReservationResponse),
     GetMetrics(MetricsResponse),
+    TickExpirations(TickExpirationsResponse),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,6 +182,7 @@ impl InvalidRequestReason {
 pub enum ResourceResponse {
     Found(ResourceView),
     NotFound,
+    EngineHalted,
     FenceNotApplied {
         required_lsn: Lsn,
         last_applied_lsn: Option<Lsn>,
@@ -205,6 +213,7 @@ pub enum ReservationResponse {
     Found(ReservationView),
     NotFound,
     Retired,
+    EngineHalted,
     FenceNotApplied {
         required_lsn: Lsn,
         last_applied_lsn: Option<Lsn>,
@@ -243,6 +252,27 @@ pub struct MetricsResponse {
     pub metrics: EngineMetrics,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TickExpirationsResponse {
+    Applied(TickExpirationsApplied),
+    Rejected(SubmissionFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TickExpirationsApplied {
+    pub processed_count: u32,
+    pub last_applied_lsn: Option<Lsn>,
+}
+
+impl From<ExpirationTickResult> for TickExpirationsApplied {
+    fn from(value: ExpirationTickResult) -> Self {
+        Self {
+            processed_count: value.processed_count,
+            last_applied_lsn: value.last_applied_lsn,
+        }
+    }
+}
+
 impl SingleNodeEngine {
     /// Handles one transport-neutral alpha API request against the live single-node engine.
     #[must_use]
@@ -260,6 +290,9 @@ impl SingleNodeEngine {
             ApiRequest::GetMetrics(request) => ApiResponse::GetMetrics(MetricsResponse {
                 metrics: self.metrics(request.current_wall_clock_slot),
             }),
+            ApiRequest::TickExpirations(request) => {
+                ApiResponse::TickExpirations(self.handle_tick_expirations_request(request))
+            }
         }
     }
 
@@ -284,10 +317,16 @@ impl SingleNodeEngine {
     }
 
     fn handle_resource_request(&self, request: ResourceRequest) -> ResourceResponse {
-        if let Some(error) = self.read_fence_error(request.required_lsn) {
-            return ResourceResponse::FenceNotApplied {
-                required_lsn: error.required_lsn,
-                last_applied_lsn: error.last_applied_lsn,
+        if let Some(error) = self.read_error(request.required_lsn) {
+            return match error {
+                ReadError::EngineHalted => ResourceResponse::EngineHalted,
+                ReadError::RequiredLsnNotApplied {
+                    required_lsn,
+                    last_applied_lsn,
+                } => ResourceResponse::FenceNotApplied {
+                    required_lsn,
+                    last_applied_lsn,
+                },
             };
         }
 
@@ -299,10 +338,16 @@ impl SingleNodeEngine {
     }
 
     fn handle_reservation_request(&self, request: ReservationRequest) -> ReservationResponse {
-        if let Some(error) = self.read_fence_error(request.required_lsn) {
-            return ReservationResponse::FenceNotApplied {
-                required_lsn: error.required_lsn,
-                last_applied_lsn: error.last_applied_lsn,
+        if let Some(error) = self.read_error(request.required_lsn) {
+            return match error {
+                ReadError::EngineHalted => ReservationResponse::EngineHalted,
+                ReadError::RequiredLsnNotApplied {
+                    required_lsn,
+                    last_applied_lsn,
+                } => ReservationResponse::FenceNotApplied {
+                    required_lsn,
+                    last_applied_lsn,
+                },
             };
         }
 
@@ -316,23 +361,20 @@ impl SingleNodeEngine {
         }
     }
 
-    fn read_fence_error(&self, required_lsn: Option<Lsn>) -> Option<ReadFenceError> {
-        let required_lsn = required_lsn?;
-        match self.enforce_read_fence(required_lsn) {
-            Ok(()) => None,
-            Err(ReadError::RequiredLsnNotApplied {
-                required_lsn,
-                last_applied_lsn,
-            }) => Some(ReadFenceError {
-                required_lsn,
-                last_applied_lsn,
-            }),
+    fn handle_tick_expirations_request(
+        &mut self,
+        request: TickExpirationsRequest,
+    ) -> TickExpirationsResponse {
+        match self.tick_expirations(request.current_wall_clock_slot) {
+            Ok(result) => TickExpirationsResponse::Applied(result.into()),
+            Err(error) => {
+                TickExpirationsResponse::Rejected(SubmissionFailure::from_submission_error(&error))
+            }
         }
     }
-}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ReadFenceError {
-    required_lsn: Lsn,
-    last_applied_lsn: Option<Lsn>,
+    fn read_error(&self, required_lsn: Option<Lsn>) -> Option<ReadError> {
+        self.enforce_read_fence(required_lsn.unwrap_or(Lsn(0)))
+            .err()
+    }
 }

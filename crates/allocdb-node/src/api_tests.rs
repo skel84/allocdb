@@ -11,10 +11,14 @@ use allocdb_core::{ReservationState, ResourceState};
 use super::{
     ApiCodecError, ApiRequest, ApiResponse, InvalidRequestReason, MetricsRequest, MetricsResponse,
     ReservationRequest, ReservationResponse, ResourceRequest, ResourceResponse,
-    SubmissionFailureCode, SubmitRequest, SubmitResponse, decode_request, decode_response,
+    SubmissionFailureCode, SubmitRequest, SubmitResponse, TickExpirationsApplied,
+    TickExpirationsRequest, TickExpirationsResponse, decode_request, decode_response,
     encode_request, encode_response,
 };
-use crate::engine::{EngineConfig, RecoveryStartupKind, SingleNodeEngine, SubmissionErrorCategory};
+use crate::engine::{
+    EngineConfig, PersistFailurePhase, RecoveryStartupKind, SingleNodeEngine,
+    SubmissionErrorCategory,
+};
 
 fn test_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -49,6 +53,7 @@ fn engine_config() -> EngineConfig {
     EngineConfig {
         max_submission_queue: 2,
         max_command_bytes: 512,
+        max_expirations_per_tick: 1,
     }
 }
 
@@ -116,6 +121,9 @@ fn request_codec_round_trips_all_variants() {
         ApiRequest::GetMetrics(MetricsRequest {
             current_wall_clock_slot: Slot(15),
         }),
+        ApiRequest::TickExpirations(TickExpirationsRequest {
+            current_wall_clock_slot: Slot(16),
+        }),
     ];
 
     for request in requests {
@@ -143,6 +151,7 @@ fn response_codec_round_trips_all_variants() {
             version: 5,
         })),
         ApiResponse::GetResource(ResourceResponse::NotFound),
+        ApiResponse::GetResource(ResourceResponse::EngineHalted),
         ApiResponse::GetResource(ResourceResponse::FenceNotApplied {
             required_lsn: Lsn(9),
             last_applied_lsn: Some(Lsn(8)),
@@ -159,6 +168,7 @@ fn response_codec_round_trips_all_variants() {
         })),
         ApiResponse::GetReservation(ReservationResponse::NotFound),
         ApiResponse::GetReservation(ReservationResponse::Retired),
+        ApiResponse::GetReservation(ReservationResponse::EngineHalted),
         ApiResponse::GetReservation(ReservationResponse::FenceNotApplied {
             required_lsn: Lsn(11),
             last_applied_lsn: None,
@@ -186,6 +196,16 @@ fn response_codec_round_trips_all_variants() {
                 },
             },
         }),
+        ApiResponse::TickExpirations(TickExpirationsResponse::Applied(TickExpirationsApplied {
+            processed_count: 1,
+            last_applied_lsn: Some(Lsn(12)),
+        })),
+        ApiResponse::TickExpirations(TickExpirationsResponse::Rejected(
+            super::SubmissionFailure {
+                category: SubmissionErrorCategory::Indefinite,
+                code: SubmissionFailureCode::EngineHalted,
+            },
+        )),
     ];
 
     for response in responses {
@@ -382,6 +402,116 @@ fn api_reservation_reports_retired_history() {
     );
 
     drop(engine);
+    fs::remove_file(&wal_path).unwrap();
+}
+
+#[test]
+fn api_tick_expirations_commits_due_internal_expire() {
+    let wal_path = test_path("tick-expirations");
+    let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+
+    let _ = engine.handle_api_request(ApiRequest::Submit(SubmitRequest::from_client_request(
+        Slot(1),
+        create_request(11, 1),
+    )));
+    let _ = engine.handle_api_request(ApiRequest::Submit(SubmitRequest::from_client_request(
+        Slot(2),
+        reserve_request(11, 2, 9),
+    )));
+
+    let tick = engine.handle_api_request(ApiRequest::TickExpirations(TickExpirationsRequest {
+        current_wall_clock_slot: Slot(20),
+    }));
+    assert_eq!(
+        tick,
+        ApiResponse::TickExpirations(TickExpirationsResponse::Applied(TickExpirationsApplied {
+            processed_count: 1,
+            last_applied_lsn: Some(Lsn(3)),
+        },))
+    );
+
+    let resource = engine.handle_api_request(ApiRequest::GetResource(ResourceRequest {
+        resource_id: ResourceId(11),
+        required_lsn: Some(Lsn(3)),
+    }));
+    assert_eq!(
+        resource,
+        ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
+            resource_id: ResourceId(11),
+            state: ResourceState::Available,
+            current_reservation_id: None,
+            version: 2,
+        }))
+    );
+
+    let reservation = engine.handle_api_request(ApiRequest::GetReservation(ReservationRequest {
+        reservation_id: ReservationId(2),
+        current_slot: Slot(20),
+        required_lsn: Some(Lsn(3)),
+    }));
+    assert_eq!(
+        reservation,
+        ApiResponse::GetReservation(ReservationResponse::Found(super::ReservationView {
+            reservation_id: ReservationId(2),
+            resource_id: ResourceId(11),
+            holder_id: HolderId(9),
+            state: ReservationState::Expired,
+            created_lsn: Lsn(2),
+            deadline_slot: Slot(5),
+            released_lsn: Some(Lsn(3)),
+            retire_after_slot: Some(Slot(24)),
+        }))
+    );
+
+    drop(engine);
+    fs::remove_file(&wal_path).unwrap();
+}
+
+#[test]
+fn api_reads_reject_when_engine_is_halted() {
+    let wal_path = test_path("halted-read");
+    let snapshot_path = test_snapshot_path("halted-read");
+    let mut live = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+    live.inject_next_persist_failure(PersistFailurePhase::AfterAppend);
+
+    let submit = live.handle_api_request(ApiRequest::Submit(SubmitRequest::from_client_request(
+        Slot(1),
+        create_request(11, 1),
+    )));
+    assert_eq!(
+        submit,
+        ApiResponse::Submit(SubmitResponse::Rejected(super::SubmissionFailure {
+            category: SubmissionErrorCategory::Indefinite,
+            code: SubmissionFailureCode::StorageFailure,
+        }))
+    );
+    assert_eq!(
+        live.handle_api_request(ApiRequest::GetResource(ResourceRequest {
+            resource_id: ResourceId(11),
+            required_lsn: None,
+        })),
+        ApiResponse::GetResource(ResourceResponse::EngineHalted)
+    );
+    drop(live);
+
+    let mut recovered =
+        SingleNodeEngine::recover(core_config(), engine_config(), &snapshot_path, &wal_path)
+            .unwrap();
+    assert_eq!(
+        recovered.handle_api_request(ApiRequest::GetResource(ResourceRequest {
+            resource_id: ResourceId(11),
+            required_lsn: Some(Lsn(1)),
+        })),
+        ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
+            resource_id: ResourceId(11),
+            state: ResourceState::Available,
+            current_reservation_id: None,
+            version: 0,
+        }))
+    );
+
+    drop(recovered);
+    let _ = fs::remove_file(&snapshot_path);
     fs::remove_file(&wal_path).unwrap();
 }
 

@@ -2,13 +2,16 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use allocdb_core::ResourceState;
 use allocdb_core::command::{ClientRequest, Command};
 use allocdb_core::command_codec::{CommandCodecError, encode_client_request};
 use allocdb_core::config::Config;
 use allocdb_core::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use allocdb_core::result::ResultCode;
-use allocdb_core::wal_file::WalFileError;
+use allocdb_core::snapshot_file::SnapshotFile;
+use allocdb_core::state_machine::AllocDb;
+use allocdb_core::wal::RecordType;
+use allocdb_core::wal_file::{WalFile, WalFileError};
+use allocdb_core::{ReservationState, ResourceState};
 
 use super::PersistFailurePhase;
 use crate::engine::{
@@ -41,6 +44,7 @@ fn engine_config() -> EngineConfig {
     EngineConfig {
         max_submission_queue: 2,
         max_command_bytes: 512,
+        max_expirations_per_tick: 1,
     }
 }
 
@@ -60,6 +64,7 @@ fn engine_config_rejects_zero_bounds() {
         (EngineConfig {
             max_submission_queue: 0,
             max_command_bytes: 1,
+            max_expirations_per_tick: 1,
         })
         .validate(),
         Err(EngineConfigError::ZeroCapacity("max_submission_queue"))
@@ -68,9 +73,19 @@ fn engine_config_rejects_zero_bounds() {
         (EngineConfig {
             max_submission_queue: 1,
             max_command_bytes: 0,
+            max_expirations_per_tick: 1,
         })
         .validate(),
         Err(EngineConfigError::ZeroCapacity("max_command_bytes"))
+    );
+    assert_eq!(
+        (EngineConfig {
+            max_submission_queue: 1,
+            max_command_bytes: 1,
+            max_expirations_per_tick: 0,
+        })
+        .validate(),
+        Err(EngineConfigError::ZeroCapacity("max_expirations_per_tick"))
     );
 }
 
@@ -99,6 +114,7 @@ fn oversized_submission_is_rejected_before_commit() {
         EngineConfig {
             max_submission_queue: 2,
             max_command_bytes: 8,
+            max_expirations_per_tick: 1,
         },
         &wal_path,
     )
@@ -127,6 +143,7 @@ fn enqueue_respects_bounded_queue_capacity() {
         EngineConfig {
             max_submission_queue: 1,
             max_command_bytes: 512,
+            max_expirations_per_tick: 1,
         },
         &wal_path,
     )
@@ -318,6 +335,71 @@ fn encoded_submission_round_trips_same_as_typed_submit() {
 }
 
 #[test]
+fn expiration_tick_commits_internal_expire_and_frees_overdue_resource() {
+    let wal_path = test_path("expiration-tick");
+    let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+
+    engine.submit(Slot(1), create(11, 1)).unwrap();
+    let reserved = engine
+        .submit(
+            Slot(2),
+            ClientRequest {
+                operation_id: OperationId(2),
+                client_id: ClientId(7),
+                command: Command::Reserve {
+                    resource_id: ResourceId(11),
+                    holder_id: HolderId(9),
+                    ttl_slots: 3,
+                },
+            },
+        )
+        .unwrap();
+
+    let tick = engine.tick_expirations(Slot(20)).unwrap();
+
+    assert_eq!(tick.processed_count, 1);
+    assert_eq!(tick.last_applied_lsn, Some(Lsn(3)));
+    assert_eq!(
+        engine.db().resource(ResourceId(11)).unwrap().current_state,
+        ResourceState::Available
+    );
+    assert_eq!(
+        engine
+            .db()
+            .reservation(
+                reserved
+                    .outcome
+                    .reservation_id
+                    .expect("reserve must return reservation id"),
+                Slot(20),
+            )
+            .unwrap()
+            .state,
+        ReservationState::Expired
+    );
+
+    let recovered_wal = WalFile::open(&wal_path, engine_config().max_command_bytes)
+        .unwrap()
+        .recover()
+        .unwrap();
+    assert_eq!(
+        recovered_wal
+            .scan_result
+            .frames
+            .iter()
+            .map(|frame| frame.record_type)
+            .collect::<Vec<_>>(),
+        vec![
+            RecordType::ClientCommand,
+            RecordType::ClientCommand,
+            RecordType::InternalCommand,
+        ]
+    );
+
+    fs::remove_file(wal_path).unwrap();
+}
+
+#[test]
 fn strict_read_fence_requires_applied_lsn() {
     let wal_path = test_path("read-fence");
     let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
@@ -343,6 +425,37 @@ fn strict_read_fence_requires_applied_lsn() {
     );
 
     fs::remove_file(wal_path).unwrap();
+}
+
+#[test]
+fn halted_engine_rejects_reads_until_recovery() {
+    let wal_path = test_path("halted-read");
+    let snapshot_path = wal_path.with_extension("snapshot");
+
+    {
+        let mut live = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+        live.inject_next_persist_failure(PersistFailurePhase::AfterAppend);
+
+        let error = live.submit(Slot(1), create(11, 1)).unwrap_err();
+        assert!(matches!(error, SubmissionError::WalFile(_)));
+        assert_eq!(
+            live.enforce_read_fence(Lsn(0)),
+            Err(ReadError::EngineHalted)
+        );
+        assert_eq!(
+            live.enforce_read_fence(Lsn(1)),
+            Err(ReadError::EngineHalted)
+        );
+    }
+
+    let recovered =
+        SingleNodeEngine::recover(core_config(), engine_config(), &snapshot_path, &wal_path)
+            .unwrap();
+    assert_eq!(recovered.enforce_read_fence(Lsn(1)), Ok(()));
+    assert!(recovered.db().resource(ResourceId(11)).is_some());
+
+    fs::remove_file(wal_path).unwrap();
+    let _ = fs::remove_file(snapshot_path);
 }
 
 #[test]
@@ -406,6 +519,32 @@ fn recovery_metrics_report_snapshot_and_wal_replay() {
 
     fs::remove_file(wal_path).unwrap();
     fs::remove_file(snapshot_path).unwrap();
+}
+
+#[test]
+fn recovery_metrics_treat_loaded_empty_snapshot_as_snapshot_startup() {
+    let wal_path = test_path("empty-snapshot-recovery");
+    let snapshot_path = wal_path.with_extension("snapshot");
+    SnapshotFile::new(&snapshot_path)
+        .write_snapshot(&AllocDb::new(core_config()).unwrap().snapshot())
+        .unwrap();
+
+    let recovered =
+        SingleNodeEngine::recover(core_config(), engine_config(), &snapshot_path, &wal_path)
+            .unwrap();
+    let metrics = recovered.metrics(Slot(1));
+
+    assert_eq!(
+        metrics.recovery.startup_kind,
+        RecoveryStartupKind::SnapshotOnly
+    );
+    assert_eq!(metrics.recovery.loaded_snapshot_lsn, None);
+    assert_eq!(metrics.recovery.replayed_wal_frame_count, 0);
+    assert_eq!(metrics.recovery.replayed_wal_last_lsn, None);
+    assert_eq!(metrics.recovery.active_snapshot_lsn, None);
+
+    fs::remove_file(snapshot_path).unwrap();
+    fs::remove_file(wal_path).unwrap();
 }
 
 #[test]
