@@ -151,15 +151,15 @@ impl SimulationHarness {
         while !pending.is_empty() {
             let index = self.chooser.next_index(pending.len());
             let action = pending.remove(index);
-            observations.push(self.execute(action));
+            observations.push(self.execute(action).unwrap());
         }
 
         observations
     }
 
-    fn submit(&mut self, request: ClientRequest) -> SubmissionResult {
+    fn submit(&mut self, request: ClientRequest) -> Result<SubmissionResult, SubmissionError> {
         let current_slot = self.current_slot;
-        self.engine_mut().submit(current_slot, request).unwrap()
+        self.engine_mut().submit(current_slot, request)
     }
 
     fn tick_expirations(&mut self) -> Result<ExpirationTickResult, SubmissionError> {
@@ -206,16 +206,16 @@ impl SimulationHarness {
             .expect("simulation harness must have one live engine")
     }
 
-    fn execute(&mut self, action: SimAction) -> SimObservation {
+    fn execute(&mut self, action: SimAction) -> Result<SimObservation, SubmissionError> {
         match action {
             SimAction::Submit(request) => {
-                let result = self.submit(request);
-                SimObservation {
+                let result = self.submit(request)?;
+                Ok(SimObservation {
                     slot: self.current_slot,
                     operation_id: request.operation_id,
                     applied_lsn: result.applied_lsn.get(),
                     result_code: result.outcome.result_code,
-                }
+                })
             }
         }
     }
@@ -269,11 +269,11 @@ fn simulated_slot_driver_handles_expiration_restart_path() {
     let mut harness = SimulationHarness::new(0x15);
 
     harness.advance_to(Slot(1));
-    let created = harness.submit(create(11, 1));
+    let created = harness.submit(create(11, 1)).unwrap();
     assert_eq!(created.applied_lsn.get(), 1);
 
     harness.advance_to(Slot(2));
-    let reserved = harness.submit(reserve(11, 9, 2, 3));
+    let reserved = harness.submit(reserve(11, 9, 2, 3)).unwrap();
     let reservation_id = reserved
         .outcome
         .reservation_id
@@ -351,4 +351,17 @@ fn simulated_slot_driver_handles_expiration_restart_path() {
             .state,
         ReservationState::Expired
     );
+}
+
+#[test]
+fn harness_submit_propagates_wal_failure_for_negative_path_tests() {
+    let mut harness = SimulationHarness::new(0x99);
+
+    harness.advance_to(Slot(1));
+    harness.inject_next_persist_failure(PersistFailurePhase::BeforeAppend);
+
+    let error = harness.submit(create(11, 1)).unwrap_err();
+
+    assert!(matches!(error, SubmissionError::WalFile(_)));
+    assert!(!harness.metrics().accepting_writes);
 }
