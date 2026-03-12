@@ -112,6 +112,40 @@ Why a spike is justified:
 
 - this is a harness-design question and should be proven early
 
+Current chosen direction:
+
+- a scripted single-node harness around the real `SingleNodeEngine`
+- simulated slot lives in the harness and advances only when the test driver says so
+- seeded choice is used only to order ready ingress at one logical slot; state-machine and
+  recovery semantics remain the production implementations
+- crash, restart, checkpoint, and persist-failure events stay explicit driver actions rather than
+  hidden behind fake clock or storage traits
+
+Evidence gathered:
+
+- `crates/allocdb-node/src/experiments/simulation_harness_spike_tests.rs` runs the real engine
+  under seeded batch ordering and explicit slot advancement
+- the spike proves one restart path with checkpoint, logged expiration, injected WAL ambiguity, and
+  recovery from snapshot plus WAL
+
+Reuse for `M4-T01` through `M4-T04`:
+
+- the external-driver shape
+- explicit simulated-slot state owned by the harness
+- seeded ready-set ordering for same-slot ingress
+- temp WAL/snapshot lifecycle and restart helpers
+
+Discard after the spike:
+
+- the ad hoc test-only API names and one-off helper layout
+- the exact PRNG choice used only to prove reproducibility
+- any expectation that all future scenarios fit one linear script helper without refinement
+
+Next step:
+
+- promote the chosen shape into reusable simulation test support during `M4-T01`, then add crash
+  point and storage-fault coverage on top of that support
+
 ## Non-Approved Spike Areas
 
 Do not spike:

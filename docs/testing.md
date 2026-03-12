@@ -80,6 +80,45 @@ Properties:
 - runs real state-machine and recovery code
 - supports shrinking failures to minimal cases when possible
 
+### M4-S01 Harness Direction
+
+The `M4-S01` spike selected one external scripted driver as the starting point for `M4-T01`
+through `M4-T04`.
+
+The selected shape is:
+
+- wrap the real `allocdb_node::SingleNodeEngine` instead of adding simulator-only execution paths
+- keep one explicit simulated current slot in the harness and pass it into real engine calls
+- model ingress, tick, checkpoint, crash, restart, and injected persistence faults as explicit
+  driver events
+- use a seed only to choose ordering among ready actions at the same logical slot
+
+The spike evidence lives in `crates/allocdb-node/src/experiments/simulation_harness_spike_tests.rs`.
+That experiment showed:
+
+- the same seed reproduces the same same-slot action order and LSN transcript
+- advancing the simulated slot without ticking produces deterministic expiration backlog
+- a checkpoint plus WAL-backed restart path still works when an expiration commit halts the live
+  engine after append and before sync
+
+What to reuse in follow-up tasks:
+
+- the external-driver architecture
+- explicit slot advancement under test control
+- seeded scheduling for same-slot ready work
+- restart helpers that reopen from snapshot plus WAL on disk
+
+What not to promote directly:
+
+- the spike's ad hoc helper surface
+- the specific throwaway PRNG
+- the current one-file experiment layout
+
+This direction keeps trusted-core churn low because the real engine already exposes the slot,
+checkpoint, recovery, and failure-injection seams the simulator needs. It also avoids trait-heavy
+virtual clock or fake storage abstractions inside the core before the project has proven they are
+necessary.
+
 ## External Validation
 
 Before any replicated release, AllocDB should add a Jepsen-style external validation stage.
