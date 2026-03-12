@@ -4,10 +4,28 @@ use allocdb_core::ids::{Lsn, Slot};
 use super::SingleNodeEngine;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryStartupKind {
+    FreshStart,
+    WalOnly,
+    SnapshotOnly,
+    SnapshotAndWal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryStatus {
+    pub startup_kind: RecoveryStartupKind,
+    pub loaded_snapshot_lsn: Option<Lsn>,
+    pub replayed_wal_frame_count: u32,
+    pub replayed_wal_last_lsn: Option<Lsn>,
+    pub active_snapshot_lsn: Option<Lsn>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EngineMetrics {
     pub queue_depth: u32,
     pub queue_capacity: u32,
     pub accepting_writes: bool,
+    pub recovery: RecoveryStatus,
     pub core: HealthMetrics,
 }
 
@@ -21,7 +39,8 @@ pub enum ReadError {
 
 impl SingleNodeEngine {
     #[must_use]
-    /// Returns the current engine-level health snapshot including queue pressure and core metrics.
+    /// Returns the current engine-level health snapshot including queue pressure, recovery
+    /// metadata, and core metrics.
     ///
     /// # Panics
     ///
@@ -32,6 +51,13 @@ impl SingleNodeEngine {
             queue_capacity: u32::try_from(self.queue.capacity())
                 .expect("queue capacity must fit u32"),
             accepting_writes: self.accepting_writes,
+            recovery: RecoveryStatus {
+                startup_kind: self.recovery_startup_kind(),
+                loaded_snapshot_lsn: self.startup_recovery.loaded_snapshot_lsn,
+                replayed_wal_frame_count: self.startup_recovery.replayed_wal_frame_count,
+                replayed_wal_last_lsn: self.startup_recovery.replayed_wal_last_lsn,
+                active_snapshot_lsn: self.active_snapshot_lsn,
+            },
             core: self.db.health_metrics(current_wall_clock_slot),
         }
     }
@@ -54,6 +80,18 @@ impl SingleNodeEngine {
                 required_lsn,
                 last_applied_lsn,
             })
+        }
+    }
+
+    fn recovery_startup_kind(&self) -> RecoveryStartupKind {
+        match (
+            self.startup_recovery.loaded_snapshot_lsn,
+            self.startup_recovery.replayed_wal_frame_count,
+        ) {
+            (None, 0) => RecoveryStartupKind::FreshStart,
+            (None, _) => RecoveryStartupKind::WalOnly,
+            (Some(_), 0) => RecoveryStartupKind::SnapshotOnly,
+            (Some(_), _) => RecoveryStartupKind::SnapshotAndWal,
         }
     }
 }

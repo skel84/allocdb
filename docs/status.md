@@ -12,7 +12,9 @@
   - `M1H` constant-time core hardening: complete
   - `M2` durability and recovery: implemented
   - `M3` submission pipeline: implemented
-  - `M4+` simulation, alpha hardening, replication design: not started
+  - `M4` simulation: not started
+  - `M5` single-node alpha surface: in progress
+  - `M6` replication design: not started
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -22,8 +24,8 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: indefinite-outcome retry handling with restart-based resolution and
-    retry-window expiry coverage
+  - current validated chunk: recovery-status and checkpoint-health signals through the node
+    metrics surface
 
 ## What Exists
 
@@ -45,6 +47,8 @@
   - restart path from snapshot plus WAL
   - explicit definite-vs-indefinite submission error categorization
   - explicit restart-and-retry handling for ambiguous WAL failures within the dedupe window
+  - node-level metrics for queue pressure, write acceptance, startup recovery status, and active
+    snapshot anchor
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -60,7 +64,7 @@
 ## Current Focus
 
 - `M5-T01`: expose the minimal single-node alpha API on top of the completed submission layer
-- `M5-T02`: expose recovery status alongside the current queue-pressure and core-health signals
+- open the next tracked issue for `M5-T01` and keep the wire-level error mapping explicit
 - prepare the wire/API mapping for definite-vs-indefinite submission failures
 
 ## How To Check Progress

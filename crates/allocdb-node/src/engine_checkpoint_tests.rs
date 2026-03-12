@@ -10,7 +10,7 @@ use allocdb_core::snapshot_file::SnapshotFile;
 use allocdb_core::wal::{RecordType, ScanStopReason};
 use allocdb_core::wal_file::WalFile;
 
-use crate::engine::{CheckpointError, EngineConfig, SingleNodeEngine};
+use crate::engine::{CheckpointError, EngineConfig, RecoveryStartupKind, SingleNodeEngine};
 
 fn test_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -101,6 +101,12 @@ fn checkpoint_rewrites_wal_with_one_checkpoint_overlap() {
     let first = engine.checkpoint(&snapshot_path).unwrap();
     assert_eq!(first.snapshot_lsn, Some(Lsn(1)));
     assert_eq!(first.previous_snapshot_lsn, None);
+    let first_metrics = engine.metrics(Slot(1));
+    assert_eq!(
+        first_metrics.recovery.startup_kind,
+        RecoveryStartupKind::FreshStart
+    );
+    assert_eq!(first_metrics.recovery.active_snapshot_lsn, Some(Lsn(1)));
 
     engine.submit(Slot(2), reserve(11, 2, 5)).unwrap();
     engine.submit(Slot(3), confirm(2, 3, 5)).unwrap();
@@ -108,6 +114,8 @@ fn checkpoint_rewrites_wal_with_one_checkpoint_overlap() {
 
     assert_eq!(second.snapshot_lsn, Some(Lsn(3)));
     assert_eq!(second.previous_snapshot_lsn, Some(Lsn(1)));
+    let second_metrics = engine.metrics(Slot(3));
+    assert_eq!(second_metrics.recovery.active_snapshot_lsn, Some(Lsn(3)));
 
     let wal = WalFile::open(&wal_path, engine_config().max_command_bytes).unwrap();
     let recovered_wal = wal.recover().unwrap();
