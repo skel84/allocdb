@@ -24,10 +24,10 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: fail-closed recovery on semantically invalid WAL ordering and
-    malformed decoded snapshots, explicit seeded crash-point injection across submit, checkpoint,
-    and recovery boundaries, and restart coverage for post-sync submit replay, snapshot-written
-    before WAL rewrite, and replay-interrupted recovery
+  - current validated chunk: explicit seeded crash-point injection across submit, checkpoint, and
+    recovery boundaries, restart coverage for post-sync submit replay, snapshot-written before WAL
+    rewrite, and replay-interrupted recovery, plus operator-facing runbook guidance aligned with
+    current startup, recovery, overload, and expiration-maintenance behavior
 
 ## What Exists
 
@@ -67,6 +67,9 @@
     restore through bounded retired-watermark metadata
   - bounded `tick_expirations` maintenance request for live TTL enforcement
   - metrics exposure through the same API boundary
+- Operator documentation:
+  - operator-facing runbook for single-node startup, restart, checkpoint, overload, expiration
+    maintenance, and corruption/fail-closed handling
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -102,7 +105,7 @@
 
 - `M4-T03`: extend the same seeded simulation driver with storage-fault coverage for torn writes,
   checksum mismatch, and sync failures
-- follow with `M5-T04` operator guidance after the simulation evidence set is broader
+- keep the operator runbook aligned as new simulation and storage-fault evidence lands
 - keep `M4-T02` regression coverage green while broadening the fault matrix
 
 ## How To Check Progress

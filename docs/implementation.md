@@ -64,9 +64,10 @@ Current durability shape before alpha:
 - retained WAL keeps one-checkpoint overlap and appends a `snapshot_marker` at the active snapshot
   anchor
 
-Next hardening steps before alpha are:
+Current operator guidance:
 
-- write the operator runbook for startup, recovery, overload, and corruption handling
+- [operator-runbook.md](./operator-runbook.md) covers startup, recovery, overload, expiration
+  maintenance, and corruption handling for the single-node alpha
 
 ## Dependency Policy
 
@@ -140,4 +141,4 @@ The next useful detailed docs are:
 
 1. `replication.md` only after the single-node semantics are fixed
 2. `roadmap.md` and `work-breakdown.md` for execution planning
-3. operator-facing runbook details once the alpha surface is complete
+3. `operator-runbook.md` for the current single-node operational contract
