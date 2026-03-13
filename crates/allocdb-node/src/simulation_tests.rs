@@ -138,6 +138,22 @@ fn tick_expiration_ids(transcript: &[ScheduleObservation], label: &'static str) 
     }
 }
 
+fn tick_expiration_deadlines(transcript: &[ScheduleObservation], label: &'static str) -> Vec<u64> {
+    match &transcript
+        .iter()
+        .find(|entry| entry.label == label)
+        .expect("schedule transcript must contain the requested tick label")
+        .outcome
+    {
+        ScheduleObservationKind::Submit(_) => panic!("requested label must point to one tick"),
+        ScheduleObservationKind::Tick(observation) => observation
+            .expirations
+            .iter()
+            .map(|entry| entry.deadline_slot.get())
+            .collect(),
+    }
+}
+
 fn seed_for_point(point: CrashPoint, enabled_points: &[CrashPoint]) -> u64 {
     (0_u64..256)
         .find(|seed| CrashPlan::from_seed(*seed, enabled_points).point == point)
@@ -376,6 +392,34 @@ fn seeded_schedule_explores_due_expiration_order_reproducibly() {
         tick_expiration_ids(&different_transcript, "tick-second"),
         vec![3]
     );
+}
+
+#[test]
+fn seeded_schedule_preserves_earliest_deadline_priority_under_bounded_ticks() {
+    let actions = [
+        schedule_submit("create-11", &[1], create(11, 1)),
+        schedule_submit("create-12", &[1], create(12, 2)),
+        schedule_submit("reserve-11", &[2], reserve(11, 9, 3, 1)),
+        schedule_submit("reserve-12", &[2], reserve(12, 10, 4, 3)),
+        schedule_tick("tick-first", &[5]),
+        schedule_tick("tick-second", &[6]),
+    ];
+
+    for seed in 0_u64..32 {
+        let scenario_name = format!("schedule-earliest-deadline-{seed}");
+        let (_, transcript) = run_schedule(&scenario_name, seed, &actions);
+
+        assert_eq!(
+            tick_expiration_deadlines(&transcript, "tick-first"),
+            vec![3],
+            "seed {seed} must expire the earliest deadline first"
+        );
+        assert_eq!(
+            tick_expiration_deadlines(&transcript, "tick-second"),
+            vec![5],
+            "seed {seed} must leave the later deadline for the next tick"
+        );
+    }
 }
 
 #[test]

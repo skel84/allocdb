@@ -385,7 +385,14 @@ impl SimulationHarness {
         let mut expirations = Vec::with_capacity(due.len().min(limit));
 
         while expirations.len() < limit && !due.is_empty() {
-            let index = self.slot_driver.choose_index(due.len());
+            // Keep the engine's earliest-deadline priority while still exploring same-deadline
+            // expiration choice under the per-tick throughput bound.
+            let earliest_deadline = due[0].deadline_slot;
+            let cohort_len = due
+                .iter()
+                .take_while(|entry| entry.deadline_slot == earliest_deadline)
+                .count();
+            let index = self.slot_driver.choose_index(cohort_len);
             let target = due.remove(index);
             let result = self
                 .engine_mut()

@@ -32,7 +32,7 @@
     `u64::MAX`, deterministic storage-fault injection for append failures, sync-failure
     ambiguity, checksum-mismatch fail-closed recovery, and torn-tail truncation over the real WAL
     restart path, plus replayable seeded schedule exploration over ingress contention,
-    due-expiration selection, and retry timing
+    due-expiration selection with earliest-deadline priority, and retry timing
 
 ## What Exists
 
@@ -108,7 +108,8 @@
   - regression coverage for crash-selected post-sync submit replay, crash-after-snapshot-write
     checkpoint recovery, replay-interrupted recovery restart, sync-failure retry recovery,
     checksum-corruption fail-closed restart, torn-tail truncation retry, ingress contention winner
-    order, same-deadline expiration order, and retry timing across the dedupe window
+    order, same-deadline expiration order, mixed-deadline earliest-first expiration priority, and
+    retry timing across the dedupe window
 - Validation:
   - `cargo test -p allocdb-core wal -- --nocapture`
   - `cargo test -p allocdb-core snapshot -- --nocapture`
