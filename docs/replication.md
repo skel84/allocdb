@@ -200,7 +200,7 @@ read-index confirmation, or stale-read modes before the basic protocol has been 
 
 Read rules:
 
-- the primary serves a strict read only from locally applied committed state
+- the primary serves a strict-read only from locally applied committed state
 - the `required_lsn` fence keeps the same meaning as in single-node mode
 - a replica in `backup`, `recovering`, `faulted`, or view-uncertain state does not serve API
   reads
