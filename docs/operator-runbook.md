@@ -8,13 +8,15 @@ It is intentionally limited to behavior that exists on the current branch:
 
 - the single-node alpha engine
 - the first local multi-process replicated cluster runner
+- the first local QEMU replicated testbed
 
 Current operational constraints for the local replicated runner:
 
 - the cluster runner binds one loopback `control`, `client`, and `protocol` address per replica
 - only the `control` listener is implemented today
 - `client` and `protocol` listeners are reserved and logged but return `not implemented`
-- there is no built-in network or process fault-control harness yet
+- there is a built-in local process fault-control harness and a QEMU control-node script, but
+  there is still no replicated client transport on either boundary
 - there is no built-in background expiration worker or checkpoint loop
 
 Current operational constraints for the single-node alpha remain:
@@ -105,6 +107,83 @@ Current limits:
   still in `recovering`; after that it preserves recovered durable metadata instead of resetting
   views or roles
 - there is still no background expiration or checkpoint worker inside the replica daemons
+
+## Local QEMU Testbed
+
+Command surface:
+
+- `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- prepare --workspace <path> --base-image-path <cloudimg.qcow2> --local-cluster-bin <allocdb-local-cluster>`
+- `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- start --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- status --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- stop --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- ssh-control --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- control --workspace <path> -- <status|isolate|heal|crash|restart|reboot|collect-logs> ...`
+
+What `prepare` does:
+
+- persists one `qemu-testbed-layout.txt` file rooted at `<path>`
+- creates one copy-on-write overlay and one generated NoCloud seed image for the control guest and
+  each replica guest
+- copies one per-guest firmware-vars file from the local QEMU firmware templates
+- writes one shared SSH keypair used by the host and control guest for replica orchestration
+- embeds the existing `allocdb-local-cluster` binary and one static local-cluster layout into the
+  guest seed data
+
+Host overrides and prerequisites:
+
+- `QEMU_SHARE_DIR` can point at a non-default QEMU firmware directory when the host does not keep
+  firmware templates under the standard search paths
+- `QEMU_ACCEL` can override the accelerator embedded into the rendered QEMU command; the default is
+  `hvf` on macOS and `kvm` on Linux
+- `prepare` hard-fails unless the host has the arch-specific `qemu-system-*` binary, `qemu-img`,
+  `ssh`, and `ssh-keygen` on `PATH`
+- `prepare` uses `hdiutil` on macOS and `mkisofs` or `genisoimage` on Linux-class hosts when it
+  builds NoCloud seed images, and it hard-fails if the platform-appropriate ISO builder is absent
+- `prepare` hard-fails unless the configured `allocdb-local-cluster` binary already exists on the
+  host
+- if `--base-image-path` does not already exist, `prepare` hard-fails unless `curl` is on `PATH`
+  and the base-image download succeeds
+- `prepare` hard-fails if the QEMU firmware templates are not reachable either through the default
+  search paths or `QEMU_SHARE_DIR`
+
+What `start` does:
+
+- boots `3` replica guests and `1` control guest under QEMU
+- places replica `control` on one management network and replica `client`/`protocol` on one
+  separate cluster network
+- forwards host SSH only to the control guest; all replica orchestration then flows through the
+  generated control-node script
+
+Current workspace layout:
+
+- `<path>/qemu-testbed-layout.txt`
+- `<path>/qemu/images/control-overlay.qcow2`
+- `<path>/qemu/images/replica-{1,2,3}-overlay.qcow2`
+- `<path>/qemu/seed/control-seed.iso`
+- `<path>/qemu/seed/replica-{1,2,3}-seed.iso`
+- `<path>/qemu/seed/allocdb-control/{meta-data,network-config,user-data}`
+- `<path>/qemu/seed/replica-{1,2,3}/{meta-data,network-config,user-data}`
+- `<path>/qemu/firmware/{control,replica-{1,2,3}}-vars.fd`
+- `<path>/qemu/run/{control,replica-{1,2,3}}.pid`
+- `<path>/qemu/logs/{control,replica-{1,2,3}}-console.log`
+- `<path>/qemu/ssh/id_ed25519`
+- `<path>/qemu/ssh/id_ed25519.pub`
+
+Current control hooks:
+
+- `status` queries each replica control socket from the control guest
+- `isolate`, `heal`, `crash`, and `restart` SSH into the target replica guest and reuse the
+  existing local fault-control commands there
+- `reboot` reboots one target replica guest through the control node
+- `collect-logs` gathers replica `journalctl`, `cluster-faults.txt`, `cluster-timeline.log`, and
+  control-status snapshots under the control guest
+
+Current limits:
+
+- the first QEMU testbed still depends on one supported cloud image already being available or
+  downloadable on the host
+- the first QEMU layer still does not carry the real replicated client transport
+- Jepsen automation remains follow-on work after this environment
 
 ## Single-Node Engine
 

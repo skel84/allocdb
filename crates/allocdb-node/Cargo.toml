@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 allocdb-core = { path = "../allocdb-core" }
+base64 = "0.22.1"
 libc = "0.2.177"
 log = "0.4.28"
 

@@ -2,6 +2,7 @@ pub mod api;
 mod bounded_queue;
 pub mod engine;
 pub mod local_cluster;
+pub mod qemu_testbed;
 pub mod replica;
 #[cfg(test)]
 pub(crate) mod replicated_simulation;

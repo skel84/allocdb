@@ -28,6 +28,8 @@ const REPLICA_METADATA_FILE_NAME: &str = "replica.metadata";
 const REPLICA_SNAPSHOT_FILE_NAME: &str = "state.snapshot";
 const REPLICA_WAL_FILE_NAME: &str = "state.wal";
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_millis(250);
+const CONTROL_STATUS_RETRY_DELAY: Duration = Duration::from_millis(10);
+const CONTROL_STATUS_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalClusterReplicaConfig {
@@ -489,6 +491,12 @@ pub fn timeline_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(CLUSTER_TIMELINE_FILE_NAME)
 }
 
+/// Encodes one local-cluster layout to the text format used on disk.
+#[must_use]
+pub fn encode_layout_text(layout: &LocalClusterLayout) -> String {
+    encode_layout(layout)
+}
+
 /// Loads one persisted local-cluster timeline.
 ///
 /// # Errors
@@ -549,8 +557,39 @@ pub fn append_local_cluster_timeline_event(
 pub fn request_control_status(
     addr: SocketAddr,
 ) -> Result<ReplicaRuntimeStatus, ControlProtocolError> {
-    let response = send_control_request(addr, ControlRequest::Status)?;
-    decode_status_response(&response)
+    request_control_status_with(addr, send_control_request, std::thread::sleep)
+}
+
+fn request_control_status_with<F, S>(
+    addr: SocketAddr,
+    mut send_request: F,
+    mut sleep: S,
+) -> Result<ReplicaRuntimeStatus, ControlProtocolError>
+where
+    F: FnMut(SocketAddr, ControlRequest) -> Result<String, ControlProtocolError>,
+    S: FnMut(Duration),
+{
+    let mut last_error = None;
+    for attempt in 0..CONTROL_STATUS_MAX_ATTEMPTS {
+        match send_request(addr, ControlRequest::Status)
+            .and_then(|response| decode_status_response(&response))
+        {
+            Ok(status) => return Ok(status),
+            Err(error)
+                if control_status_error_is_transient(&error)
+                    && attempt + 1 < CONTROL_STATUS_MAX_ATTEMPTS =>
+            {
+                last_error = Some(error);
+                sleep(CONTROL_STATUS_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        ControlProtocolError::Remote(String::from(
+            "control status retry loop ended without error",
+        ))
+    }))
 }
 
 /// Sends one `stop` request to a running replica control socket.
@@ -733,6 +772,16 @@ fn decode_status_response(response: &str) -> Result<ReplicaRuntimeStatus, Contro
         protocol_addr: parse_required_socket_addr(&fields, "protocol_addr")
             .map_err(ControlProtocolError::from)?,
     })
+}
+
+fn control_status_error_is_transient(error: &ControlProtocolError) -> bool {
+    matches!(
+        error,
+        ControlProtocolError::Io(_)
+            | ControlProtocolError::MissingField(_)
+            | ControlProtocolError::InvalidLine(_)
+            | ControlProtocolError::InvalidField { .. }
+    )
 }
 
 fn encode_fault_state(state: &LocalClusterFaultState) -> String {
@@ -1405,6 +1454,7 @@ impl From<LocalClusterLayoutError> for ControlProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
 
     fn fixture_layout() -> LocalClusterLayout {
         LocalClusterLayout {
@@ -1462,17 +1512,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn layout_round_trips_through_text_encoding() {
-        let layout = fixture_layout();
-        let encoded = encode_layout(&layout);
-        let decoded = decode_layout(&encoded).unwrap();
-        assert_eq!(decoded, layout);
-    }
-
-    #[test]
-    fn status_response_round_trips_through_text_encoding() {
-        let status = ReplicaRuntimeStatus {
+    fn fixture_status() -> ReplicaRuntimeStatus {
+        ReplicaRuntimeStatus {
             process_id: 42,
             replica_id: ReplicaId(1),
             state: ReplicaRuntimeState::Active,
@@ -1498,7 +1539,20 @@ mod tests {
             control_addr: "127.0.0.1:18001".parse().unwrap(),
             client_addr: "127.0.0.1:19001".parse().unwrap(),
             protocol_addr: "127.0.0.1:20001".parse().unwrap(),
-        };
+        }
+    }
+
+    #[test]
+    fn layout_round_trips_through_text_encoding() {
+        let layout = fixture_layout();
+        let encoded = encode_layout(&layout);
+        let decoded = decode_layout(&encoded).unwrap();
+        assert_eq!(decoded, layout);
+    }
+
+    #[test]
+    fn status_response_round_trips_through_text_encoding() {
+        let status = fixture_status();
 
         let encoded = encode_status_response(&status);
         let decoded = decode_status_response(&encoded).unwrap();
@@ -1549,5 +1603,121 @@ mod tests {
         assert!(
             matches!(error, ControlProtocolError::Remote(message) if message.contains("restart"))
         );
+    }
+
+    #[test]
+    fn request_control_status_retries_transient_decode_error_then_succeeds() {
+        let addr = fixture_status().control_addr;
+        let status = fixture_status();
+        let encoded = encode_status_response(&status);
+        let attempts = Cell::new(0_usize);
+        let delays = RefCell::new(Vec::new());
+
+        let result = request_control_status_with(
+            addr,
+            |request_addr, request| {
+                assert_eq!(request_addr, addr);
+                assert_eq!(request, ControlRequest::Status);
+                let attempt = attempts.get();
+                attempts.set(attempt.saturating_add(1));
+                if attempt == 0 {
+                    Ok(String::from("status=ok\nprocess_id=42\n"))
+                } else {
+                    Ok(encoded.clone())
+                }
+            },
+            |delay| delays.borrow_mut().push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(result, status);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(delays.borrow().as_slice(), &[CONTROL_STATUS_RETRY_DELAY]);
+        assert!(attempts.get() < CONTROL_STATUS_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn request_control_status_returns_non_transient_error_without_retry() {
+        let addr = fixture_status().control_addr;
+        let attempts = Cell::new(0_usize);
+        let delays = RefCell::new(Vec::new());
+
+        let error = request_control_status_with(
+            addr,
+            |request_addr, request| {
+                assert_eq!(request_addr, addr);
+                assert_eq!(request, ControlRequest::Status);
+                attempts.set(attempts.get().saturating_add(1));
+                Err(ControlProtocolError::Remote(String::from(
+                    "replica refused status",
+                )))
+            },
+            |delay| delays.borrow_mut().push(delay),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlProtocolError::Remote(message) if message == "replica refused status"
+        ));
+        assert_eq!(attempts.get(), 1);
+        assert!(delays.borrow().is_empty());
+    }
+
+    #[test]
+    fn request_control_status_retries_truncated_field_value_then_succeeds() {
+        let addr = fixture_status().control_addr;
+        let status = fixture_status();
+        let encoded = encode_status_response(&status);
+        let attempts = Cell::new(0_usize);
+        let delays = RefCell::new(Vec::new());
+
+        let error_response = concat!(
+            "status=ok\n",
+            "protocol_version=1\n",
+            "process_id=42\n",
+            "replica_id=1\n",
+            "state=active\n",
+            "role=primary\n",
+            "current_view=7\n",
+            "commit_lsn=9\n",
+            "active_snapshot_lsn=8\n",
+            "accepting_writes=true\n",
+            "startup_kind=snapshot_and_wal\n",
+            "loaded_snapshot_lsn=8\n",
+            "replayed_wal_frame_count=3\n",
+            "replayed_wal_last_lsn=9\n",
+            "fault_reason=none\n",
+            "workspace_dir=/tmp/allocdb-local-cluster/replica-1\n",
+            "log_path=/tmp/allocdb-local-cluster/logs/replica-1.log\n",
+            "pid_path=/tmp/allocdb-local-cluster/run/replica-1.pid\n",
+            "metadata_path=/tmp/allocdb-local-cluster/replica-1/replica.metadata\n",
+            "prepare_log_path=/tmp/allocdb-local-cluster/replica-1/replica.metadata.prepare\n",
+            "snapshot_path=/tmp/allocdb-local-cluster/replica-1/state.snapshot\n",
+            "wal_path=/tmp/allocdb-local-cluster/replica-1/state.wal\n",
+            "control_addr=127.0.0.\n",
+            "client_addr=127.0.0.1:19001\n",
+            "protocol_addr=127.0.0.1:20001\n",
+        );
+        let result = request_control_status_with(
+            addr,
+            |request_addr, request| {
+                assert_eq!(request_addr, addr);
+                assert_eq!(request, ControlRequest::Status);
+                let attempt = attempts.get();
+                attempts.set(attempt.saturating_add(1));
+                if attempt == 0 {
+                    Ok(String::from(error_response))
+                } else {
+                    Ok(encoded.clone())
+                }
+            },
+            |delay| delays.borrow_mut().push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(result, status);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(delays.borrow().as_slice(), &[CONTROL_STATUS_RETRY_DELAY]);
     }
 }

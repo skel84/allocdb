@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, ExitCode, Stdio};
 use std::thread;
@@ -49,6 +49,9 @@ enum ParsedCommand {
         workspace_root: PathBuf,
         replica_id: ReplicaId,
     },
+    ControlStatus {
+        addr: SocketAddr,
+    },
     ReplicaDaemon {
         layout_file: PathBuf,
         replica_id: ReplicaId,
@@ -90,6 +93,7 @@ fn run() -> Result<(), String> {
             workspace_root,
             replica_id,
         } => heal_replica(&workspace_root, replica_id),
+        ParsedCommand::ControlStatus { addr } => control_status(addr),
         ParsedCommand::ReplicaDaemon {
             layout_file,
             replica_id,
@@ -142,6 +146,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ParsedCommand, S
                 replica_id,
             })
         }
+        "control-status" => Ok(ParsedCommand::ControlStatus {
+            addr: parse_control_addr_flag(args)?,
+        }),
         "replica-daemon" => parse_replica_daemon_args(args),
         other => Err(format!("unknown subcommand `{other}`\n\n{}", usage())),
     }
@@ -221,6 +228,25 @@ fn parse_replica_daemon_args(
         layout_file: layout_file.ok_or_else(usage)?,
         replica_id: replica_id.ok_or_else(usage)?,
     })
+}
+
+fn parse_control_addr_flag(args: impl IntoIterator<Item = String>) -> Result<SocketAddr, String> {
+    let mut args = args.into_iter();
+    let mut addr = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--addr" => {
+                let value = args.next().ok_or_else(usage)?;
+                let parsed = value
+                    .parse::<SocketAddr>()
+                    .map_err(|_| format!("invalid value for `--addr`: `{value}`\n\n{}", usage()))?;
+                addr = Some(parsed);
+            }
+            "--help" | "-h" => return Err(usage()),
+            other => return Err(format!("unknown argument `{other}`\n\n{}", usage())),
+        }
+    }
+    addr.ok_or_else(usage)
 }
 
 fn start_cluster(workspace_root: &Path) -> Result<(), String> {
@@ -467,6 +493,13 @@ fn heal_replica(workspace_root: &Path, replica_id: ReplicaId) -> Result<(), Stri
         replica.client_addr,
         replica.protocol_addr
     );
+    Ok(())
+}
+
+fn control_status(addr: SocketAddr) -> Result<(), String> {
+    let status = request_control_status(addr)
+        .map_err(|error| format!("failed to query control status from {addr}: {error}"))?;
+    print!("{}", encode_status_response(&status));
     Ok(())
 }
 
@@ -1092,7 +1125,8 @@ fn usage() -> String {
          \x20\x20crash --workspace <path> --replica-id <id>\n\
          \x20\x20restart --workspace <path> --replica-id <id>\n\
          \x20\x20isolate --workspace <path> --replica-id <id>\n\
-         \x20\x20heal --workspace <path> --replica-id <id>\n",
+         \x20\x20heal --workspace <path> --replica-id <id>\n\
+         \x20\x20control-status --addr <host:port>\n",
     )
 }
 
