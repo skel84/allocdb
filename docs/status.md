@@ -44,7 +44,11 @@
     durable append, primary-only read enforcement on locally applied committed state, explicit
     quorum-loss demotion into `view_uncertain`, durable higher-view vote recording, higher-view
     takeover that reconstructs the latest committed prefix before normal mode, stale-message
-    discard across view change, and fail-closed stale-primary read and write rejection
+    discard across view change, fail-closed stale-primary read and write rejection, plus
+    checkpoint-aware stale-replica rejoin that chooses suffix-only catch-up when the target still
+    holds a recent enough committed durable prefix, falls back to snapshot transfer when the
+    primary has already pruned older history, discards divergent uncommitted prepared suffix
+    during rejoin, and rejects faulted replicas instead of auto-repairing them
 
 ## What Exists
 
@@ -161,8 +165,12 @@
     reconstructs the safe committed prefix on the new primary, discards stale uncommitted suffix,
     and drops old-view protocol messages
   - replica crash as loss of volatile state with restart through real `ReplicaNode::recover`
-  - regression coverage for quorum-loss fail-closed reads and writes plus higher-view takeover
-    with stale-primary read rejection
+  - checkpoint-assisted rejoin that rewrites one stale replica from suffix-only WAL catch-up or
+    snapshot transfer, then restarts through the real recovery path before returning the replica
+    to backup mode
+  - regression coverage for quorum-loss fail-closed reads and writes, higher-view takeover with
+    stale-primary read rejection, suffix-only rejoin, snapshot-transfer rejoin, and faulted
+    rejoin rejection
 - Validation:
   - `cargo test -p allocdb-core wal -- --nocapture`
   - `cargo test -p allocdb-core snapshot -- --nocapture`
@@ -178,13 +186,13 @@
 
 ## Current Focus
 
-- `M7-T04` is implemented on this branch; the next execution target is `M7-T05`
-- add suffix catch-up, snapshot transfer, and safe rejoin for stale replicas
-- preserve the committed-prefix and fail-closed view-change rules now established by `M7-T04`
-- follow with `M7-T06` and then `M8` for broader executable replicated coverage and external
-  cluster validation
-- use `M8` for the external multi-process, QEMU, and Jepsen layers after the in-process replicated
-  prototype is credible
+- `M7-T05` is implemented on this branch; the next execution target is `M7-T06`
+- promote the replicated simulation plan into broader executable partition, failover, and rejoin
+  regression coverage on the real three-replica harness
+- keep the rejoin contract narrow: suffix-only catch-up when retained WAL covers the target’s
+  durable prefix, snapshot transfer otherwise, and fail-closed handling for faulted replicas
+- follow `M7-T06` with `M8` for the external multi-process, QEMU, and Jepsen layers after the
+  in-process replicated prototype has the planned scenario coverage
 
 ## How To Check Progress
 

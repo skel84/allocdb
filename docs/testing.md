@@ -214,7 +214,10 @@ codebase:
 The harness already hosts three real `ReplicaNode`s with independent durable workspaces and one
 shared seeded slot driver. `M7-T03` upgrades that queue from opaque labels to real
 `prepare`/`prepare_ack`/`commit` payloads while keeping the same deterministic delivery,
-partition, crash, and replay surface.
+partition, crash, and replay surface. `M7-T05` extends that same harness with
+`checkpoint_replica` and `rejoin_replica` helpers so deterministic tests can force one retained
+WAL floor on the primary, then prove suffix-only catch-up, snapshot transfer, and faulted-rejoin
+rejection through the real on-disk restart path.
 
 ### Network And Failure Model In Simulation
 
@@ -248,6 +251,8 @@ Key checks:
 - no split-brain commit
 - no read served from a view-uncertain or quorum-lost replica
 - retries with the same `operation_id` resolve ambiguity without duplicate execution
+- a healed but stale replica catches up only after the committed prefix already accepted by the
+  healthy quorum is restored locally
 
 #### Primary Crash Scenarios
 
@@ -315,6 +320,12 @@ Current executable replicated coverage already proves:
 - a higher-view takeover can reconstruct the latest committed prefix on a new primary before that
   replica returns to normal mode
 - stale or quorum-lost primaries reject reads after failover instead of serving stale success
+- a stale replica can rejoin by replicated suffix only when it still holds one recent enough
+  committed durable prefix
+- a primary checkpoint can force snapshot transfer for older replicas whose local durable state
+  falls behind the retained WAL floor
+- rejoin discards one divergent uncommitted suffix and rejects one replica forced into `faulted`
+  state by corrupted durable metadata
 
 ## Jepsen Validation Gate
 

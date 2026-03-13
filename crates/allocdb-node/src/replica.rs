@@ -8,8 +8,8 @@ use allocdb_core::ids::{Lsn, Slot};
 use log::{error, info, warn};
 
 use crate::engine::{
-    EngineConfig, EngineOpenError, ReadError, RecoverEngineError, SingleNodeEngine,
-    SubmissionError, SubmissionResult,
+    CheckpointError, CheckpointResult, EngineConfig, EngineOpenError, ReadError,
+    RecoverEngineError, SingleNodeEngine, SubmissionError, SubmissionResult,
 };
 
 #[cfg(all(test, unix))]
@@ -356,6 +356,25 @@ impl From<RecoverEngineError> for RecoverReplicaError {
 }
 
 impl From<ReplicaMetadataFileError> for RecoverReplicaError {
+    fn from(error: ReplicaMetadataFileError) -> Self {
+        Self::MetadataFile(error)
+    }
+}
+
+#[derive(Debug)]
+pub enum ReplicaCheckpointError {
+    Inactive(ReplicaNodeStatus),
+    Checkpoint(CheckpointError),
+    MetadataFile(ReplicaMetadataFileError),
+}
+
+impl From<CheckpointError> for ReplicaCheckpointError {
+    fn from(error: CheckpointError) -> Self {
+        Self::Checkpoint(error)
+    }
+}
+
+impl From<ReplicaMetadataFileError> for ReplicaCheckpointError {
     fn from(error: ReplicaMetadataFileError) -> Self {
         Self::MetadataFile(error)
     }
@@ -733,6 +752,35 @@ impl ReplicaNode {
     #[must_use]
     pub fn prepare_log_path(&self) -> &Path {
         &self.prepare_log_file.path
+    }
+
+    /// Persists one local checkpoint through the wrapped single-node engine and updates the active
+    /// snapshot anchor in replica metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicaCheckpointError`] if the replica is faulted, if the checkpoint operation
+    /// fails, or if the updated metadata cannot be persisted durably.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an `active` replica no longer holds its required live wrapped engine.
+    pub fn checkpoint_local_state(&mut self) -> Result<CheckpointResult, ReplicaCheckpointError> {
+        match self.status {
+            ReplicaNodeStatus::Active => {}
+            status @ ReplicaNodeStatus::Faulted(_) => {
+                return Err(ReplicaCheckpointError::Inactive(status));
+            }
+        }
+
+        let result = self
+            .engine
+            .as_mut()
+            .expect("active replica must keep one live engine")
+            .checkpoint(&self.paths.snapshot_path)?;
+        self.metadata.active_snapshot_lsn = result.snapshot_lsn;
+        self.persist_metadata()?;
+        Ok(result)
     }
 
     /// Moves one active replica into normal mode for the provided view.

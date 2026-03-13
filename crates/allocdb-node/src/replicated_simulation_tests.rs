@@ -8,9 +8,10 @@ use allocdb_core::ids::{ClientId, Lsn, OperationId, ResourceId, Slot};
 use crate::engine::EngineConfig;
 use crate::replica::{NotPrimaryReadError, ReplicaId, ReplicaNodeStatus, ReplicaRole};
 use crate::replicated_simulation::{
-    ClusterEndpoint, QueuedProtocolMessage, ReplicaObservation, ReplicaRuntimeStatus,
-    ReplicatedScheduleAction, ReplicatedScheduleActionKind, ReplicatedScheduleObservation,
-    ReplicatedScheduleObservationKind, ReplicatedSimulationError, ReplicatedSimulationHarness,
+    ClusterEndpoint, QueuedProtocolMessage, ReplicaObservation, ReplicaRejoinMethod,
+    ReplicaRuntimeStatus, ReplicatedScheduleAction, ReplicatedScheduleActionKind,
+    ReplicatedScheduleObservation, ReplicatedScheduleObservationKind, ReplicatedSimulationError,
+    ReplicatedSimulationHarness,
 };
 
 fn core_config() -> Config {
@@ -196,6 +197,24 @@ fn replica_last_applied_lsn(harness: &ReplicatedSimulationHarness, replica_id: u
         .last_applied_lsn()
 }
 
+fn replica_commit_lsn(harness: &ReplicatedSimulationHarness, replica_id: u64) -> Option<Lsn> {
+    harness
+        .replica(replica(replica_id))
+        .unwrap()
+        .unwrap()
+        .metadata()
+        .commit_lsn
+}
+
+fn replica_snapshot_lsn(harness: &ReplicatedSimulationHarness, replica_id: u64) -> Option<Lsn> {
+    harness
+        .replica(replica(replica_id))
+        .unwrap()
+        .unwrap()
+        .metadata()
+        .active_snapshot_lsn
+}
+
 fn replica_prepared_len(harness: &ReplicatedSimulationHarness, replica_id: u64) -> usize {
     harness
         .replica(replica(replica_id))
@@ -247,6 +266,37 @@ fn set_replica_link(
             ClusterEndpoint::Replica(replica(left)),
             allowed,
         )
+        .unwrap();
+}
+
+fn commit_to_backup(
+    harness: &mut ReplicatedSimulationHarness,
+    label_prefix: &str,
+    lsn: Lsn,
+    backup: u64,
+) {
+    harness
+        .deliver_protocol_message(&format!("{label_prefix}-prepare-{}-to-{backup}", lsn.get()))
+        .unwrap();
+    harness
+        .deliver_protocol_message(&format!(
+            "{label_prefix}-prepare-{}-to-{backup}-ack",
+            lsn.get()
+        ))
+        .unwrap();
+    harness
+        .deliver_protocol_message(&format!("commit-{}-to-{backup}", lsn.get()))
+        .unwrap();
+}
+
+fn deliver_prepare_without_ack(
+    harness: &mut ReplicatedSimulationHarness,
+    label_prefix: &str,
+    lsn: Lsn,
+    backup: u64,
+) {
+    harness
+        .deliver_protocol_message(&format!("{label_prefix}-prepare-{}-to-{backup}", lsn.get()))
         .unwrap();
 }
 
@@ -841,4 +891,149 @@ fn higher_view_takeover_reconstructs_prefix_and_rejects_stale_primary_reads() {
             found
         }) if expected == replica(2) && found == replica(1)
     ));
+}
+
+#[test]
+fn stale_replica_rejoins_by_suffix_and_drops_uncommitted_suffix() {
+    let mut harness = primary_harness("replicated-rejoin-suffix", 0x5a5);
+
+    let first = harness
+        .client_submit(replica(1), Slot(1), &create_payload(51, 7), "first")
+        .unwrap();
+    commit_to_backup(&mut harness, "first", first.lsn, 2);
+    harness
+        .deliver_protocol_message("first-prepare-1-to-3")
+        .unwrap();
+    harness.deliver_protocol_message("commit-1-to-3").unwrap();
+    harness.checkpoint_replica(replica(1)).unwrap();
+
+    let second = harness
+        .client_submit(replica(1), Slot(2), &create_payload(52, 8), "second")
+        .unwrap();
+    commit_to_backup(&mut harness, "second", second.lsn, 2);
+    harness
+        .deliver_protocol_message("second-prepare-2-to-3")
+        .unwrap();
+    harness.deliver_protocol_message("commit-2-to-3").unwrap();
+    harness.checkpoint_replica(replica(1)).unwrap();
+
+    let third = harness
+        .client_submit(replica(1), Slot(3), &create_payload(53, 9), "third")
+        .unwrap();
+    commit_to_backup(&mut harness, "third", third.lsn, 2);
+    harness
+        .deliver_protocol_message("third-prepare-3-to-3")
+        .unwrap();
+    harness.checkpoint_replica(replica(1)).unwrap();
+
+    let fourth = harness
+        .client_submit(replica(1), Slot(4), &create_payload(54, 10), "fourth")
+        .unwrap();
+    deliver_prepare_without_ack(&mut harness, "fourth", fourth.lsn, 3);
+
+    assert_eq!(replica_commit_lsn(&harness, 3), Some(Lsn(2)));
+    assert_eq!(replica_prepared_len(&harness, 3), 2);
+    assert!(pending_labels(&harness).contains(&"commit-3-to-3"));
+    assert!(pending_labels(&harness).contains(&"fourth-prepare-4-to-3-ack"));
+
+    let method = harness.rejoin_replica(replica(3), replica(1)).unwrap();
+    assert_eq!(method, ReplicaRejoinMethod::SuffixOnly);
+    assert_eq!(replica_commit_lsn(&harness, 3), Some(third.lsn));
+    assert_eq!(replica_last_applied_lsn(&harness, 3), Some(third.lsn));
+    assert_eq!(replica_prepared_len(&harness, 3), 0);
+    assert!(replica_has_resource(&harness, 3, 53));
+    assert!(!replica_has_resource(&harness, 3, 54));
+    assert!(
+        pending_labels(&harness)
+            .iter()
+            .all(|label| !label.ends_with("-to-3") && !label.contains("-to-3-ack"))
+    );
+}
+
+#[test]
+fn stale_replica_rejoins_by_snapshot_transfer_when_primary_pruned_older_history() {
+    let mut harness = primary_harness("replicated-rejoin-snapshot", 0x5a6);
+
+    let first = harness
+        .client_submit(replica(1), Slot(1), &create_payload(61, 11), "first")
+        .unwrap();
+    commit_to_backup(&mut harness, "first", first.lsn, 2);
+    harness
+        .deliver_protocol_message("first-prepare-1-to-3")
+        .unwrap();
+    harness.deliver_protocol_message("commit-1-to-3").unwrap();
+    harness.checkpoint_replica(replica(1)).unwrap();
+
+    set_replica_link(&mut harness, 1, 3, false);
+    let second = harness
+        .client_submit(replica(1), Slot(2), &create_payload(62, 12), "second")
+        .unwrap();
+    commit_to_backup(&mut harness, "second", second.lsn, 2);
+    harness.checkpoint_replica(replica(1)).unwrap();
+
+    let third = harness
+        .client_submit(replica(1), Slot(3), &create_payload(63, 13), "third")
+        .unwrap();
+    commit_to_backup(&mut harness, "third", third.lsn, 2);
+    harness.checkpoint_replica(replica(1)).unwrap();
+
+    assert_eq!(replica_commit_lsn(&harness, 3), Some(first.lsn));
+    assert_eq!(replica_snapshot_lsn(&harness, 3), None);
+
+    let method = harness.rejoin_replica(replica(3), replica(1)).unwrap();
+    assert_eq!(method, ReplicaRejoinMethod::SnapshotTransfer);
+    assert_eq!(replica_commit_lsn(&harness, 3), Some(third.lsn));
+    assert_eq!(replica_last_applied_lsn(&harness, 3), Some(third.lsn));
+    assert_eq!(replica_snapshot_lsn(&harness, 3), Some(third.lsn));
+    assert!(replica_has_resource(&harness, 3, 61));
+    assert!(replica_has_resource(&harness, 3, 62));
+    assert!(replica_has_resource(&harness, 3, 63));
+    assert_eq!(replica_prepared_len(&harness, 3), 0);
+}
+
+#[test]
+fn faulted_replica_rejoin_is_rejected() {
+    let mut harness = primary_harness("replicated-rejoin-faulted", 0x5a7);
+    let metadata_path = harness
+        .replica_paths(replica(3))
+        .unwrap()
+        .metadata_path
+        .clone();
+
+    harness.crash_replica(replica(3)).unwrap();
+    fs::write(&metadata_path, [0x01, 0x02, 0x03]).unwrap();
+    let restarted = harness.restart_replica(replica(3)).unwrap();
+    match restarted {
+        ReplicatedScheduleObservationKind::ReplicaRestarted { after, .. } => {
+            assert_eq!(
+                after.runtime_status,
+                ReplicaRuntimeStatus::Running(ReplicaNodeStatus::Faulted(
+                    crate::replica::ReplicaFault {
+                        reason: crate::replica::ReplicaFaultReason::MetadataLoad(
+                            crate::replica::ReplicaMetadataLoadError::Decode(
+                                crate::replica::ReplicaMetadataDecodeError::BufferTooShort,
+                            ),
+                        ),
+                    },
+                ))
+            );
+        }
+        other => panic!("expected restart observation, got {other:?}"),
+    }
+
+    let error = harness.rejoin_replica(replica(3), replica(1)).unwrap_err();
+    assert!(matches!(
+        error,
+        ReplicatedSimulationError::ReplicaFaulted(replica_id) if replica_id == replica(3)
+    ));
+    assert_eq!(
+        harness.replica(replica(3)).unwrap().unwrap().status(),
+        ReplicaNodeStatus::Faulted(crate::replica::ReplicaFault {
+            reason: crate::replica::ReplicaFaultReason::MetadataLoad(
+                crate::replica::ReplicaMetadataLoadError::Decode(
+                    crate::replica::ReplicaMetadataDecodeError::BufferTooShort,
+                ),
+            ),
+        })
+    );
 }
