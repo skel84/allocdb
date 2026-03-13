@@ -80,9 +80,14 @@
     maintenance, and corruption/fail-closed handling
 - Replication design draft:
   - VSR-style primary/backup replicated log with fixed membership and majority quorums
-  - leader-only reads in the first replicated release
+  - primary-only reads in the first replicated release
   - protocol invariants that preserve single-node idempotency, strict-read, TTL, and
     reservation-ID semantics across failover
+- Replicated validation planning:
+  - deterministic cluster-simulation plan that extends seeded simulation to partitions, primary
+    crash, and rejoin without a mock semantics layer
+  - explicit promotion path from one-shard cluster harness to replicated failover and catch-up
+    coverage before Jepsen
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -128,9 +133,8 @@
 
 ## Current Focus
 
-- `M6-T02`: define how deterministic simulation extends to replicated execution for partitions,
-  leader crash, and rejoin on top of the protocol draft in `docs/replication.md`
-- follow with `M6-T03` to define the Jepsen gate for any replicated release
+- `M6-T03`: define the Jepsen gate for any replicated release on top of the protocol draft and
+  replicated simulation plan
 - keep `docs/status.md`, `docs/testing.md`, and `docs/replication.md` aligned as replication
   design work becomes more concrete
 

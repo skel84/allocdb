@@ -90,7 +90,7 @@ Required behavior:
 
 These matter later, but should not distort the v1 core:
 
-- leader crash
+- primary crash
 - follower lag
 - quorum loss
 - network partition
