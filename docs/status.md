@@ -2,7 +2,7 @@
 
 ## Current State
 
-- Phase: single-node v1 foundation
+- Phase: replicated implementation planning
 - Planning IDs:
   - tasks use `M#-T#`
   - spikes use `M#-S#`
@@ -15,6 +15,8 @@
   - `M4` simulation: implemented
   - `M5` single-node alpha surface: implemented
   - `M6` replication design: implemented
+  - `M7` replicated core prototype: planned
+  - `M8` external cluster validation: planned
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -134,10 +136,13 @@
 
 ## Current Focus
 
-- the current roadmap queue has no open planned issues after `M6-T03`
-- if replicated implementation begins, open a new tracked milestone and keep `docs/testing.md` and
-  `docs/replication.md` authoritative for validation and protocol rules
-- keep `docs/status.md` aligned when new post-M6 work is planned
+- `M7-T01`: add replicated node state and durable protocol metadata
+- `M7-T02`: build the deterministic 3-replica cluster harness
+- `M7-T03`: implement the first quorum write path with one configured primary
+- follow with `M7-T04` through `M7-T06` for view change, rejoin, and executable replicated
+  simulation coverage
+- use `M8` for the external multi-process, QEMU, and Jepsen layers after the in-process replicated
+  prototype is credible
 
 ## How To Check Progress
 

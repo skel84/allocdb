@@ -248,12 +248,56 @@ Exit criteria:
 - replication work has explicit validation gates
 - quorum and failover choices are justified against the research inputs
 
+### M7: Replicated Core Prototype
+
+Goal:
+
+- implement the first real replicated AllocDB shard on top of the completed `M6` design
+
+Deliverables:
+
+- replicated node wrapper state and durable protocol metadata
+- deterministic `3`-replica in-process cluster harness
+- primary-to-backup quorum write path
+- view change and fail-closed read behavior
+- suffix catch-up, snapshot transfer, and rejoin
+- executable replicated simulation scenarios from [testing.md](./testing.md)
+
+Exit criteria:
+
+- one configured primary can replicate and commit through majority durable append
+- quorum loss and higher-view takeover fail closed instead of guessing
+- stale and recovering replicas catch up without rewriting committed history
+- replicated simulation scenarios for partition, primary crash, and rejoin run against the real
+  replicated harness
+
+### M8: External Cluster Validation
+
+Goal:
+
+- validate the replicated implementation through real processes and an external fault harness
+
+Deliverables:
+
+- multi-process local replicated cluster runner
+- local fault-control harness for process and network disruption
+- local QEMU `3`-replica plus control-node testbed
+- Jepsen harness implementing the release gate from [testing.md](./testing.md)
+
+Exit criteria:
+
+- local multi-process and QEMU-backed clusters are reproducible enough for scripted fault runs
+- Jepsen histories apply AllocDB's retry-aware interpretation for ambiguous writes
+- release-blocking invariants are enforced automatically for failover, ambiguity, stale reads, and
+  expiration safety
+- the external validation path is documented well enough to run before any replicated release
+
 ## Sequencing
 
 The minimum dependency chain is:
 
 ```text
-M0 -> M1 -> M1H -> M2 -> M3 -> M4 -> M5 -> M6
+M0 -> M1 -> M1H -> M2 -> M3 -> M4 -> M5 -> M6 -> M7 -> M8
 ```
 
 Allowed overlap:
@@ -264,6 +308,8 @@ Allowed overlap:
 - some M2 durability hardening can overlap with M1H when it does not reopen state-machine
   semantics
 - some M5 API and metrics work can start during late M3
+- some M8 cluster-runner and operator packaging work can start during late M7 when it does not
+  weaken deterministic replicated-harness coverage
 
 Not allowed:
 
@@ -280,6 +326,8 @@ Suggested review points:
 4. end of M2: durability and corruption-handling review
 5. end of M4: simulation credibility review
 6. end of M5: alpha readiness review
+7. end of M7: replicated prototype correctness review
+8. end of M8: external validation gate review
 
 ## Planning Output
 
