@@ -1034,7 +1034,7 @@ Blocked by:
 
 Acceptance criteria:
 
-- partitions, leader crash, and rejoin are part of the simulation plan
+- partitions, primary crash, and rejoin are part of the simulation plan
 
 Test evidence:
 
