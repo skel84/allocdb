@@ -262,12 +262,7 @@ fn start_testbed(workspace_root: &Path) -> Result<(), String> {
     ensure_testbed_not_running(&layout)?;
     clear_stale_pid_files(&layout)?;
     prepare_runtime_assets(&layout)?;
-
-    for guest in std::iter::once(&layout.control_guest).chain(layout.replica_guests.iter()) {
-        spawn_guest(&layout, guest)?;
-    }
-
-    wait_for_control_guest_ssh(&layout)?;
+    start_prepared_testbed(&layout, spawn_guest, wait_for_control_guest_ssh, stop_guest)?;
     println!("qemu testbed started");
     println!("workspace={}", layout.config.workspace_root.display());
     println!("layout={}", layout.layout_path().display());
@@ -276,6 +271,41 @@ fn start_testbed(workspace_root: &Path) -> Result<(), String> {
         layout.ssh_private_key_path().display()
     );
     Ok(())
+}
+
+fn start_prepared_testbed<FSpawn, FWait, FStop>(
+    layout: &QemuTestbedLayout,
+    mut spawn_guest_fn: FSpawn,
+    mut wait_for_control_guest_ssh_fn: FWait,
+    mut stop_guest_fn: FStop,
+) -> Result<(), String>
+where
+    FSpawn: FnMut(&QemuTestbedLayout, &QemuGuestConfig) -> Result<(), String>,
+    FWait: FnMut(&QemuTestbedLayout) -> Result<(), String>,
+    FStop: FnMut(&QemuGuestConfig) -> Result<(), String>,
+{
+    let mut started_guests = Vec::new();
+    for guest in std::iter::once(&layout.control_guest).chain(layout.replica_guests.iter()) {
+        if let Err(error) = spawn_guest_fn(layout, guest) {
+            rollback_started_guests(&started_guests, &mut stop_guest_fn);
+            return Err(error);
+        }
+        started_guests.push(guest);
+    }
+    if let Err(error) = wait_for_control_guest_ssh_fn(layout) {
+        rollback_started_guests(&started_guests, &mut stop_guest_fn);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn rollback_started_guests<F>(started_guests: &[&QemuGuestConfig], stop_guest_fn: &mut F)
+where
+    F: FnMut(&QemuGuestConfig) -> Result<(), String>,
+{
+    for guest in started_guests.iter().rev() {
+        let _ = stop_guest_fn(guest);
+    }
 }
 
 fn stop_testbed(workspace_root: &Path) -> Result<(), String> {
@@ -1024,11 +1054,130 @@ fn firmware_vars_template_path(layout: &QemuTestbedLayout) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_qemu_image_format;
+    use super::{parse_qemu_image_format, start_prepared_testbed};
+    use allocdb_node::qemu_testbed::{QemuGuestArch, QemuTestbedConfig, QemuTestbedLayout};
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    fn fixture_layout() -> QemuTestbedLayout {
+        QemuTestbedLayout::new(QemuTestbedConfig {
+            workspace_root: std::env::temp_dir().join("allocdb-qemu-testbed-start-prepared"),
+            arch: QemuGuestArch::Aarch64,
+            base_image_url: String::from(
+                "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img",
+            ),
+            base_image_path: PathBuf::from("/tmp/base-cloudimg.img"),
+            local_cluster_binary_path: PathBuf::from("/tmp/allocdb-local-cluster"),
+        })
+        .expect("fixture layout")
+    }
 
     #[test]
     fn parse_qemu_image_format_extracts_format_line() {
         let output = "image: base.img\nfile format: raw\nvirtual size: 64 MiB (67108864 bytes)\n";
         assert_eq!(parse_qemu_image_format(output).as_deref(), Some("raw"));
+    }
+
+    #[test]
+    fn start_prepared_testbed_rolls_back_spawn_failure_and_allows_retry() {
+        let layout = fixture_layout();
+        let running = RefCell::new(HashSet::new());
+        let stopped = RefCell::new(Vec::new());
+        let fail_once = Cell::new(true);
+        let fail_guest = layout.replica_guests[0].name.clone();
+
+        let first_error = start_prepared_testbed(
+            &layout,
+            |_, guest| {
+                if guest.name == fail_guest && fail_once.replace(false) {
+                    return Err(String::from("spawn failed"));
+                }
+                running.borrow_mut().insert(guest.name.clone());
+                Ok(())
+            },
+            |_| Ok(()),
+            |guest| {
+                running.borrow_mut().remove(&guest.name);
+                stopped.borrow_mut().push(guest.name.clone());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(first_error, "spawn failed");
+        assert!(running.borrow().is_empty());
+        assert_eq!(
+            stopped.borrow().as_slice(),
+            &[layout.control_guest.name.clone()]
+        );
+
+        let retry_result = start_prepared_testbed(
+            &layout,
+            |_, guest| {
+                running.borrow_mut().insert(guest.name.clone());
+                Ok(())
+            },
+            |_| Ok(()),
+            |guest| {
+                running.borrow_mut().remove(&guest.name);
+                Ok(())
+            },
+        );
+        assert!(retry_result.is_ok());
+        assert_eq!(running.borrow().len(), 4);
+    }
+
+    #[test]
+    fn start_prepared_testbed_rolls_back_readiness_failure_and_allows_retry() {
+        let layout = fixture_layout();
+        let running = RefCell::new(HashSet::new());
+        let stopped = RefCell::new(Vec::new());
+        let wait_fail_once = Cell::new(true);
+
+        let first_error = start_prepared_testbed(
+            &layout,
+            |_, guest| {
+                running.borrow_mut().insert(guest.name.clone());
+                Ok(())
+            },
+            |_| {
+                if wait_fail_once.replace(false) {
+                    Err(String::from(
+                        "control guest ssh did not become ready within timeout",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            |guest| {
+                running.borrow_mut().remove(&guest.name);
+                stopped.borrow_mut().push(guest.name.clone());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            first_error,
+            "control guest ssh did not become ready within timeout"
+        );
+        assert!(running.borrow().is_empty());
+        assert_eq!(stopped.borrow().len(), 4);
+
+        let retry_result = start_prepared_testbed(
+            &layout,
+            |_, guest| {
+                running.borrow_mut().insert(guest.name.clone());
+                Ok(())
+            },
+            |_| Ok(()),
+            |guest| {
+                running.borrow_mut().remove(&guest.name);
+                Ok(())
+            },
+        );
+        assert!(retry_result.is_ok());
+        assert_eq!(running.borrow().len(), 4);
     }
 }

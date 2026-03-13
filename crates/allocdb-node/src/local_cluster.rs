@@ -780,6 +780,7 @@ fn control_status_error_is_transient(error: &ControlProtocolError) -> bool {
         ControlProtocolError::Io(_)
             | ControlProtocolError::MissingField(_)
             | ControlProtocolError::InvalidLine(_)
+            | ControlProtocolError::InvalidField { .. }
     )
 }
 
@@ -1661,5 +1662,62 @@ mod tests {
         ));
         assert_eq!(attempts.get(), 1);
         assert!(delays.borrow().is_empty());
+    }
+
+    #[test]
+    fn request_control_status_retries_truncated_field_value_then_succeeds() {
+        let addr = fixture_status().control_addr;
+        let status = fixture_status();
+        let encoded = encode_status_response(&status);
+        let attempts = Cell::new(0_usize);
+        let delays = RefCell::new(Vec::new());
+
+        let error_response = concat!(
+            "status=ok\n",
+            "protocol_version=1\n",
+            "process_id=42\n",
+            "replica_id=1\n",
+            "state=active\n",
+            "role=primary\n",
+            "current_view=7\n",
+            "commit_lsn=9\n",
+            "active_snapshot_lsn=8\n",
+            "accepting_writes=true\n",
+            "startup_kind=snapshot_and_wal\n",
+            "loaded_snapshot_lsn=8\n",
+            "replayed_wal_frame_count=3\n",
+            "replayed_wal_last_lsn=9\n",
+            "fault_reason=none\n",
+            "workspace_dir=/tmp/allocdb-local-cluster/replica-1\n",
+            "log_path=/tmp/allocdb-local-cluster/logs/replica-1.log\n",
+            "pid_path=/tmp/allocdb-local-cluster/run/replica-1.pid\n",
+            "metadata_path=/tmp/allocdb-local-cluster/replica-1/replica.metadata\n",
+            "prepare_log_path=/tmp/allocdb-local-cluster/replica-1/replica.metadata.prepare\n",
+            "snapshot_path=/tmp/allocdb-local-cluster/replica-1/state.snapshot\n",
+            "wal_path=/tmp/allocdb-local-cluster/replica-1/state.wal\n",
+            "control_addr=127.0.0.\n",
+            "client_addr=127.0.0.1:19001\n",
+            "protocol_addr=127.0.0.1:20001\n",
+        );
+        let result = request_control_status_with(
+            addr,
+            |request_addr, request| {
+                assert_eq!(request_addr, addr);
+                assert_eq!(request, ControlRequest::Status);
+                let attempt = attempts.get();
+                attempts.set(attempt.saturating_add(1));
+                if attempt == 0 {
+                    Ok(String::from(error_response))
+                } else {
+                    Ok(encoded.clone())
+                }
+            },
+            |delay| delays.borrow_mut().push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(result, status);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(delays.borrow().as_slice(), &[CONTROL_STATUS_RETRY_DELAY]);
     }
 }

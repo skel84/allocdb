@@ -1,6 +1,6 @@
 use std::fmt::{self, Write as _};
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
@@ -337,7 +337,16 @@ impl QemuTestbedLayout {
     /// Returns [`QemuTestbedLayoutError`] if the file cannot be written.
     pub fn persist(&self) -> Result<(), QemuTestbedLayoutError> {
         fs::create_dir_all(&self.config.workspace_root)?;
-        fs::write(self.layout_path(), encode_layout(self))?;
+        let layout_path = self.layout_path();
+        let temp_path = layout_path.with_extension(format!("{}.tmp", std::process::id()));
+        let mut file = File::create(&temp_path)?;
+        file.write_all(encode_layout(self).as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, &layout_path).map_err(|error| {
+            let _ = fs::remove_file(&temp_path);
+            QemuTestbedLayoutError::Io(error)
+        })?;
         Ok(())
     }
 
@@ -437,7 +446,7 @@ impl QemuTestbedLayout {
         let bin_path = GUEST_LOCAL_CLUSTER_BIN_PATH;
         let layout_path = GUEST_LAYOUT_PATH;
         let service = format!(
-            "[Unit]\nDescription=AllocDB replica daemon {replica_id}\nAfter=network-online.target cloud-final.service\nWants=network-online.target\n\n[Service]\nUser={user}\nGroup={user}\nExecStart={bin_path} replica-daemon --layout-file {layout_path} --replica-id {replica_id}\nRestart=always\nRestartSec=1\nStandardOutput=append:/var/log/allocdb/replica-{replica_id}.log\nStandardError=append:/var/log/allocdb/replica-{replica_id}.log\n\n[Install]\nWantedBy=multi-user.target\n",
+            "[Unit]\nDescription=AllocDB replica daemon {replica_id}\nAfter=network-online.target cloud-final.service\nWants=network-online.target\n\n[Service]\nUser={user}\nGroup={user}\nExecStart={bin_path} replica-daemon --layout-file {layout_path} --replica-id {replica_id}\nStandardOutput=append:/var/log/allocdb/replica-{replica_id}.log\nStandardError=append:/var/log/allocdb/replica-{replica_id}.log\n\n[Install]\nWantedBy=multi-user.target\n",
         );
         format!(
             "#cloud-config\nusers:\n  - default\n  - name: {user}\n    shell: /bin/bash\n    sudo: ALL=(ALL) NOPASSWD:ALL\n    ssh_authorized_keys:\n      - {ssh_public_key}\nwrite_files:\n  - path: {bin_path}\n    permissions: '0755'\n    encoding: b64\n    content: {binary_b64}\n  - path: {layout_path}\n    permissions: '0644'\n    content: |\n{layout_block}\n  - path: /etc/systemd/system/allocdb-replica.service\n    permissions: '0644'\n    content: |\n{service_block}\nruncmd:\n  - mkdir -p {guest_workspace_root}/replica-1 {guest_workspace_root}/replica-2 {guest_workspace_root}/replica-3 /var/log/allocdb /run/allocdb\n  - chown -R {user}:{user} {guest_workspace_root} /var/log/allocdb /run/allocdb\n  - systemctl daemon-reload\n  - systemctl enable --now allocdb-replica.service\n",
@@ -853,6 +862,7 @@ fn required_field<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fixture_layout() -> QemuTestbedLayout {
         QemuTestbedLayout::new(QemuTestbedConfig {
@@ -885,6 +895,43 @@ mod tests {
             CONTROL_GUEST_MANAGEMENT_IP
         );
         assert_eq!(decoded.replica_guests.len(), 3);
+    }
+
+    #[test]
+    fn persisted_qemu_layout_round_trips_from_disk() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "allocdb-qemu-testbed-persist-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let layout = QemuTestbedLayout::new(QemuTestbedConfig {
+            workspace_root: workspace_root.clone(),
+            arch: QemuGuestArch::Aarch64,
+            base_image_url: String::from(DEFAULT_AARCH64_IMAGE_URL),
+            base_image_path: PathBuf::from("/tmp/base-cloudimg.img"),
+            local_cluster_binary_path: PathBuf::from("/tmp/allocdb-local-cluster"),
+        })
+        .expect("persist fixture layout");
+
+        layout.persist().expect("persist qemu layout");
+        let loaded = QemuTestbedLayout::load(layout.layout_path()).expect("load qemu layout");
+        let temp_path = layout
+            .layout_path()
+            .with_extension(format!("{}.tmp", std::process::id()));
+
+        assert_eq!(loaded.config.arch, layout.config.arch);
+        assert_eq!(loaded.config.workspace_root, layout.config.workspace_root);
+        assert_eq!(loaded.config.base_image_path, layout.config.base_image_path);
+        assert_eq!(
+            loaded.config.local_cluster_binary_path,
+            layout.config.local_cluster_binary_path
+        );
+        assert!(!temp_path.exists());
+
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[test]
@@ -931,6 +978,8 @@ mod tests {
         assert!(user_data.contains("allocdb-replica.service"));
         assert!(user_data.contains("--replica-id 2"));
         assert!(user_data.contains("current_view=1"));
+        assert!(!user_data.contains("Restart=always"));
+        assert!(!user_data.contains("RestartSec=1"));
         assert!(
             user_data.contains("replica.2.control_addr=172.31.0.12:17000")
                 || user_data.contains("control_addr=172.31.0.12:17000")
