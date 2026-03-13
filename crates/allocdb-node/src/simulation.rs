@@ -20,6 +20,14 @@ mod tests;
 static NEXT_SIMULATION_WORKSPACE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageFault {
+    AppendFailure,
+    SyncFailure,
+    CorruptLastFrameChecksum,
+    TornLastFrameTail { truncate_bytes: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SimulationObservation {
     pub slot: Slot,
     pub operation_id: OperationId,
@@ -287,8 +295,23 @@ impl SimulationHarness {
         Ok(metrics)
     }
 
-    pub(crate) fn inject_next_persist_failure(&mut self, phase: PersistFailurePhase) {
-        self.engine_mut().inject_next_persist_failure(phase);
+    pub(crate) fn inject_storage_fault(&mut self, fault: StorageFault) {
+        match fault {
+            StorageFault::AppendFailure => self
+                .engine_mut()
+                .inject_next_persist_failure(PersistFailurePhase::BeforeAppend),
+            StorageFault::SyncFailure => self
+                .engine_mut()
+                .inject_next_persist_failure(PersistFailurePhase::Sync),
+            StorageFault::CorruptLastFrameChecksum => {
+                drop(self.engine.take());
+                corrupt_last_wal_byte(&self.wal_path);
+            }
+            StorageFault::TornLastFrameTail { truncate_bytes } => {
+                drop(self.engine.take());
+                truncate_wal_tail(&self.wal_path, truncate_bytes);
+            }
+        }
     }
 
     pub(crate) fn arm_next_engine_crash(
@@ -423,4 +446,37 @@ fn simulation_workspace_path(name: &str, seed: u64) -> PathBuf {
     std::env::temp_dir().join(format!(
         "allocdb-sim-{name}-seed-{seed}-pid-{process_id}-run-{workspace_id}"
     ))
+}
+
+fn corrupt_last_wal_byte(path: &PathBuf) {
+    let mut bytes = fs::read(path).expect("recovery fault requires one WAL file");
+    assert!(
+        !bytes.is_empty(),
+        "checksum mismatch requires one non-empty WAL"
+    );
+    let last_index = bytes.len() - 1;
+    bytes[last_index] ^= 0xff;
+    fs::write(path, bytes).expect("checksum mismatch must rewrite WAL bytes");
+}
+
+fn truncate_wal_tail(path: &PathBuf, truncated_bytes: u64) {
+    assert!(
+        truncated_bytes > 0,
+        "torn tail requires one positive truncation"
+    );
+    let file_len = fs::metadata(path)
+        .expect("torn tail requires one WAL file")
+        .len();
+    assert!(
+        file_len > truncated_bytes,
+        "torn tail must leave at least one valid WAL byte behind"
+    );
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("torn tail requires one writable WAL");
+    file.set_len(file_len - truncated_bytes)
+        .expect("torn tail truncation must succeed");
+    file.sync_data()
+        .expect("torn tail truncation must sync the shortened file");
 }

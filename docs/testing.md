@@ -111,6 +111,9 @@ regression coverage in `crates/allocdb-node/src/simulation_tests.rs`. The curren
 - seeded schedule exploration now covers ingress contention order, same-deadline expiration
   selection under bounded tick throughput, and retry timing across the dedupe window with replay
   from the same seed
+- one-shot storage-fault helpers now cover append-failure halts, sync-failure ambiguity,
+  checksum-mismatch fail-closed recovery, and torn-tail truncation against the real WAL and
+  restart path
 
 What to reuse in follow-up tasks:
 
@@ -120,6 +123,7 @@ What to reuse in follow-up tasks:
 - labeled schedule actions with candidate slot windows and replayable transcripts
 - seeded due-expiration selection over the real internal-expire path
 - seeded one-shot crash plans over real engine and recovery boundaries
+- one-shot storage-fault helpers over live WAL writes and post-crash WAL mutation
 - restart helpers that reopen from snapshot plus WAL on disk
 
 What not to promote directly:

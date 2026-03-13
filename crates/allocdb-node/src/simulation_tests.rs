@@ -1,16 +1,19 @@
 use allocdb_core::command::{ClientRequest, Command};
 use allocdb_core::config::Config;
 use allocdb_core::ids::{ClientId, HolderId, OperationId, ResourceId, Slot};
+use allocdb_core::recovery::RecoveryError;
 use allocdb_core::result::ResultCode;
+use allocdb_core::wal::{DecodeError, ScanStopReason};
+use allocdb_core::wal_file::{WalFile, WalFileError};
 use allocdb_core::{ReservationState, ResourceState};
 
 use crate::engine::{
-    CheckpointError, CrashPlan, CrashPoint, EngineConfig, PersistFailurePhase, RecoverEngineError,
-    RecoveryStartupKind, SubmissionError,
+    CheckpointError, CrashPlan, CrashPoint, EngineConfig, RecoverEngineError, RecoveryStartupKind,
+    SubmissionError,
 };
 use crate::simulation::{
     ScheduleAction, ScheduleActionKind, ScheduleObservation, ScheduleObservationKind,
-    SimulationHarness,
+    SimulationHarness, StorageFault,
 };
 
 fn core_config() -> Config {
@@ -435,6 +438,29 @@ fn seeded_schedule_explores_retry_timing_reproducibly() {
 }
 
 #[test]
+#[should_panic(expected = "schedule actions must have unique labels")]
+fn schedule_exploration_rejects_duplicate_labels() {
+    let actions = [
+        schedule_submit("duplicate", &[1], create(11, 1)),
+        schedule_submit("duplicate", &[2], create(12, 2)),
+    ];
+
+    let _ = run_schedule("schedule-duplicate-labels", 0xabc, &actions);
+}
+
+#[test]
+#[should_panic(expected = "schedule action requires at least one candidate slot")]
+fn schedule_exploration_rejects_empty_candidate_slots() {
+    let actions = [ScheduleAction {
+        label: "empty-slot-window",
+        candidate_slots: Vec::new(),
+        action: ScheduleActionKind::Submit(create(11, 1)),
+    }];
+
+    let _ = run_schedule("schedule-empty-candidates", 0xdef, &actions);
+}
+
+#[test]
 fn explicit_slot_advancement_controls_lag_and_backlog() {
     let mut harness =
         SimulationHarness::new("lag-backlog", 0x44, core_config(), engine_config()).unwrap();
@@ -523,7 +549,7 @@ fn simulated_slot_driver_handles_expiration_restart_path() {
         ReservationState::Reserved
     );
 
-    harness.inject_next_persist_failure(PersistFailurePhase::AfterAppend);
+    harness.inject_storage_fault(StorageFault::SyncFailure);
     let error = harness.tick_expirations().unwrap_err();
     assert!(matches!(error, SubmissionError::WalFile(_)));
     assert!(!harness.metrics().accepting_writes);
@@ -569,17 +595,127 @@ fn simulated_slot_driver_handles_expiration_restart_path() {
 }
 
 #[test]
-fn harness_submit_propagates_persist_failure_for_negative_path_tests() {
+fn harness_storage_fault_append_failure_halts_engine_for_negative_path_tests() {
     let mut harness =
         SimulationHarness::new("persist-failure", 0x99, core_config(), engine_config()).unwrap();
 
     harness.advance_to(Slot(1));
-    harness.inject_next_persist_failure(PersistFailurePhase::BeforeAppend);
+    harness.inject_storage_fault(StorageFault::AppendFailure);
 
     let error = harness.submit(create(11, 1)).unwrap_err();
 
     assert!(matches!(error, SubmissionError::WalFile(_)));
     assert!(!harness.metrics().accepting_writes);
+}
+
+#[test]
+fn simulated_sync_failure_recovers_retryable_write_from_real_wal() {
+    let mut harness = SimulationHarness::new(
+        "sync-failure-recovery",
+        0x155,
+        core_config(),
+        engine_config(),
+    )
+    .unwrap();
+
+    harness.advance_to(Slot(1));
+    harness.inject_storage_fault(StorageFault::SyncFailure);
+
+    let error = harness.submit(create(11, 1)).unwrap_err();
+
+    assert!(matches!(error, SubmissionError::WalFile(_)));
+    assert!(!harness.metrics().accepting_writes);
+
+    let recovered = harness.restart().unwrap();
+    assert_eq!(
+        recovered.recovery.startup_kind,
+        RecoveryStartupKind::WalOnly
+    );
+    assert_eq!(recovered.recovery.replayed_wal_frame_count, 1);
+    assert_eq!(
+        recovered
+            .recovery
+            .replayed_wal_last_lsn
+            .map(allocdb_core::Lsn::get),
+        Some(1)
+    );
+    assert!(harness.engine().db().resource(ResourceId(11)).is_some());
+
+    let retry = harness.submit(create(11, 1)).unwrap();
+    assert!(retry.from_retry_cache);
+    assert_eq!(retry.applied_lsn.get(), 1);
+}
+
+#[test]
+fn simulated_torn_tail_recovers_from_snapshot_and_retries_once() {
+    let mut harness =
+        SimulationHarness::new("torn-tail-recovery", 0x166, core_config(), engine_config())
+            .unwrap();
+
+    harness.advance_to(Slot(1));
+    harness.submit(create(11, 1)).unwrap();
+    harness.checkpoint().unwrap();
+
+    harness.advance_to(Slot(2));
+    harness.submit(create(12, 2)).unwrap();
+    harness.inject_storage_fault(StorageFault::TornLastFrameTail { truncate_bytes: 2 });
+
+    let recovered = harness.restart().unwrap();
+
+    assert_eq!(
+        recovered.recovery.startup_kind,
+        RecoveryStartupKind::SnapshotOnly
+    );
+    assert_eq!(
+        recovered
+            .recovery
+            .loaded_snapshot_lsn
+            .map(allocdb_core::Lsn::get),
+        Some(1)
+    );
+    assert_eq!(recovered.recovery.replayed_wal_frame_count, 0);
+    assert!(harness.engine().db().resource(ResourceId(11)).is_some());
+    assert!(harness.engine().db().resource(ResourceId(12)).is_none());
+    let wal = WalFile::open(
+        harness.engine().wal_path(),
+        engine_config().max_command_bytes,
+    )
+    .unwrap();
+    let recovered_wal = wal.recover().unwrap();
+    assert_eq!(
+        recovered_wal.scan_result.stop_reason,
+        ScanStopReason::CleanEof
+    );
+
+    let retried = harness.submit(create(12, 2)).unwrap();
+    assert!(!retried.from_retry_cache);
+    assert_eq!(retried.applied_lsn.get(), 2);
+    assert!(harness.engine().db().resource(ResourceId(12)).is_some());
+}
+
+#[test]
+fn simulated_checksum_corruption_fails_closed_during_restart() {
+    let mut harness =
+        SimulationHarness::new("checksum-corruption", 0x177, core_config(), engine_config())
+            .unwrap();
+
+    harness.advance_to(Slot(1));
+    harness.submit(create(11, 1)).unwrap();
+    harness.checkpoint().unwrap();
+
+    harness.advance_to(Slot(2));
+    harness.submit(create(12, 2)).unwrap();
+    harness.inject_storage_fault(StorageFault::CorruptLastFrameChecksum);
+
+    let error = harness.restart().unwrap_err();
+
+    assert!(matches!(
+        error,
+        RecoverEngineError::Recovery(RecoveryError::WalFile(WalFileError::Corruption {
+            error: DecodeError::InvalidChecksum,
+            ..
+        }))
+    ));
 }
 
 #[test]

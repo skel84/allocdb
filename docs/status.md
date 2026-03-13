@@ -29,8 +29,10 @@
     sequencing paths, including deterministic pre-commit overflow rejection for request slots,
     fail-closed replay rejection for overflowed WAL commands, restart coverage for post-sync
     submit replay and replay-interrupted recovery, explicit `next_lsn` exhaustion handling after
-    `u64::MAX`, and replayable seeded schedule exploration over ingress contention, due-expiration
-    selection, and retry timing
+    `u64::MAX`, deterministic storage-fault injection for append failures, sync-failure
+    ambiguity, checksum-mismatch fail-closed recovery, and torn-tail truncation over the real WAL
+    restart path, plus replayable seeded schedule exploration over ingress contention,
+    due-expiration selection, and retry timing
 
 ## What Exists
 
@@ -100,11 +102,15 @@
     per-tick expiration limit
   - seeded one-shot crash plans over named client-submit, internal-apply, checkpoint, and
     recovery boundaries
-  - checkpoint, restart, and injected persist-failure helpers over the real `SingleNodeEngine`
+  - one-shot storage fault helpers over append failure, sync failure, checksum mismatch, and
+    torn-tail WAL mutation against real on-disk recovery
+  - checkpoint, restart, and live write-fault helpers over the real `SingleNodeEngine`
   - regression coverage for crash-selected post-sync submit replay, crash-after-snapshot-write
-    checkpoint recovery, replay-interrupted recovery restart, ingress contention winner order,
-    same-deadline expiration order, and retry timing across the dedupe window
+    checkpoint recovery, replay-interrupted recovery restart, sync-failure retry recovery,
+    checksum-corruption fail-closed restart, torn-tail truncation retry, ingress contention winner
+    order, same-deadline expiration order, and retry timing across the dedupe window
 - Validation:
+  - `cargo test -p allocdb-core wal -- --nocapture`
   - `cargo test -p allocdb-core snapshot -- --nocapture`
   - `cargo test -p allocdb-core recovery -- --nocapture`
   - `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
@@ -116,10 +122,11 @@
 
 ## Current Focus
 
-- `M4-T04`: keep the seeded schedule-exploration harness aligned while capturing new replayable
-  regression seeds for ingress, expiration, and retry interleavings
-- keep the simulation/testing docs aligned as new transcript assertions land
-- keep `M4-T02` and `M4-T03` regression coverage green while broadening schedule exploration
+- `M4-T04`: extend the seeded simulation driver with reproducible schedule exploration over
+  ingress order, expiration order, and retry timing
+- keep `M4-T02` and `M4-T03` regression coverage green while broadening the schedule matrix
+- keep the operator runbook, testing notes, and status snapshot aligned as new simulation evidence
+  lands
 
 ## How To Check Progress
 
