@@ -1,12 +1,16 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use allocdb_core::config::Config;
-use allocdb_core::ids::Lsn;
+use allocdb_core::ids::{Lsn, Slot};
 use log::{error, info, warn};
 
-use crate::engine::{EngineConfig, EngineOpenError, RecoverEngineError, SingleNodeEngine};
+use crate::engine::{
+    EngineConfig, EngineOpenError, ReadError, RecoverEngineError, SingleNodeEngine,
+    SubmissionError, SubmissionResult,
+};
 
 #[cfg(all(test, unix))]
 #[path = "replica_tests.rs"]
@@ -19,6 +23,8 @@ mod non_unix_tests;
 const MAX_REPLICA_METADATA_BYTES: u64 = 256;
 const REPLICA_METADATA_MAGIC: [u8; 4] = *b"RPLM";
 const REPLICA_METADATA_VERSION: u8 = 1;
+const REPLICA_PREPARE_LOG_MAGIC: [u8; 4] = *b"RPLP";
+const REPLICA_PREPARE_LOG_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplicaId(pub u64);
@@ -213,6 +219,14 @@ impl ReplicaPaths {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicaPreparedEntry {
+    pub view: u64,
+    pub lsn: Lsn,
+    pub request_slot: Slot,
+    pub payload: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplicaMetadataDecodeError {
     BufferTooShort,
@@ -347,6 +361,64 @@ impl From<ReplicaMetadataFileError> for RecoverReplicaError {
 }
 
 #[derive(Debug)]
+pub enum ReplicaProtocolError {
+    Inactive(ReplicaNodeStatus),
+    UnsupportedNormalRole(ReplicaRole),
+    RoleMismatch {
+        expected: ReplicaRole,
+        found: ReplicaRole,
+    },
+    ViewRegression {
+        current_view: u64,
+        requested_view: u64,
+    },
+    ViewMismatch {
+        expected: u64,
+        found: u64,
+    },
+    PrepareLsnExhausted {
+        last_lsn: Lsn,
+    },
+    PrepareOrderMismatch {
+        expected_lsn: Lsn,
+        found_lsn: Lsn,
+    },
+    PreparedEntryConflict {
+        lsn: Lsn,
+    },
+    MissingPreparedEntry {
+        lsn: Lsn,
+    },
+    PrepareStorage(std::io::ErrorKind),
+    MetadataFile(ReplicaMetadataFileError),
+    Submission(SubmissionError),
+    AppliedLsnMismatch {
+        expected: Lsn,
+        found: Lsn,
+    },
+    Read(NotPrimaryReadError),
+}
+
+impl From<ReplicaMetadataFileError> for ReplicaProtocolError {
+    fn from(error: ReplicaMetadataFileError) -> Self {
+        Self::MetadataFile(error)
+    }
+}
+
+impl From<SubmissionError> for ReplicaProtocolError {
+    fn from(error: SubmissionError) -> Self {
+        Self::Submission(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotPrimaryReadError {
+    ReplicaCrashed,
+    Role(ReplicaRole),
+    Fence(ReadError),
+}
+
+#[derive(Debug)]
 pub struct ReplicaMetadataFile {
     path: PathBuf,
 }
@@ -435,9 +507,41 @@ impl ReplicaMetadataFile {
 }
 
 #[derive(Debug)]
+struct ReplicaPrepareLogFile {
+    path: PathBuf,
+}
+
+impl ReplicaPrepareLogFile {
+    fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+
+    fn write_entries(
+        &self,
+        entries: &BTreeMap<u64, ReplicaPreparedEntry>,
+    ) -> Result<(), std::io::Error> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let temp_path = metadata_temp_path(&self.path);
+        let mut file = File::create(&temp_path)?;
+        file.write_all(&encode_prepare_log(entries))?;
+        file.sync_all()?;
+        drop(file);
+
+        replace_file_durably(&temp_path, &self.path)
+    }
+}
+
+#[derive(Debug)]
 pub struct ReplicaNode {
     metadata: ReplicaMetadata,
     metadata_file: ReplicaMetadataFile,
+    prepare_log_file: ReplicaPrepareLogFile,
+    prepared_entries: BTreeMap<u64, ReplicaPreparedEntry>,
     paths: ReplicaPaths,
     status: ReplicaNodeStatus,
     engine: Option<SingleNodeEngine>,
@@ -611,6 +715,264 @@ impl ReplicaNode {
         self.metadata_file.write_metadata(&self.metadata)
     }
 
+    #[must_use]
+    pub fn prepared_entry(&self, lsn: Lsn) -> Option<&ReplicaPreparedEntry> {
+        self.prepared_entries.get(&lsn.get())
+    }
+
+    #[must_use]
+    pub fn prepared_len(&self) -> usize {
+        self.prepared_entries.len()
+    }
+
+    #[must_use]
+    pub fn prepare_log_path(&self) -> &Path {
+        &self.prepare_log_file.path
+    }
+
+    /// Moves one active replica into normal mode for the provided view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicaProtocolError`] if the replica is faulted, the requested role is not
+    /// `primary` or `backup`, the view would move backwards, or the updated metadata cannot be
+    /// persisted durably.
+    pub fn configure_normal_role(
+        &mut self,
+        current_view: u64,
+        role: ReplicaRole,
+    ) -> Result<(), ReplicaProtocolError> {
+        self.ensure_active()?;
+        if !matches!(role, ReplicaRole::Primary | ReplicaRole::Backup) {
+            return Err(ReplicaProtocolError::UnsupportedNormalRole(role));
+        }
+        if current_view < self.metadata.current_view {
+            return Err(ReplicaProtocolError::ViewRegression {
+                current_view: self.metadata.current_view,
+                requested_view: current_view,
+            });
+        }
+
+        self.metadata.current_view = current_view;
+        self.metadata.role = role;
+        self.metadata.last_normal_view = Some(current_view);
+        self.metadata.durable_vote = None;
+        self.persist_metadata()?;
+        Ok(())
+    }
+
+    /// Validates and durably prepares one client request on the current primary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicaProtocolError`] if the replica is not an active primary, if the next
+    /// prepared LSN would overflow, if the payload fails the existing single-node ingress
+    /// validation path, or if the prepared-entry sidecar cannot be persisted.
+    pub fn prepare_client_request(
+        &mut self,
+        request_slot: Slot,
+        payload: &[u8],
+    ) -> Result<ReplicaPreparedEntry, ReplicaProtocolError> {
+        self.require_role(ReplicaRole::Primary)?;
+        let next_lsn = self.next_prepared_lsn()?;
+        let entry = ReplicaPreparedEntry {
+            view: self.metadata.current_view,
+            lsn: next_lsn,
+            request_slot,
+            payload: payload.to_vec(),
+        };
+        self.append_prepared_entry(entry.clone())?;
+        Ok(entry)
+    }
+
+    /// Durably appends one already-assigned prepared entry without applying it to allocator state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicaProtocolError`] if the replica is not in normal mode, if the entry view or
+    /// LSN order is invalid, if a different prepared payload already occupies the same LSN, if the
+    /// payload fails single-node ingress validation, or if the sidecar write fails.
+    pub fn append_prepared_entry(
+        &mut self,
+        entry: ReplicaPreparedEntry,
+    ) -> Result<(), ReplicaProtocolError> {
+        self.ensure_normal_role()?;
+        if entry.view != self.metadata.current_view {
+            return Err(ReplicaProtocolError::ViewMismatch {
+                expected: self.metadata.current_view,
+                found: entry.view,
+            });
+        }
+        if let Some(existing) = self.prepared_entries.get(&entry.lsn.get()) {
+            return if existing == &entry {
+                Ok(())
+            } else {
+                Err(ReplicaProtocolError::PreparedEntryConflict { lsn: entry.lsn })
+            };
+        }
+
+        let expected_lsn = self.next_prepared_lsn()?;
+        if entry.lsn != expected_lsn {
+            return Err(ReplicaProtocolError::PrepareOrderMismatch {
+                expected_lsn,
+                found_lsn: entry.lsn,
+            });
+        }
+
+        self.engine_mut()?
+            .validate_encoded_submission(entry.request_slot, &entry.payload)?;
+        self.prepared_entries.insert(entry.lsn.get(), entry);
+        self.persist_prepared_entries()
+    }
+
+    /// Applies prepared entries through the existing single-node executor up to one committed LSN.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicaProtocolError`] if the replica is not in normal mode, if any committed LSN
+    /// is missing from the prepared buffer, if the entry view no longer matches the local view, if
+    /// the single-node executor rejects the payload, if the applied LSN diverges from the prepared
+    /// position, or if the updated metadata / prepared-entry sidecar cannot be persisted.
+    pub fn commit_prepared_through(
+        &mut self,
+        commit_lsn: Lsn,
+    ) -> Result<Option<SubmissionResult>, ReplicaProtocolError> {
+        self.ensure_normal_role()?;
+        let first_pending = self
+            .metadata
+            .commit_lsn
+            .and_then(|lsn| lsn.get().checked_add(1))
+            .unwrap_or(1);
+        if commit_lsn.get() < first_pending {
+            return Ok(None);
+        }
+
+        let entries = (first_pending..=commit_lsn.get())
+            .map(|lsn| {
+                self.prepared_entries
+                    .get(&lsn)
+                    .cloned()
+                    .ok_or(ReplicaProtocolError::MissingPreparedEntry { lsn: Lsn(lsn) })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut last_result = None;
+        for entry in &entries {
+            if entry.view != self.metadata.current_view {
+                return Err(ReplicaProtocolError::ViewMismatch {
+                    expected: self.metadata.current_view,
+                    found: entry.view,
+                });
+            }
+            let result = self
+                .engine_mut()?
+                .submit_encoded(entry.request_slot, &entry.payload)?;
+            if result.applied_lsn != entry.lsn {
+                return Err(ReplicaProtocolError::AppliedLsnMismatch {
+                    expected: entry.lsn,
+                    found: result.applied_lsn,
+                });
+            }
+            self.metadata.commit_lsn = Some(entry.lsn);
+            self.metadata.active_snapshot_lsn = self
+                .engine
+                .as_ref()
+                .and_then(SingleNodeEngine::active_snapshot_lsn);
+            last_result = Some(result);
+        }
+
+        for entry in &entries {
+            self.prepared_entries.remove(&entry.lsn.get());
+        }
+
+        self.persist_prepared_entries()?;
+        self.persist_metadata()?;
+        Ok(last_result)
+    }
+
+    /// Enforces the first replicated-release read rule: only the current primary may serve reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotPrimaryReadError`] if the replica is faulted, is not currently the primary, or
+    /// has not yet applied the required committed LSN locally.
+    pub fn enforce_primary_read(&self, required_lsn: Lsn) -> Result<(), NotPrimaryReadError> {
+        match self.status {
+            ReplicaNodeStatus::Active => {}
+            ReplicaNodeStatus::Faulted(_) => return Err(NotPrimaryReadError::ReplicaCrashed),
+        }
+
+        if self.metadata.role != ReplicaRole::Primary {
+            return Err(NotPrimaryReadError::Role(self.metadata.role));
+        }
+
+        self.engine
+            .as_ref()
+            .ok_or(NotPrimaryReadError::ReplicaCrashed)?
+            .enforce_read_fence(required_lsn)
+            .map_err(NotPrimaryReadError::Fence)
+    }
+
+    fn ensure_active(&self) -> Result<(), ReplicaProtocolError> {
+        match self.status {
+            ReplicaNodeStatus::Active => Ok(()),
+            status @ ReplicaNodeStatus::Faulted(_) => Err(ReplicaProtocolError::Inactive(status)),
+        }
+    }
+
+    fn require_role(&self, expected: ReplicaRole) -> Result<(), ReplicaProtocolError> {
+        self.ensure_active()?;
+        if self.metadata.role == expected {
+            Ok(())
+        } else {
+            Err(ReplicaProtocolError::RoleMismatch {
+                expected,
+                found: self.metadata.role,
+            })
+        }
+    }
+
+    fn ensure_normal_role(&self) -> Result<(), ReplicaProtocolError> {
+        self.ensure_active()?;
+        match self.metadata.role {
+            ReplicaRole::Primary | ReplicaRole::Backup => Ok(()),
+            found => Err(ReplicaProtocolError::RoleMismatch {
+                expected: ReplicaRole::Backup,
+                found,
+            }),
+        }
+    }
+
+    fn next_prepared_lsn(&self) -> Result<Lsn, ReplicaProtocolError> {
+        let last_lsn = self
+            .prepared_entries
+            .last_key_value()
+            .map(|(lsn, _)| Lsn(*lsn))
+            .or(self.metadata.commit_lsn);
+        match last_lsn {
+            Some(last_lsn) => last_lsn
+                .get()
+                .checked_add(1)
+                .map(Lsn)
+                .ok_or(ReplicaProtocolError::PrepareLsnExhausted { last_lsn }),
+            None => Ok(Lsn(1)),
+        }
+    }
+
+    fn persist_prepared_entries(&self) -> Result<(), ReplicaProtocolError> {
+        self.prepare_log_file
+            .write_entries(&self.prepared_entries)
+            .map_err(|error| ReplicaProtocolError::PrepareStorage(error.kind()))
+    }
+
+    fn engine_mut(&mut self) -> Result<&mut SingleNodeEngine, ReplicaProtocolError> {
+        self.ensure_active()?;
+        Ok(self
+            .engine
+            .as_mut()
+            .expect("active replica must keep one live engine"))
+    }
+
     fn active(
         metadata: ReplicaMetadata,
         metadata_file: ReplicaMetadataFile,
@@ -620,6 +982,8 @@ impl ReplicaNode {
         Self {
             metadata,
             metadata_file,
+            prepare_log_file: ReplicaPrepareLogFile::new(prepare_log_path(&paths.metadata_path)),
+            prepared_entries: BTreeMap::new(),
             paths,
             status: ReplicaNodeStatus::Active,
             engine: Some(engine),
@@ -635,6 +999,8 @@ impl ReplicaNode {
         Self {
             metadata,
             metadata_file,
+            prepare_log_file: ReplicaPrepareLogFile::new(prepare_log_path(&paths.metadata_path)),
+            prepared_entries: BTreeMap::new(),
             paths,
             status: ReplicaNodeStatus::Faulted(ReplicaFault { reason }),
             engine: None,
@@ -707,6 +1073,49 @@ fn validate_active_metadata(
             engine.active_snapshot_lsn(),
         )
         .map_err(ReplicaFaultReason::Validation)
+}
+
+pub(crate) fn prepare_log_path(metadata_path: &Path) -> PathBuf {
+    let mut path = metadata_path.to_path_buf();
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map_or_else(|| "prepare".to_owned(), |value| format!("{value}.prepare"));
+    path.set_extension(extension);
+    path
+}
+
+fn metadata_temp_path(path: &Path) -> PathBuf {
+    let mut temp_path = path.to_path_buf();
+    let extension = temp_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map_or_else(|| "tmp".to_owned(), |value| format!("{value}.tmp"));
+    temp_path.set_extension(extension);
+    temp_path
+}
+
+fn encode_prepare_log(entries: &BTreeMap<u64, ReplicaPreparedEntry>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&REPLICA_PREPARE_LOG_MAGIC);
+    bytes.push(REPLICA_PREPARE_LOG_VERSION);
+    bytes.extend_from_slice(
+        &u64::try_from(entries.len())
+            .expect("prepared entry count must fit u64")
+            .to_le_bytes(),
+    );
+    for entry in entries.values() {
+        bytes.extend_from_slice(&entry.view.to_le_bytes());
+        bytes.extend_from_slice(&entry.lsn.get().to_le_bytes());
+        bytes.extend_from_slice(&entry.request_slot.get().to_le_bytes());
+        bytes.extend_from_slice(
+            &u64::try_from(entry.payload.len())
+                .expect("prepared payload length must fit u64")
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&entry.payload);
+    }
+    bytes
 }
 
 fn encode_replica_metadata(metadata: &ReplicaMetadata) -> Vec<u8> {

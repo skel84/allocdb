@@ -19,8 +19,9 @@ pub use engine::{
     SubmissionErrorCategory, SubmissionResult,
 };
 pub use replica::{
-    DurableVote, RecoverReplicaError, ReplicaFault, ReplicaFaultReason, ReplicaId, ReplicaIdentity,
-    ReplicaMetadata, ReplicaMetadataDecodeError, ReplicaMetadataFile, ReplicaMetadataFileError,
-    ReplicaMetadataLoadError, ReplicaNode, ReplicaNodeStatus, ReplicaOpenError, ReplicaPaths,
-    ReplicaRole, ReplicaStartupValidationError,
+    DurableVote, NotPrimaryReadError, RecoverReplicaError, ReplicaFault, ReplicaFaultReason,
+    ReplicaId, ReplicaIdentity, ReplicaMetadata, ReplicaMetadataDecodeError, ReplicaMetadataFile,
+    ReplicaMetadataFileError, ReplicaMetadataLoadError, ReplicaNode, ReplicaNodeStatus,
+    ReplicaOpenError, ReplicaPaths, ReplicaPreparedEntry, ReplicaProtocolError, ReplicaRole,
+    ReplicaStartupValidationError,
 };

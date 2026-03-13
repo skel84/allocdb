@@ -212,9 +212,9 @@ codebase:
 - `explore_schedule`
 
 The harness already hosts three real `ReplicaNode`s with independent durable workspaces and one
-shared seeded slot driver. Protocol payloads remain opaque labels in this milestone; `M7-T03`
-layers real primary/backup message semantics onto the same deterministic queue and transcript
-surface.
+shared seeded slot driver. `M7-T03` upgrades that queue from opaque labels to real
+`prepare`/`prepare_ack`/`commit` payloads while keeping the same deterministic delivery,
+partition, crash, and replay surface.
 
 ### Network And Failure Model In Simulation
 

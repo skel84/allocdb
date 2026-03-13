@@ -1,10 +1,12 @@
 use std::fs;
 
+use allocdb_core::command::{ClientRequest, Command};
+use allocdb_core::command_codec::encode_client_request;
 use allocdb_core::config::Config;
-use allocdb_core::ids::Slot;
+use allocdb_core::ids::{ClientId, Lsn, OperationId, ResourceId, Slot};
 
 use crate::engine::EngineConfig;
-use crate::replica::{ReplicaId, ReplicaNodeStatus};
+use crate::replica::{NotPrimaryReadError, ReplicaId, ReplicaNodeStatus, ReplicaRole};
 use crate::replicated_simulation::{
     ClusterEndpoint, QueuedProtocolMessage, ReplicaObservation, ReplicaRuntimeStatus,
     ReplicatedScheduleAction, ReplicatedScheduleActionKind, ReplicatedScheduleObservation,
@@ -34,6 +36,16 @@ fn engine_config() -> EngineConfig {
 
 fn replica(replica_id: u64) -> ReplicaId {
     ReplicaId(replica_id)
+}
+
+fn create_payload(resource_id: u128, operation_id: u128) -> Vec<u8> {
+    encode_client_request(ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::CreateResource {
+            resource_id: ResourceId(resource_id),
+        },
+    })
 }
 
 fn queue_message(
@@ -164,6 +176,56 @@ fn delivered_message<'a>(
         } => (message, *recipient),
         other => panic!("expected delivered protocol message, got {other:?}"),
     }
+}
+
+fn primary_harness(name: &str, seed: u64) -> ReplicatedSimulationHarness {
+    let mut harness =
+        ReplicatedSimulationHarness::new(name, seed, core_config(), engine_config()).unwrap();
+    harness.configure_primary(replica(1), 1).unwrap();
+    harness
+}
+
+fn replica_last_applied_lsn(harness: &ReplicatedSimulationHarness, replica_id: u64) -> Option<Lsn> {
+    harness
+        .replica(replica(replica_id))
+        .unwrap()
+        .unwrap()
+        .engine()
+        .unwrap()
+        .db()
+        .last_applied_lsn()
+}
+
+fn replica_prepared_len(harness: &ReplicatedSimulationHarness, replica_id: u64) -> usize {
+    harness
+        .replica(replica(replica_id))
+        .unwrap()
+        .unwrap()
+        .prepared_len()
+}
+
+fn replica_has_resource(
+    harness: &ReplicatedSimulationHarness,
+    replica_id: u64,
+    resource_id: u128,
+) -> bool {
+    harness
+        .replica(replica(replica_id))
+        .unwrap()
+        .unwrap()
+        .engine()
+        .unwrap()
+        .db()
+        .resource(ResourceId(resource_id))
+        .is_some()
+}
+
+fn pending_labels(harness: &ReplicatedSimulationHarness) -> Vec<&str> {
+    harness
+        .pending_messages()
+        .iter()
+        .map(|message| message.label.as_str())
+        .collect()
 }
 
 #[test]
@@ -330,10 +392,10 @@ fn connectivity_matrix_controls_delivery_until_partition_heals() {
     assert!(matches!(
         blocked,
         ReplicatedSimulationError::MessageDeliveryBlocked {
-            label: "prepare-blocked",
+            label,
             from: ClusterEndpoint::Replica(source),
             to: ClusterEndpoint::Replica(target),
-        } if source == replica(1) && target == replica(2)
+        } if label == "prepare-blocked" && source == replica(1) && target == replica(2)
     ));
     assert_eq!(harness.pending_messages().len(), 1);
 
@@ -379,13 +441,13 @@ fn connectivity_matrix_controls_delivery_until_partition_heals() {
         .unwrap_err();
     assert!(matches!(
         missing_delivery,
-        ReplicatedSimulationError::MessageNotFound("unknown-label")
+        ReplicatedSimulationError::MessageNotFound(label) if label == "unknown-label"
     ));
 
     let missing_drop = harness.drop_protocol_message("unknown-label").unwrap_err();
     assert!(matches!(
         missing_drop,
-        ReplicatedSimulationError::MessageNotFound("unknown-label")
+        ReplicatedSimulationError::MessageNotFound(label) if label == "unknown-label"
     ));
 }
 
@@ -500,4 +562,109 @@ fn crash_and_restart_keep_replica_workspace_stable() {
         harness.replica(replica(2)).unwrap().unwrap().status(),
         ReplicaNodeStatus::Active
     );
+}
+
+#[test]
+fn quorum_write_publishes_after_majority_append_and_backups_wait_for_commit() {
+    let mut harness = primary_harness("replicated-quorum-write", 0x5a1);
+
+    let entry = harness
+        .client_submit(replica(1), Slot(1), &create_payload(11, 1), "client-create")
+        .unwrap();
+    assert_eq!(entry.view, 1);
+    assert_eq!(entry.lsn, Lsn(1));
+    assert_eq!(harness.published_result(entry.lsn), None);
+    assert_eq!(replica_prepared_len(&harness, 1), 1);
+    assert_eq!(replica_last_applied_lsn(&harness, 1), None);
+    assert_eq!(replica_last_applied_lsn(&harness, 2), None);
+    assert_eq!(replica_last_applied_lsn(&harness, 3), None);
+    assert_eq!(
+        pending_labels(&harness),
+        vec![
+            "client-create-prepare-1-to-2",
+            "client-create-prepare-1-to-3"
+        ]
+    );
+
+    harness
+        .deliver_protocol_message("client-create-prepare-1-to-2")
+        .unwrap();
+    assert_eq!(harness.published_result(entry.lsn), None);
+    assert_eq!(replica_prepared_len(&harness, 2), 1);
+    assert_eq!(replica_last_applied_lsn(&harness, 2), None);
+
+    harness
+        .deliver_protocol_message("client-create-prepare-1-to-2-ack")
+        .unwrap();
+    let committed = *harness
+        .published_result(entry.lsn)
+        .expect("primary should publish after majority append");
+    assert_eq!(committed.applied_lsn, entry.lsn);
+    assert_eq!(replica_last_applied_lsn(&harness, 1), Some(entry.lsn));
+    assert_eq!(replica_last_applied_lsn(&harness, 2), None);
+    assert_eq!(replica_last_applied_lsn(&harness, 3), None);
+    assert_eq!(replica_prepared_len(&harness, 1), 0);
+    assert_eq!(
+        pending_labels(&harness),
+        vec![
+            "client-create-prepare-1-to-3",
+            "commit-1-to-2",
+            "commit-1-to-3",
+        ]
+    );
+
+    harness.deliver_protocol_message("commit-1-to-2").unwrap();
+    assert_eq!(replica_last_applied_lsn(&harness, 2), Some(entry.lsn));
+    assert_eq!(replica_prepared_len(&harness, 2), 0);
+    assert_eq!(replica_last_applied_lsn(&harness, 3), None);
+
+    harness
+        .deliver_protocol_message("client-create-prepare-1-to-3")
+        .unwrap();
+    assert_eq!(replica_prepared_len(&harness, 3), 1);
+    assert_eq!(replica_last_applied_lsn(&harness, 3), None);
+    harness.deliver_protocol_message("commit-1-to-3").unwrap();
+    assert_eq!(replica_prepared_len(&harness, 3), 0);
+    assert_eq!(replica_last_applied_lsn(&harness, 3), Some(entry.lsn));
+    assert!(replica_has_resource(&harness, 1, 11));
+    assert!(replica_has_resource(&harness, 2, 11));
+    assert!(replica_has_resource(&harness, 3, 11));
+}
+
+#[test]
+fn reads_are_served_only_from_the_primary_after_local_commit() {
+    let mut harness = primary_harness("replicated-primary-read", 0x5a2);
+
+    let entry = harness
+        .client_submit(replica(1), Slot(1), &create_payload(21, 2), "read-create")
+        .unwrap();
+    let before_commit = harness.read_resource(replica(1), ResourceId(21), Some(entry.lsn));
+    assert!(matches!(
+        before_commit,
+        Err(ReplicatedSimulationError::Read(NotPrimaryReadError::Fence(
+            _
+        )))
+    ));
+
+    harness
+        .deliver_protocol_message("read-create-prepare-1-to-2")
+        .unwrap();
+    harness
+        .deliver_protocol_message("read-create-prepare-1-to-2-ack")
+        .unwrap();
+    harness.deliver_protocol_message("commit-1-to-2").unwrap();
+
+    let primary_read = harness
+        .read_resource(replica(1), ResourceId(21), Some(entry.lsn))
+        .unwrap()
+        .expect("primary should serve committed resource");
+    assert_eq!(primary_read.resource_id, ResourceId(21));
+
+    let backup_read = harness.read_resource(replica(2), ResourceId(21), Some(entry.lsn));
+    assert!(matches!(
+        backup_read,
+        Err(ReplicatedSimulationError::Read(NotPrimaryReadError::Role(
+            ReplicaRole::Backup
+        )))
+    ));
 }

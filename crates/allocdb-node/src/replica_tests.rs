@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use allocdb_core::command::{ClientRequest, Command};
+use allocdb_core::command_codec::encode_client_request;
 use allocdb_core::config::Config;
 use allocdb_core::ids::{ClientId, HolderId, Lsn, OperationId, ResourceId, Slot};
 
@@ -11,7 +12,7 @@ use crate::replica::{
     DurableVote, ReplicaFaultReason, ReplicaId, ReplicaIdentity, ReplicaMetadata,
     ReplicaMetadataDecodeError, ReplicaMetadataFile, ReplicaMetadataFileError,
     ReplicaMetadataLoadError, ReplicaNode, ReplicaNodeStatus, ReplicaPaths, ReplicaRole,
-    ReplicaStartupValidationError,
+    ReplicaStartupValidationError, prepare_log_path,
 };
 
 fn test_path(name: &str, extension: &str) -> PathBuf {
@@ -101,6 +102,7 @@ fn cleanup(paths: &ReplicaPaths) {
     remove_if_exists(&paths.metadata_path);
     remove_if_exists(&paths.snapshot_path);
     remove_if_exists(&paths.wal_path);
+    remove_if_exists(&prepare_log_path(&paths.metadata_path));
 }
 
 fn base_metadata() -> ReplicaMetadata {
@@ -199,6 +201,49 @@ fn replica_recover_bootstraps_metadata_from_local_durable_state() {
     assert_eq!(node.metadata().commit_lsn, Some(Lsn(2)));
     assert_eq!(node.metadata().active_snapshot_lsn, Some(Lsn(2)));
     assert!(node.engine().is_some());
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_prepare_and_commit_keep_apply_gated_by_commit() {
+    let paths = ReplicaPaths::new(
+        metadata_path("prepare-commit"),
+        snapshot_path("prepare-commit"),
+        wal_path("prepare-commit"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+
+    let payload = encode_client_request(create(11, 1));
+    let entry = node.prepare_client_request(Slot(1), &payload).unwrap();
+
+    assert_eq!(entry.view, 1);
+    assert_eq!(entry.lsn, Lsn(1));
+    assert_eq!(node.prepared_len(), 1);
+    assert_eq!(node.metadata().commit_lsn, None);
+    assert_eq!(node.engine().unwrap().db().last_applied_lsn(), None);
+    assert!(fs::metadata(node.prepare_log_path()).is_ok());
+
+    let committed = node
+        .commit_prepared_through(entry.lsn)
+        .unwrap()
+        .expect("commit should publish one result");
+    assert_eq!(committed.applied_lsn, entry.lsn);
+    assert_eq!(node.prepared_len(), 0);
+    assert_eq!(node.metadata().commit_lsn, Some(entry.lsn));
+    assert_eq!(
+        node.engine().unwrap().db().last_applied_lsn(),
+        Some(entry.lsn)
+    );
+    assert!(
+        node.engine()
+            .unwrap()
+            .db()
+            .resource(ResourceId(11))
+            .is_some()
+    );
 
     cleanup(&paths);
 }

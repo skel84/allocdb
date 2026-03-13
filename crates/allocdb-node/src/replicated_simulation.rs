@@ -1,16 +1,18 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use allocdb_core::config::Config;
-use allocdb_core::ids::{Lsn, Slot};
+use allocdb_core::ids::{Lsn, ResourceId, Slot};
+use allocdb_core::state_machine::ResourceRecord;
 use log::{debug, info, warn};
 
-use crate::engine::EngineConfig;
+use crate::engine::{EngineConfig, SubmissionResult};
 use crate::replica::{
-    RecoverReplicaError, ReplicaId, ReplicaIdentity, ReplicaNode, ReplicaNodeStatus,
-    ReplicaOpenError, ReplicaPaths, ReplicaRole,
+    NotPrimaryReadError, RecoverReplicaError, ReplicaId, ReplicaIdentity, ReplicaNode,
+    ReplicaNodeStatus, ReplicaOpenError, ReplicaPaths, ReplicaPreparedEntry, ReplicaProtocolError,
+    ReplicaRole, prepare_log_path,
 };
 use crate::simulation::{SimulatedSlotDriver, simulation_workspace_path};
 
@@ -44,11 +46,29 @@ pub(crate) struct ReplicaObservation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProtocolMessage {
+    Opaque,
+    Prepare {
+        entry: ReplicaPreparedEntry,
+    },
+    PrepareAck {
+        view: u64,
+        lsn: Lsn,
+        from: ReplicaId,
+    },
+    Commit {
+        view: u64,
+        commit_lsn: Lsn,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QueuedProtocolMessage {
     pub message_id: u64,
-    pub label: &'static str,
+    pub label: String,
     pub from: ReplicaId,
     pub to: ReplicaId,
+    pub payload: ProtocolMessage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,12 +145,19 @@ pub(crate) struct ReplicatedScheduleObservation {
 pub(crate) enum ReplicatedSimulationError {
     OpenReplica(ReplicaOpenError),
     RecoverReplica(RecoverReplicaError),
+    Protocol(ReplicaProtocolError),
+    Read(NotPrimaryReadError),
     UnknownReplica(ReplicaId),
+    NotConfiguredPrimary {
+        expected: Option<ReplicaId>,
+        found: ReplicaId,
+    },
+    PendingCommitNotFound(Lsn),
     ReplicaAlreadyCrashed(ReplicaId),
     ReplicaAlreadyRunning(ReplicaId),
-    MessageNotFound(&'static str),
+    MessageNotFound(String),
     MessageDeliveryBlocked {
-        label: &'static str,
+        label: String,
         from: ClusterEndpoint,
         to: ClusterEndpoint,
     },
@@ -143,8 +170,23 @@ impl fmt::Display for ReplicatedSimulationError {
             Self::RecoverReplica(error) => {
                 write!(formatter, "failed to recover replica: {error:?}")
             }
+            Self::Protocol(error) => write!(formatter, "replica protocol error: {error:?}"),
+            Self::Read(error) => write!(formatter, "replica read error: {error:?}"),
             Self::UnknownReplica(replica_id) => {
                 write!(formatter, "unknown replica: {}", replica_id.get())
+            }
+            Self::NotConfiguredPrimary { expected, found } => write!(
+                formatter,
+                "replica {} is not the configured primary {:?}",
+                found.get(),
+                expected.map(ReplicaId::get)
+            ),
+            Self::PendingCommitNotFound(lsn) => {
+                write!(
+                    formatter,
+                    "pending primary commit not found for lsn {}",
+                    lsn.get()
+                )
             }
             Self::ReplicaAlreadyCrashed(replica_id) => {
                 write!(formatter, "replica {} is already crashed", replica_id.get())
@@ -164,6 +206,18 @@ impl fmt::Display for ReplicatedSimulationError {
 }
 
 impl std::error::Error for ReplicatedSimulationError {}
+
+impl From<ReplicaProtocolError> for ReplicatedSimulationError {
+    fn from(error: ReplicaProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+impl From<NotPrimaryReadError> for ReplicatedSimulationError {
+    fn from(error: NotPrimaryReadError) -> Self {
+        Self::Read(error)
+    }
+}
 
 #[derive(Debug)]
 struct HarnessReplica {
@@ -201,6 +255,14 @@ struct ResolvedReplicatedAction {
 }
 
 #[derive(Debug)]
+struct PendingPrimaryCommit {
+    primary: ReplicaId,
+    entry: ReplicaPreparedEntry,
+    acked_replicas: BTreeSet<u64>,
+    committed: bool,
+}
+
+#[derive(Debug)]
 pub(crate) struct ReplicatedSimulationHarness {
     slot_driver: SimulatedSlotDriver,
     core_config: Config,
@@ -208,6 +270,9 @@ pub(crate) struct ReplicatedSimulationHarness {
     replicas: Vec<HarnessReplica>,
     connectivity: ConnectivityMatrix,
     pending_messages: Vec<QueuedProtocolMessage>,
+    configured_primary: Option<ReplicaId>,
+    pending_commits: BTreeMap<u64, PendingPrimaryCommit>,
+    published_results: BTreeMap<u64, SubmissionResult>,
     next_message_id: u64,
 }
 
@@ -251,6 +316,9 @@ impl ReplicatedSimulationHarness {
             replicas,
             connectivity: ConnectivityMatrix::fully_connected(),
             pending_messages: Vec::new(),
+            configured_primary: None,
+            pending_commits: BTreeMap::new(),
+            published_results: BTreeMap::new(),
             next_message_id: 1,
         })
     }
@@ -306,6 +374,101 @@ impl ReplicatedSimulationHarness {
         &self.pending_messages
     }
 
+    pub(crate) fn configure_primary(
+        &mut self,
+        replica_id: ReplicaId,
+        view: u64,
+    ) -> Result<(), ReplicatedSimulationError> {
+        for index in 0..self.replicas.len() {
+            let current_replica_id = self.replicas[index].identity.replica_id;
+            let role = if self.replicas[index].identity.replica_id == replica_id {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::Backup
+            };
+            let node = self.replicas[index].node.as_mut().ok_or(
+                ReplicatedSimulationError::ReplicaAlreadyCrashed(current_replica_id),
+            )?;
+            node.configure_normal_role(view, role)?;
+        }
+        self.configured_primary = Some(replica_id);
+        Ok(())
+    }
+
+    pub(crate) fn client_submit(
+        &mut self,
+        primary: ReplicaId,
+        request_slot: Slot,
+        payload: &[u8],
+        label_prefix: &str,
+    ) -> Result<ReplicaPreparedEntry, ReplicatedSimulationError> {
+        if self.configured_primary != Some(primary) {
+            return Err(ReplicatedSimulationError::NotConfiguredPrimary {
+                expected: self.configured_primary,
+                found: primary,
+            });
+        }
+
+        let entry = self
+            .replica_entry_mut(primary)?
+            .node
+            .as_mut()
+            .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(primary))?
+            .prepare_client_request(request_slot, payload)?;
+        self.pending_commits.insert(
+            entry.lsn.get(),
+            PendingPrimaryCommit {
+                primary,
+                entry: entry.clone(),
+                acked_replicas: BTreeSet::from([primary.get()]),
+                committed: false,
+            },
+        );
+
+        let backup_ids = self
+            .replicas
+            .iter()
+            .map(|replica| replica.identity.replica_id)
+            .filter(|replica_id| *replica_id != primary)
+            .collect::<Vec<_>>();
+        for backup_id in backup_ids {
+            let message_label = format!(
+                "{label_prefix}-prepare-{}-to-{}",
+                entry.lsn.get(),
+                backup_id.get()
+            );
+            self.queue_protocol_message_with_payload(
+                primary,
+                backup_id,
+                message_label,
+                ProtocolMessage::Prepare {
+                    entry: entry.clone(),
+                },
+            )?;
+        }
+
+        Ok(entry)
+    }
+
+    pub(crate) fn published_result(&self, lsn: Lsn) -> Option<&SubmissionResult> {
+        self.published_results.get(&lsn.get())
+    }
+
+    pub(crate) fn read_resource(
+        &self,
+        replica_id: ReplicaId,
+        resource_id: ResourceId,
+        required_lsn: Option<Lsn>,
+    ) -> Result<Option<ResourceRecord>, ReplicatedSimulationError> {
+        let node = self
+            .replica(replica_id)?
+            .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(replica_id))?;
+        node.enforce_primary_read(required_lsn.unwrap_or(Lsn(0)))?;
+        Ok(node
+            .engine()
+            .and_then(|engine| engine.db().resource(resource_id)))
+    }
+
     pub(crate) fn connectivity_allows(
         &self,
         from: ClusterEndpoint,
@@ -334,6 +497,21 @@ impl ReplicatedSimulationHarness {
         to: ReplicaId,
         message_label: &'static str,
     ) -> Result<ReplicatedScheduleObservationKind, ReplicatedSimulationError> {
+        self.queue_protocol_message_with_payload(
+            from,
+            to,
+            message_label.to_owned(),
+            ProtocolMessage::Opaque,
+        )
+    }
+
+    fn queue_protocol_message_with_payload(
+        &mut self,
+        from: ReplicaId,
+        to: ReplicaId,
+        message_label: String,
+        payload: ProtocolMessage,
+    ) -> Result<ReplicatedScheduleObservationKind, ReplicatedSimulationError> {
         let _ = self.replica_entry(from)?;
         let _ = self.replica_entry(to)?;
         if self.replica_observation(from)?.runtime_status == ReplicaRuntimeStatus::Crashed {
@@ -350,6 +528,7 @@ impl ReplicatedSimulationHarness {
             label: message_label,
             from,
             to,
+            payload,
         };
         self.next_message_id += 1;
         self.pending_messages.push(message.clone());
@@ -367,7 +546,7 @@ impl ReplicatedSimulationHarness {
 
     pub(crate) fn deliver_protocol_message(
         &mut self,
-        message_label: &'static str,
+        message_label: &str,
     ) -> Result<ReplicatedScheduleObservationKind, ReplicatedSimulationError> {
         let index = self.pending_message_index(message_label)?;
         let message = self.pending_messages[index].clone();
@@ -375,18 +554,18 @@ impl ReplicatedSimulationHarness {
         let to = ClusterEndpoint::Replica(message.to);
         if !self.connectivity_allows(from, to)? {
             return Err(ReplicatedSimulationError::MessageDeliveryBlocked {
-                label: message_label,
+                label: message_label.to_owned(),
                 from,
                 to,
             });
         }
-
-        let recipient = self.replica_observation(message.to)?;
-        if recipient.runtime_status == ReplicaRuntimeStatus::Crashed {
+        if self.replica_observation(message.to)?.runtime_status == ReplicaRuntimeStatus::Crashed {
             return Err(ReplicatedSimulationError::ReplicaAlreadyCrashed(message.to));
         }
 
         self.pending_messages.remove(index);
+        self.apply_protocol_message(&message)?;
+        let recipient = self.replica_observation(message.to)?;
         log_protocol_message_event(
             "ProtocolMessageDelivered",
             &message,
@@ -404,7 +583,7 @@ impl ReplicatedSimulationHarness {
 
     pub(crate) fn drop_protocol_message(
         &mut self,
-        message_label: &'static str,
+        message_label: &str,
     ) -> Result<ReplicatedScheduleObservationKind, ReplicatedSimulationError> {
         let index = self.pending_message_index(message_label)?;
         let message = self.pending_messages.remove(index);
@@ -418,6 +597,120 @@ impl ReplicatedSimulationHarness {
             message,
             pending_messages: self.pending_messages.len(),
         })
+    }
+
+    fn apply_protocol_message(
+        &mut self,
+        message: &QueuedProtocolMessage,
+    ) -> Result<(), ReplicatedSimulationError> {
+        match &message.payload {
+            ProtocolMessage::Opaque => Ok(()),
+            ProtocolMessage::Prepare { entry } => {
+                self.replica_entry_mut(message.to)?
+                    .node
+                    .as_mut()
+                    .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(message.to))?
+                    .append_prepared_entry(entry.clone())?;
+                let ack_label = format!("{}-ack", message.label);
+                self.queue_protocol_message_with_payload(
+                    message.to,
+                    message.from,
+                    ack_label,
+                    ProtocolMessage::PrepareAck {
+                        view: entry.view,
+                        lsn: entry.lsn,
+                        from: message.to,
+                    },
+                )?;
+                Ok(())
+            }
+            ProtocolMessage::PrepareAck { view, lsn, from } => {
+                self.handle_prepare_ack(message.to, *view, *lsn, *from)
+            }
+            ProtocolMessage::Commit { view, commit_lsn } => {
+                let node = self
+                    .replica_entry_mut(message.to)?
+                    .node
+                    .as_mut()
+                    .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(message.to))?;
+                if node.metadata().current_view != *view {
+                    return Err(ReplicaProtocolError::ViewMismatch {
+                        expected: node.metadata().current_view,
+                        found: *view,
+                    }
+                    .into());
+                }
+                node.commit_prepared_through(*commit_lsn)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_prepare_ack(
+        &mut self,
+        primary: ReplicaId,
+        view: u64,
+        lsn: Lsn,
+        from: ReplicaId,
+    ) -> Result<(), ReplicatedSimulationError> {
+        let mut commit_view = None;
+        {
+            let pending = self
+                .pending_commits
+                .get_mut(&lsn.get())
+                .ok_or(ReplicatedSimulationError::PendingCommitNotFound(lsn))?;
+            if pending.primary != primary {
+                return Err(ReplicatedSimulationError::NotConfiguredPrimary {
+                    expected: Some(pending.primary),
+                    found: primary,
+                });
+            }
+            if pending.entry.view != view {
+                return Err(ReplicaProtocolError::ViewMismatch {
+                    expected: pending.entry.view,
+                    found: view,
+                }
+                .into());
+            }
+            pending.acked_replicas.insert(from.get());
+            if !pending.committed && pending.acked_replicas.len() >= majority_quorum() {
+                commit_view = Some(pending.entry.view);
+            }
+        }
+
+        if let Some(commit_view) = commit_view {
+            let result = self
+                .replica_entry_mut(primary)?
+                .node
+                .as_mut()
+                .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(primary))?
+                .commit_prepared_through(lsn)?
+                .expect("primary quorum commit must publish one result");
+            self.published_results.insert(lsn.get(), result);
+            if let Some(pending) = self.pending_commits.get_mut(&lsn.get()) {
+                pending.committed = true;
+            }
+            let backup_ids = self
+                .replicas
+                .iter()
+                .map(|replica| replica.identity.replica_id)
+                .filter(|replica_id| *replica_id != primary)
+                .collect::<Vec<_>>();
+            for backup_id in backup_ids {
+                let commit_label = format!("commit-{}-to-{}", lsn.get(), backup_id.get());
+                self.queue_protocol_message_with_payload(
+                    primary,
+                    backup_id,
+                    commit_label,
+                    ProtocolMessage::Commit {
+                        view: commit_view,
+                        commit_lsn: lsn,
+                    },
+                )?;
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) fn crash_replica(
@@ -579,12 +872,12 @@ impl ReplicatedSimulationHarness {
 
     fn pending_message_index(
         &self,
-        message_label: &'static str,
+        message_label: &str,
     ) -> Result<usize, ReplicatedSimulationError> {
         self.pending_messages
             .iter()
             .position(|message| message.label == message_label)
-            .ok_or(ReplicatedSimulationError::MessageNotFound(message_label))
+            .ok_or_else(|| ReplicatedSimulationError::MessageNotFound(message_label.to_owned()))
     }
 
     fn endpoint_index(
@@ -630,6 +923,7 @@ impl Drop for ReplicatedSimulationHarness {
             remove_if_exists(&replica.paths.wal_path);
             remove_if_exists(&replica.paths.snapshot_path);
             remove_if_exists(&replica.paths.metadata_path);
+            remove_if_exists(&prepare_log_path(&replica.paths.metadata_path));
             remove_if_exists(&metadata_temp_path(&replica.paths.metadata_path));
         }
     }
@@ -643,6 +937,10 @@ fn metadata_temp_path(path: &Path) -> PathBuf {
         .map_or_else(|| "tmp".to_owned(), |value| format!("{value}.tmp"));
     temp_path.set_extension(extension);
     temp_path
+}
+
+const fn majority_quorum() -> usize {
+    (REPLICA_COUNT / 2) + 1
 }
 
 fn log_protocol_message_event(
