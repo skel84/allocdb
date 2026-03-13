@@ -268,7 +268,7 @@ That means:
 - a newly elected primary must inspect overdue reservations after it is in normal mode and append
   any needed `expire` commands through the replicated log
 
-Logical time therefore remains an input to the leader-controlled scheduler, not a follower-side
+Logical time therefore remains an input to the primary-controlled scheduler, not a follower-side
 state-machine dependency.
 
 ## Safety Invariants
