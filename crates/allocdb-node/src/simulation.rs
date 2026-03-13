@@ -134,7 +134,7 @@ impl SimulatedSlotDriver {
         self.scheduler.next_index(len)
     }
 
-    fn choose_index(&mut self, len: usize) -> usize {
+    pub(crate) fn choose_index(&mut self, len: usize) -> usize {
         assert!(len > 0, "scheduler requires at least one candidate");
         if len == 1 {
             0
@@ -447,7 +447,7 @@ impl Drop for SimulationHarness {
     }
 }
 
-fn simulation_workspace_path(name: &str, seed: u64) -> PathBuf {
+pub(crate) fn simulation_workspace_path(name: &str, seed: u64) -> PathBuf {
     let workspace_id = NEXT_SIMULATION_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
     let process_id = std::process::id();
     std::env::temp_dir().join(format!(
