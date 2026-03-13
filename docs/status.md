@@ -14,7 +14,7 @@
   - `M3` submission pipeline: implemented
   - `M4` simulation: implemented
   - `M5` single-node alpha surface: implemented
-  - `M6` replication design: in progress
+  - `M6` replication design: implemented
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -86,8 +86,9 @@
 - Replicated validation planning:
   - deterministic cluster-simulation plan that extends seeded simulation to partitions, primary
     crash, and rejoin without a mock semantics layer
-  - explicit promotion path from one-shard cluster harness to replicated failover and catch-up
-    coverage before Jepsen
+  - Jepsen gate with explicit contention, ambiguity, failover, and expiration workloads
+  - retry-aware history interpretation and release-blocking invariants for duplicate execution,
+    stale successful reads, double allocation, and early reuse
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -133,10 +134,10 @@
 
 ## Current Focus
 
-- `M6-T03`: define the Jepsen gate for any replicated release on top of the protocol draft and
-  replicated simulation plan
-- keep `docs/status.md`, `docs/testing.md`, and `docs/replication.md` aligned as replication
-  design work becomes more concrete
+- the current roadmap queue has no open planned issues after `M6-T03`
+- if replicated implementation begins, open a new tracked milestone and keep `docs/testing.md` and
+  `docs/replication.md` authoritative for validation and protocol rules
+- keep `docs/status.md` aligned when new post-M6 work is planned
 
 ## How To Check Progress
 

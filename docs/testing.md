@@ -292,22 +292,160 @@ The recommended implementation sequence is:
 This keeps the first replicated simulator narrow enough to validate protocol behavior before
 expanding into broader randomized search.
 
-## External Validation
+## Jepsen Validation Gate
 
-Before any replicated release, AllocDB should add a Jepsen-style external validation stage.
+`M6-T03` defines the external validation required before any replicated release.
 
-That stage should verify:
+### Design Goal
 
-- linearizable command behavior
-- behavior under network partition and process crash
-- indefinite client outcomes and retry semantics
-- failover and recovery semantics
+Jepsen should answer a different question than deterministic simulation:
 
-Jepsen is not a substitute for simulation. It is the outer validation layer after deterministic
-simulation and fault injection already exist.
+```text
+does the deployed replicated system preserve the client contract under real network faults and client-visible ambiguity?
+```
 
-See [replication.md](./replication.md) for the protocol draft and this section for the deterministic
-replicated-simulation gate that must exist before Jepsen is credible.
+Deterministic simulation proves protocol behavior against explicit schedules. Jepsen validates the
+same contract through the real client surface, real routing mistakes, real timeout behavior, and
+real failover and recovery timing.
+
+### Minimum Testbed
+
+The first Jepsen gate should target the same narrow release shape as the replication draft:
+
+- one shard
+- `3` replicas
+- fixed membership
+- the real external API planned for the replicated release
+- clients that preserve `operation_id` across retries
+- a pre-created bounded resource set large enough to force contention and expiration
+- logical-slot advancement and `tick_expirations` driven through the public or operator-facing
+  surface, not simulator internals
+
+`5`-replica clusters, online reconfiguration, and multi-shard behavior are follow-on work, not
+part of the first Jepsen gate.
+
+### Required Workload Families
+
+Every release candidate should run these workload families.
+
+#### Reservation Contention
+
+- many clients reserve, confirm, and release from a hot resource set
+- duplicate retries and conflicting `operation_id` reuse are injected deliberately
+- reads sample resource and reservation state during load
+
+Checks:
+
+- successful operations remain linearizable
+- no resource is committed to two holders at once
+- one `operation_id` never produces two successful executions
+
+#### Ambiguous Write Retry
+
+- crash or isolate the primary around quorum-commit boundaries for `reserve`, `confirm`, and
+  `release`
+- let clients observe timeouts or indefinite write outcomes, then force retries with the same
+  `operation_id`
+
+Checks:
+
+- an ambiguous write resolves to at most one committed result
+- retry returns the original committed result after failover when the first attempt already
+  committed
+- unresolved ambiguity after cleanup fails the gate
+
+#### Failover And Read Fences
+
+- mix writes with `required_lsn` reads while primaries fail, elections run, and some clients route
+  to stale nodes
+- keep both read-only traffic and read-after-write traffic active during failover
+
+Checks:
+
+- successful reads come only from the current primary after the requested `required_lsn` is
+  locally applied
+- stale or quorum-lost replicas fail closed instead of serving stale success
+- committed state remains linearizable across primary change
+
+#### Expiration And Recovery
+
+- create expiring reservations, advance logical time, call `tick_expirations`, and combine that
+  load with crash, partition, restart, and rejoin
+- force rejoin after stale state, suffix catch-up, and snapshot-plus-suffix recovery paths
+
+Checks:
+
+- expiration may be delayed by failover but never frees a resource early
+- restarted and rejoined replicas converge on committed history before serving or voting
+- recovery preserves the same client-visible result for retried operations
+
+### Nemesis Families
+
+The first Jepsen gate should explicitly cover:
+
+- primary crash and restart
+- majority-loss and minority-loss partitions plus heal
+- stale-primary isolation with client misrouting to the old primary
+- backup crash during catch-up and later rejoin
+- mixed crash-plus-partition schedules around ambiguous writes
+
+Clock skew, disk corruption, membership change, and multi-shard faults are not part of the first
+Jepsen gate. Those are either already covered by deterministic simulation and local durability
+testing or deferred until later replicated milestones.
+
+### History Interpretation
+
+Jepsen must interpret AllocDB histories using the product's retry contract, not a generic
+"exactly once" assumption.
+
+Rules:
+
+- every mutating client operation carries a stable `operation_id`
+- definite successes and definite failures enter the history directly
+- timeouts, transport loss, and other indefinite outcomes are recorded as ambiguous client events,
+  not as silent success or failure
+- the checker folds an ambiguous event and all later retries with the same `operation_id` into one
+  logical command
+- cleanup retries every ambiguous command within the dedupe window; any ambiguity that remains
+  unresolved after cleanup fails the gate
+- fail-closed read rejection from stale or quorum-lost replicas is an allowed outcome; stale
+  successful read is not
+
+### Required Checkers
+
+The Jepsen analysis should include at least:
+
+- a linearizability checker over successful writes and successful reads
+- an `operation_id` uniqueness checker that rejects duplicate committed execution
+- a resource-safety checker that rejects double allocation
+- a strict-read fence checker for successful `required_lsn` reads
+- an expiration-safety checker that rejects early reuse
+
+### Release Gate
+
+Jepsen is not a substitute for simulation. The deterministic replicated-simulation gate must pass
+before Jepsen begins.
+
+The minimum release gate for the first replicated version is:
+
+- one control run for each workload family with no nemesis
+- one crash-restart run for each workload family
+- one partition-heal run for each workload family
+- one mixed failover run for the ambiguity, failover, and expiration workloads
+- every faulted run lasts at least `30` minutes after the first injected fault
+- every run archives Jepsen history, client logs, replica logs, and a cluster-timeline summary
+
+Any of these outcomes blocks release:
+
+- linearizability violation
+- duplicate committed execution for one `operation_id`
+- double allocation
+- stale successful read from a non-primary or under-applied replica
+- early resource reuse after expiration
+- unresolved ambiguous client outcome after retry cleanup
+
+See [replication.md](./replication.md) for the protocol draft and the replicated-simulation
+section above for the deterministic pre-Jepsen gate.
 
 ## Research Influence
 

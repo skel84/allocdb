@@ -1048,11 +1048,12 @@ Goal:
 
 Blocked by:
 
-- M6-T01
+- M6-T02
 
 Acceptance criteria:
 
 - covers client ambiguity, failover, recovery, and linearizable behavior
+- workloads and invariants are explicit and tied to replicated semantics
 
 Test evidence:
 
