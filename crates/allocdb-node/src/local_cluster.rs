@@ -502,6 +502,10 @@ fn reserve_loopback_addr(
     seen_addrs: &mut HashSet<SocketAddr>,
 ) -> Result<SocketAddr, LocalClusterLayoutError> {
     loop {
+        // This is intentionally only a local-runner helper: the address is reserved by probing a
+        // loopback listener and then immediately released before the child process binds it for
+        // real. That leaves a small TOCTOU window, which is acceptable for the local three-replica
+        // runner but not for a production-grade allocator of externally visible listeners.
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let addr = listener.local_addr()?;
         drop(listener);
@@ -676,6 +680,9 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), std::io::Erro
     file.sync_all()?;
     drop(file);
     fs::rename(&temp_path, path)?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -766,7 +773,8 @@ where
         })
 }
 
-fn encode_role(role: ReplicaRole) -> &'static str {
+#[must_use]
+pub fn encode_role(role: ReplicaRole) -> &'static str {
     match role {
         ReplicaRole::Primary => "primary",
         ReplicaRole::Backup => "backup",

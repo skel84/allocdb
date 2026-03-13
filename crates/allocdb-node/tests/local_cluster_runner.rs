@@ -56,7 +56,7 @@ impl Drop for ClusterGuard {
 #[test]
 fn local_cluster_runner_starts_stops_and_reuses_stable_layout() {
     let workspace_root = temp_workspace("smoke");
-    let guard = ClusterGuard::new(workspace_root.clone());
+    let _guard = ClusterGuard::new(workspace_root.clone());
 
     let start_output = run_cluster_command(&workspace_root, "start");
     assert_success(&start_output, "initial cluster start");
@@ -115,5 +115,4 @@ fn local_cluster_runner_starts_stops_and_reuses_stable_layout() {
 
     let final_stop_output = run_cluster_command(&workspace_root, "stop");
     assert_success(&final_stop_output, "final cluster stop");
-    drop(guard);
 }

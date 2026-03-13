@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use allocdb_core::ids::Slot;
 use allocdb_node::local_cluster::{
     ControlRequest, LocalClusterLayout, LocalClusterReplicaConfig, ReplicaRuntimeState,
-    ReplicaRuntimeStatus, encode_control_ack, encode_control_error, encode_status_response,
-    layout_path, parse_control_request, request_control_status, request_control_stop,
+    ReplicaRuntimeStatus, encode_control_ack, encode_control_error, encode_role,
+    encode_status_response, layout_path, parse_control_request, request_control_status,
+    request_control_stop,
 };
 use allocdb_node::replica::{
     ReplicaId, ReplicaIdentity, ReplicaNode, ReplicaNodeStatus, ReplicaRole,
@@ -351,6 +352,8 @@ fn handle_control_stream(
     replica: &LocalClusterReplicaConfig,
 ) -> Result<bool, String> {
     let mut request = String::new();
+    // The control protocol is one request per connection. request_control_* half-closes the write
+    // side after sending the command, so reading to EOF here yields the complete request body.
     stream
         .read_to_string(&mut request)
         .map_err(|error| format!("failed to read control request: {error}"))?;
@@ -671,16 +674,6 @@ fn display_optional_startup_kind(
         Some(allocdb_node::engine::RecoveryStartupKind::SnapshotOnly) => "snapshot_only",
         Some(allocdb_node::engine::RecoveryStartupKind::SnapshotAndWal) => "snapshot_and_wal",
         None => "none",
-    }
-}
-
-fn encode_role(role: ReplicaRole) -> &'static str {
-    match role {
-        ReplicaRole::Primary => "primary",
-        ReplicaRole::Backup => "backup",
-        ReplicaRole::ViewUncertain => "view_uncertain",
-        ReplicaRole::Recovering => "recovering",
-        ReplicaRole::Faulted => "faulted",
     }
 }
 
