@@ -3,9 +3,7 @@
 ## Current State
 
 - Phase: replicated implementation
-- Planning IDs:
-  - tasks use `M#-T#`
-  - spikes use `M#-S#`
+- Planning IDs: tasks use `M#-T#`; spikes use `M#-S#`
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
   - `M1` pure state machine: implemented
@@ -16,7 +14,7 @@
   - `M5` single-node alpha surface: implemented
   - `M6` replication design: implemented
   - `M7` replicated core prototype: in progress
-  - `M8` external cluster validation: planned
+  - `M8` external cluster validation: in progress
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -53,7 +51,10 @@
     deterministic partition and primary-crash scenarios that prove minority-partition catch-up,
     full-split fail-closed behavior, pre-quorum retry replay, majority-appended failover
     reconstruction, prepared-suffix recovery from another voter during takeover, and post-reply
-    retry/read preservation on the new primary
+    retry/read preservation on the new primary, and the first multi-process local cluster runner
+    with one persisted `cluster-layout.txt`, stable three-replica workspaces, per-replica pid and
+    log files, reserved loopback addresses, and a smoke-tested `start`/`status`/`stop` command
+    surface that preserves replica identity and on-disk layout across restart
 
 ## What Exists
 
@@ -97,8 +98,8 @@
   - bounded `tick_expirations` maintenance request for live TTL enforcement
   - metrics exposure through the same API boundary
 - Operator documentation:
-  - operator-facing runbook for single-node startup, restart, checkpoint, overload, expiration
-    maintenance, and corruption/fail-closed handling
+  - operator-facing runbook for the single-node alpha and local replicated cluster runner,
+    including workspace layout plus start/stop/status usage and current control-hook limits
 - Replication design draft:
   - VSR-style primary/backup replicated log with fixed membership and majority quorums
   - primary-only reads in the first replicated release
@@ -123,6 +124,11 @@
   - durable prepared-entry sidecar for pre-commit replicated client commands
   - prepare append, commit-through, and strict primary-read guards built around the existing
     single-node executor rather than a second apply path
+- Local multi-process cluster runner:
+  - CLI entrypoint at `cargo run -p allocdb-node --bin allocdb-local-cluster -- <start|stop|status> --workspace <path>` with one persisted `cluster-layout.txt`
+  - stable replica identities, local bounds, and three external replica processes from one command surface
+  - per-replica loopback `control`, `client`, and `protocol` listeners with `status` and `stop` hooks on `control`
+  - per-replica pid, log, WAL, snapshot, metadata, and prepared-log paths exposed through `status`, with restart through the real `ReplicaNode::recover` path and stable durable workspace reuse
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -182,25 +188,19 @@
     primary crash after reply, suffix-only rejoin, snapshot-transfer rejoin, and faulted rejoin
     rejection
 - Validation:
-  - `cargo test -p allocdb-core wal -- --nocapture`
-  - `cargo test -p allocdb-core snapshot -- --nocapture`
-  - `cargo test -p allocdb-core recovery -- --nocapture`
-  - `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
-  - `cargo test -p allocdb-node api_reservation_reports_retired_history`
-  - `cargo test -p allocdb-node engine -- --nocapture`
-  - `cargo test -p allocdb-node replica -- --nocapture`
-  - `cargo test -p allocdb-node simulation -- --nocapture`
-  - `cargo test -p allocdb-node replicated_simulation -- --nocapture`
-  - `cargo run -p allocdb-bench -- --scenario all`
-  - `scripts/preflight.sh`
+  - core durability: `cargo test -p allocdb-core wal -- --nocapture`, `cargo test -p allocdb-core snapshot -- --nocapture`, `cargo test -p allocdb-core recovery -- --nocapture`, `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
+  - node runtime: `cargo test -p allocdb-node api_reservation_reports_retired_history`, `cargo test -p allocdb-node engine -- --nocapture`, `cargo test -p allocdb-node replica -- --nocapture`
+  - simulation: `cargo test -p allocdb-node simulation -- --nocapture`, `cargo test -p allocdb-node replicated_simulation -- --nocapture`
+  - local cluster and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo run -p allocdb-bench -- --scenario all`
+  - repo gate: `scripts/preflight.sh`
 
 ## Current Focus
 
-- `M7-T06` is implemented on this branch; the next execution target is `M8-T01`
-- keep the replicated prototype stable while moving the next validation layer out to the
-  multi-process local cluster runner and later Jepsen work
-- preserve the narrow rejoin contract: suffix-only catch-up when retained WAL covers the target’s
-  durable prefix, snapshot transfer otherwise, and fail-closed handling for faulted replicas
+- `M8-T01` is implemented on this branch; the next execution target is `M8-T02`
+- build the first fault-control harness on top of the new local cluster layout and control sockets
+- keep the local runner narrow: preserve stable identities, addresses, and durable workspaces
+- keep the replicated prototype stable while extending the external harness, with suffix-only catch-up when retained WAL still covers the target’s durable prefix, snapshot transfer otherwise, and fail-closed handling for faulted replicas
+- follow `M8-T02` with the local QEMU testbed and Jepsen gate after process and network faults become scriptable
 
 ## How To Check Progress
 
