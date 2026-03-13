@@ -340,9 +340,9 @@ struct ProcessedSubmission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct DueExpiration {
-    deadline_slot: Slot,
-    reservation_id: ReservationId,
+pub(crate) struct DueExpiration {
+    pub(crate) deadline_slot: Slot,
+    pub(crate) reservation_id: ReservationId,
 }
 
 #[derive(Debug)]
@@ -624,9 +624,14 @@ impl SingleNodeEngine {
 
         let due = self.collect_due_expirations(current_wall_clock_slot);
         let expiration_request_slot = self.expiration_request_slot(current_wall_clock_slot);
+        let mut remaining_due = self.config.max_expirations_per_tick;
         let mut processed_count = 0_u32;
         let mut last_applied_lsn = None;
         for target in due {
+            if remaining_due == 0 {
+                break;
+            }
+            remaining_due -= 1;
             let result = self.apply_internal_command(
                 expiration_request_slot,
                 Command::Expire {
@@ -807,9 +812,12 @@ impl SingleNodeEngine {
         }))
     }
 
-    fn collect_due_expirations(&self, current_wall_clock_slot: Slot) -> Vec<DueExpiration> {
-        // Scan the full wheel so delayed ticks catch up on overdue expirations, then truncate to
-        // the configured per-tick bound before committing internal expire commands.
+    pub(crate) fn collect_due_expirations(
+        &self,
+        current_wall_clock_slot: Slot,
+    ) -> Vec<DueExpiration> {
+        // Scan the full wheel so delayed ticks catch up on overdue expirations. The caller decides
+        // how many due expirations to commit once the candidate set is known.
         let mut due = Vec::new();
         for bucket in 0..self.db.config().wheel_len() {
             let bucket_slot = Slot(u64::try_from(bucket).expect("wheel bucket index must fit u64"));
@@ -833,19 +841,35 @@ impl SingleNodeEngine {
         }
 
         due.sort_unstable();
-        due.truncate(
-            usize::try_from(self.config.max_expirations_per_tick)
-                .expect("validated max_expirations_per_tick must fit usize"),
-        );
         due
     }
 
-    fn expiration_request_slot(&self, current_wall_clock_slot: Slot) -> Slot {
+    pub(crate) fn expiration_request_slot(&self, current_wall_clock_slot: Slot) -> Slot {
         self.db
             .last_request_slot()
             .map_or(current_wall_clock_slot, |last_request_slot| {
                 Slot(current_wall_clock_slot.get().max(last_request_slot.get()))
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn max_expirations_per_tick(&self) -> u32 {
+        self.config.max_expirations_per_tick
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_due_expiration(
+        &mut self,
+        request_slot: Slot,
+        target: DueExpiration,
+    ) -> Result<SubmissionResult, SubmissionError> {
+        self.apply_internal_command(
+            request_slot,
+            Command::Expire {
+                reservation_id: target.reservation_id,
+                deadline_slot: target.deadline_slot,
+            },
+        )
     }
 
     fn apply_internal_command(

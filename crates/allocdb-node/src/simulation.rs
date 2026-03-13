@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use allocdb_core::command::ClientRequest;
 use allocdb_core::config::Config;
-use allocdb_core::ids::{Lsn, OperationId, Slot};
+use allocdb_core::ids::{Lsn, OperationId, ReservationId, Slot};
 use allocdb_core::result::ResultCode;
 
 use crate::engine::{
@@ -33,6 +33,48 @@ pub(crate) struct SimulationObservation {
     pub operation_id: OperationId,
     pub applied_lsn: Lsn,
     pub result_code: ResultCode,
+    pub from_retry_cache: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExpirationObservation {
+    pub reservation_id: ReservationId,
+    pub deadline_slot: Slot,
+    pub applied_lsn: Lsn,
+    pub result_code: ResultCode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TickObservation {
+    pub processed_count: u32,
+    pub last_applied_lsn: Option<Lsn>,
+    pub expirations: Vec<ExpirationObservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScheduleActionKind {
+    Submit(ClientRequest),
+    TickExpirations,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScheduleAction {
+    pub label: &'static str,
+    pub candidate_slots: Vec<Slot>,
+    pub action: ScheduleActionKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ScheduleObservationKind {
+    Submit(SimulationObservation),
+    Tick(TickObservation),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScheduleObservation {
+    pub label: &'static str,
+    pub slot: Slot,
+    pub outcome: ScheduleObservationKind,
 }
 
 #[derive(Debug)]
@@ -91,6 +133,22 @@ impl SimulatedSlotDriver {
     fn next_ready_index(&mut self, len: usize) -> usize {
         self.scheduler.next_index(len)
     }
+
+    fn choose_index(&mut self, len: usize) -> usize {
+        assert!(len > 0, "scheduler requires at least one candidate");
+        if len == 1 {
+            0
+        } else {
+            self.next_ready_index(len)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResolvedScheduleAction {
+    label: &'static str,
+    slot: Slot,
+    action: ScheduleActionKind,
 }
 
 #[derive(Debug)]
@@ -144,7 +202,7 @@ impl SimulationHarness {
         let mut transcript = Vec::with_capacity(pending.len());
 
         while !pending.is_empty() {
-            let index = self.slot_driver.next_ready_index(pending.len());
+            let index = self.slot_driver.choose_index(pending.len());
             let request = pending.remove(index);
             let result = self.submit(request)?;
             transcript.push(SimulationObservation {
@@ -152,7 +210,50 @@ impl SimulationHarness {
                 operation_id: request.operation_id,
                 applied_lsn: result.applied_lsn,
                 result_code: result.outcome.result_code,
+                from_retry_cache: result.from_retry_cache,
             });
+        }
+
+        Ok(transcript)
+    }
+
+    pub(crate) fn explore_schedule(
+        &mut self,
+        actions: &[ScheduleAction],
+    ) -> Result<Vec<ScheduleObservation>, SubmissionError> {
+        let mut seen_labels = std::collections::BTreeSet::new();
+        let current_slot = self.current_slot();
+        let mut pending = Vec::with_capacity(actions.len());
+
+        for action in actions {
+            assert!(
+                seen_labels.insert(action.label),
+                "schedule actions must have unique labels"
+            );
+            let slot = self.resolve_schedule_slot(&action.candidate_slots);
+            assert!(
+                slot >= current_slot,
+                "schedule actions must not resolve before the current simulated slot"
+            );
+            pending.push(ResolvedScheduleAction {
+                label: action.label,
+                slot,
+                action: action.action,
+            });
+        }
+
+        pending.sort_unstable_by_key(|action| (action.slot, action.label));
+        let mut transcript = Vec::with_capacity(pending.len());
+
+        while let Some(next_slot) = pending.first().map(|action| action.slot) {
+            self.advance_to(next_slot);
+            let ready_len = pending
+                .iter()
+                .take_while(|action| action.slot == next_slot)
+                .count();
+            let index = self.slot_driver.choose_index(ready_len);
+            let action = pending.remove(index);
+            transcript.push(self.execute_schedule_action(action)?);
         }
 
         Ok(transcript)
@@ -239,6 +340,90 @@ impl SimulationHarness {
 
     pub(crate) fn engine(&self) -> &SingleNodeEngine {
         self.engine_ref()
+    }
+
+    fn execute_schedule_action(
+        &mut self,
+        action: ResolvedScheduleAction,
+    ) -> Result<ScheduleObservation, SubmissionError> {
+        let outcome = match action.action {
+            ScheduleActionKind::Submit(request) => {
+                let result = self.submit(request)?;
+                ScheduleObservationKind::Submit(SimulationObservation {
+                    slot: self.current_slot(),
+                    operation_id: request.operation_id,
+                    applied_lsn: result.applied_lsn,
+                    result_code: result.outcome.result_code,
+                    from_retry_cache: result.from_retry_cache,
+                })
+            }
+            ScheduleActionKind::TickExpirations => {
+                ScheduleObservationKind::Tick(self.tick_expirations_seeded()?)
+            }
+        };
+
+        Ok(ScheduleObservation {
+            label: action.label,
+            slot: self.current_slot(),
+            outcome,
+        })
+    }
+
+    fn tick_expirations_seeded(&mut self) -> Result<TickObservation, SubmissionError> {
+        while self.engine_mut().process_next()?.is_some() {}
+
+        let current_slot = self.current_slot();
+        let (request_slot, limit, mut due) = {
+            let engine = self.engine_ref();
+            (
+                engine.expiration_request_slot(current_slot),
+                usize::try_from(engine.max_expirations_per_tick())
+                    .expect("validated max_expirations_per_tick must fit usize"),
+                engine.collect_due_expirations(current_slot),
+            )
+        };
+        let mut expirations = Vec::with_capacity(due.len().min(limit));
+
+        while expirations.len() < limit && !due.is_empty() {
+            // Keep the engine's earliest-deadline priority while still exploring same-deadline
+            // expiration choice under the per-tick throughput bound.
+            let earliest_deadline = due[0].deadline_slot;
+            let cohort_len = due
+                .iter()
+                .take_while(|entry| entry.deadline_slot == earliest_deadline)
+                .count();
+            let index = self.slot_driver.choose_index(cohort_len);
+            let target = due.remove(index);
+            let result = self
+                .engine_mut()
+                .apply_due_expiration(request_slot, target)?;
+            expirations.push(ExpirationObservation {
+                reservation_id: target.reservation_id,
+                deadline_slot: target.deadline_slot,
+                applied_lsn: result.applied_lsn,
+                result_code: result.outcome.result_code,
+            });
+        }
+
+        Ok(TickObservation {
+            processed_count: u32::try_from(expirations.len())
+                .expect("expiration count must fit the engine tick result"),
+            last_applied_lsn: expirations.last().map(|entry| entry.applied_lsn),
+            expirations,
+        })
+    }
+
+    fn resolve_schedule_slot(&mut self, candidate_slots: &[Slot]) -> Slot {
+        assert!(
+            !candidate_slots.is_empty(),
+            "schedule action requires at least one candidate slot"
+        );
+
+        let mut resolved = candidate_slots.to_vec();
+        resolved.sort_unstable();
+        resolved.dedup();
+        let index = self.slot_driver.choose_index(resolved.len());
+        resolved[index]
     }
 
     fn engine_ref(&self) -> &SingleNodeEngine {
