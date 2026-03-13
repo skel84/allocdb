@@ -4,6 +4,7 @@ use allocdb_core::command::{ClientRequest, Command};
 use allocdb_core::command_codec::encode_client_request;
 use allocdb_core::config::Config;
 use allocdb_core::ids::{ClientId, Lsn, OperationId, ResourceId, Slot};
+use allocdb_core::result::ResultCode;
 
 use crate::engine::EngineConfig;
 use crate::replica::{NotPrimaryReadError, ReplicaId, ReplicaNodeStatus, ReplicaRole};
@@ -742,6 +743,57 @@ fn reads_are_served_only_from_the_primary_after_local_commit() {
 }
 
 #[test]
+fn retry_cache_hits_do_not_overwrite_canonical_published_results() {
+    let mut harness = primary_harness("replicated-retry-cache-published-result", 0x5a21);
+
+    let payload = create_payload(211, 201);
+    let entry = harness
+        .client_submit(replica(1), Slot(1), &payload, "canonical")
+        .unwrap();
+    commit_to_backup(&mut harness, "canonical", entry.lsn, 2);
+
+    let original = *harness
+        .published_result(entry.lsn)
+        .expect("majority commit should publish one canonical result");
+    assert!(!original.from_retry_cache);
+
+    let retry = harness
+        .client_submit_or_retry(replica(1), Slot(2), &payload, "canonical-retry")
+        .unwrap();
+    match retry {
+        ReplicatedClientRequestOutcome::Published(result) => {
+            assert_eq!(result.applied_lsn, original.applied_lsn);
+            assert_eq!(result.outcome, original.outcome);
+            assert!(result.from_retry_cache);
+        }
+        other @ ReplicatedClientRequestOutcome::Prepared(_) => {
+            panic!("expected retry cache hit on the current primary, got {other:?}")
+        }
+    }
+    assert_eq!(harness.published_result(entry.lsn), Some(&original));
+
+    let conflicting = harness
+        .client_submit_or_retry(
+            replica(1),
+            Slot(3),
+            &create_payload(212, 201),
+            "canonical-conflict",
+        )
+        .unwrap();
+    match conflicting {
+        ReplicatedClientRequestOutcome::Published(result) => {
+            assert_eq!(result.applied_lsn, original.applied_lsn);
+            assert_eq!(result.outcome.result_code, ResultCode::OperationConflict);
+            assert!(result.from_retry_cache);
+        }
+        other @ ReplicatedClientRequestOutcome::Prepared(_) => {
+            panic!("expected conflicting retry to resolve from cache, got {other:?}")
+        }
+    }
+    assert_eq!(harness.published_result(entry.lsn), Some(&original));
+}
+
+#[test]
 fn quorum_lost_primary_fails_closed_for_reads_and_writes() {
     let mut harness = primary_harness("replicated-quorum-loss", 0x5a3);
 
@@ -894,6 +946,67 @@ fn higher_view_takeover_reconstructs_prefix_and_rejects_stale_primary_reads() {
 }
 
 #[test]
+fn higher_view_takeover_recovers_missing_prepared_suffix_from_another_voter() {
+    let mut harness = primary_harness("replicated-view-change-copy-prepared", 0x5a40);
+
+    let entry = harness
+        .client_submit(
+            replica(1),
+            Slot(1),
+            &create_payload(401, 60),
+            "copy-prepared",
+        )
+        .unwrap();
+    harness
+        .deliver_protocol_message("copy-prepared-prepare-1-to-3")
+        .unwrap();
+    harness
+        .deliver_protocol_message("copy-prepared-prepare-1-to-3-ack")
+        .unwrap();
+
+    assert_eq!(replica_commit_lsn(&harness, 1), Some(entry.lsn));
+    assert_eq!(replica_last_applied_lsn(&harness, 1), Some(entry.lsn));
+    assert_eq!(replica_commit_lsn(&harness, 2), None);
+    assert_eq!(replica_last_applied_lsn(&harness, 2), None);
+    assert_eq!(replica_commit_lsn(&harness, 3), None);
+    assert_eq!(replica_last_applied_lsn(&harness, 3), None);
+    assert!(
+        harness
+            .replica(replica(2))
+            .unwrap()
+            .unwrap()
+            .prepared_entry(entry.lsn)
+            .is_none()
+    );
+    assert!(
+        harness
+            .replica(replica(3))
+            .unwrap()
+            .unwrap()
+            .prepared_entry(entry.lsn)
+            .is_some()
+    );
+
+    set_replica_link(&mut harness, 1, 2, false);
+    set_replica_link(&mut harness, 1, 3, false);
+    assert_eq!(harness.configured_primary(), None);
+
+    harness.complete_view_change(replica(2), 2).unwrap();
+
+    assert_eq!(harness.configured_primary(), Some(replica(2)));
+    assert_eq!(replica_commit_lsn(&harness, 2), Some(entry.lsn));
+    assert_eq!(replica_last_applied_lsn(&harness, 2), Some(entry.lsn));
+    assert_eq!(replica_prepared_len(&harness, 2), 0);
+    assert!(replica_has_resource(&harness, 2, 401));
+
+    let read = harness
+        .read_resource(replica(2), ResourceId(401), Some(entry.lsn))
+        .unwrap()
+        .expect("new primary should serve the reconstructed committed entry");
+    assert_eq!(read.resource_id, ResourceId(401));
+}
+
+#[test]
 fn minority_partition_keeps_quorum_and_healed_backup_catches_up() {
     let mut harness = primary_harness("replicated-minority-partition", 0x5a41);
 
@@ -1026,7 +1139,7 @@ fn primary_crash_before_quorum_append_retries_once_after_failover() {
 }
 
 #[test]
-fn primary_crash_after_quorum_append_before_reply_retries_from_reconstructed_commit() {
+fn primary_crash_after_quorum_append_retries_from_reconstructed_commit() {
     let mut harness = primary_harness("replicated-crash-after-quorum", 0x5a44);
     let payload = create_payload(47, 65);
 
@@ -1039,9 +1152,10 @@ fn primary_crash_after_quorum_append_before_reply_retries_from_reconstructed_com
     harness
         .deliver_protocol_message("after-quorum-prepare-1-to-2-ack")
         .unwrap();
-    let committed = *harness
-        .published_result(entry.lsn)
-        .expect("majority append should commit before the crash");
+    assert_eq!(replica_commit_lsn(&harness, 1), Some(entry.lsn));
+    assert_eq!(replica_last_applied_lsn(&harness, 1), Some(entry.lsn));
+    assert_eq!(replica_commit_lsn(&harness, 2), None);
+    assert_eq!(replica_prepared_len(&harness, 2), 1);
 
     harness.crash_replica(replica(1)).unwrap();
     harness.complete_view_change(replica(2), 2).unwrap();
@@ -1051,8 +1165,10 @@ fn primary_crash_after_quorum_append_before_reply_retries_from_reconstructed_com
         .unwrap();
     match retry {
         ReplicatedClientRequestOutcome::Published(result) => {
-            assert_eq!(result.applied_lsn, committed.applied_lsn);
-            assert_eq!(result.outcome, committed.outcome);
+            assert_eq!(result.applied_lsn, entry.lsn);
+            assert_eq!(result.outcome.result_code, ResultCode::Ok);
+            assert_eq!(result.outcome.reservation_id, None);
+            assert_eq!(result.outcome.deadline_slot, None);
             assert!(result.from_retry_cache);
         }
         other @ ReplicatedClientRequestOutcome::Prepared(_) => {

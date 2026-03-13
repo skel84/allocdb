@@ -258,8 +258,8 @@ Key checks:
 
 - crash the primary before quorum append, so the write remains uncommitted and clients see only an
   indefinite outcome
-- crash the primary after quorum append but before client reply, so retry must recover the
-  committed result
+- crash the primary after quorum append, so retry must recover the committed result even if
+  failover interrupts reply delivery or commit propagation
 - crash the primary after reply and force later reads and retries through the new primary
 - crash during expiration leadership, so overdue work may be delayed but never applied early
 
@@ -327,8 +327,8 @@ Current executable replicated coverage already proves:
   new primary can accept writes and rejoin the stale replica back onto the committed prefix
 - a primary crash before quorum append preserves indefinite ambiguity until failover, after which a
   retry with the same `operation_id` commits exactly once on the new primary
-- a primary crash after majority append but before reply lets the next primary reconstruct the
-  committed prefix and resolve the retry from cache instead of executing it again
+- a primary crash after majority append lets the next primary reconstruct the committed prefix and
+  resolve the retry from cache instead of executing it again
 - a primary crash after reply preserves strict-primary reads and cached retry results on the next
   primary
 - a stale replica can rejoin by replicated suffix only when it still holds one recent enough

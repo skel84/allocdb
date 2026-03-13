@@ -52,7 +52,8 @@
     target already knows a higher durable view than the current primary, plus promoted
     deterministic partition and primary-crash scenarios that prove minority-partition catch-up,
     full-split fail-closed behavior, pre-quorum retry replay, majority-appended failover
-    reconstruction, and post-reply retry/read preservation on the new primary
+    reconstruction, prepared-suffix recovery from another voter during takeover, and post-reply
+    retry/read preservation on the new primary
 
 ## What Exists
 
@@ -175,10 +176,11 @@
     snapshot transfer, then restarts through the real recovery path before returning the replica
     to backup mode
   - regression coverage for quorum-loss fail-closed reads and writes, higher-view takeover with
-    stale-primary read rejection, isolated-backup partition heal and catch-up, non-quorum split
-    fail-closed behavior with later rejoin convergence, primary crash before quorum append,
-    primary crash after majority append before reply, primary crash after reply, suffix-only
-    rejoin, snapshot-transfer rejoin, and faulted rejoin rejection
+    stale-primary read rejection, prepared-suffix recovery from another voter during takeover,
+    isolated-backup partition heal and catch-up, non-quorum split fail-closed behavior with later
+    rejoin convergence, primary crash before quorum append, primary crash after majority append,
+    primary crash after reply, suffix-only rejoin, snapshot-transfer rejoin, and faulted rejoin
+    rejection
 - Validation:
   - `cargo test -p allocdb-core wal -- --nocapture`
   - `cargo test -p allocdb-core snapshot -- --nocapture`

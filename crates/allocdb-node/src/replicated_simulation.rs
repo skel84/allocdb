@@ -672,8 +672,6 @@ impl ReplicatedSimulationHarness {
         }
 
         if let Some(result) = self.lookup_retry_result(primary, request_slot, payload)? {
-            self.published_results
-                .insert(result.applied_lsn.get(), result);
             return Ok(ReplicatedClientRequestOutcome::Published(result));
         }
 
