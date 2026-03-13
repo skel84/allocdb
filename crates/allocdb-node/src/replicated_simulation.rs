@@ -5,14 +5,18 @@ use std::path::{Path, PathBuf};
 
 use allocdb_core::config::Config;
 use allocdb_core::ids::{Lsn, ResourceId, Slot};
+use allocdb_core::snapshot_file::{SnapshotFile, SnapshotFileError};
 use allocdb_core::state_machine::ResourceRecord;
+use allocdb_core::wal::{Frame, RecordType, ScanStopReason};
+use allocdb_core::wal_file::{RecoveredWal, WalFile, WalFileError};
 use log::{debug, info, warn};
 
-use crate::engine::{EngineConfig, SubmissionResult};
+use crate::engine::{CheckpointResult, EngineConfig, SubmissionResult};
 use crate::replica::{
-    NotPrimaryReadError, RecoverReplicaError, ReplicaId, ReplicaIdentity, ReplicaNode,
-    ReplicaNodeStatus, ReplicaOpenError, ReplicaPaths, ReplicaPreparedEntry, ReplicaProtocolError,
-    ReplicaRole, prepare_log_path,
+    NotPrimaryReadError, RecoverReplicaError, ReplicaCheckpointError, ReplicaId, ReplicaIdentity,
+    ReplicaMetadata, ReplicaMetadataFile, ReplicaMetadataFileError, ReplicaNode, ReplicaNodeStatus,
+    ReplicaOpenError, ReplicaPaths, ReplicaPreparedEntry, ReplicaProtocolError, ReplicaRole,
+    prepare_log_path,
 };
 use crate::simulation::{SimulatedSlotDriver, simulation_workspace_path};
 
@@ -43,6 +47,12 @@ pub(crate) struct ReplicaObservation {
     pub current_view: Option<u64>,
     pub commit_lsn: Option<Lsn>,
     pub active_snapshot_lsn: Option<Lsn>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplicaRejoinMethod {
+    SuffixOnly,
+    SnapshotTransfer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,8 +155,12 @@ pub(crate) struct ReplicatedScheduleObservation {
 pub(crate) enum ReplicatedSimulationError {
     OpenReplica(ReplicaOpenError),
     RecoverReplica(RecoverReplicaError),
+    Checkpoint(ReplicaCheckpointError),
     Protocol(ReplicaProtocolError),
     Read(NotPrimaryReadError),
+    MetadataFile(ReplicaMetadataFileError),
+    SnapshotFile(SnapshotFileError),
+    WalFile(WalFileError),
     UnknownReplica(ReplicaId),
     NotConfiguredPrimary {
         expected: Option<ReplicaId>,
@@ -169,70 +183,198 @@ pub(crate) enum ReplicatedSimulationError {
         candidate: ReplicaId,
         lsn: Lsn,
     },
+    ReplicaFaulted(ReplicaId),
+    RejoinPrimary(ReplicaId),
+    ReplicaWalNotClean {
+        replica_id: ReplicaId,
+        stop_reason: ScanStopReason,
+    },
+    ReplicaViewAheadOfPrimary {
+        replica_id: ReplicaId,
+        highest_known_view: u64,
+        primary_view: u64,
+    },
+    ReplicaCommitAheadOfPrimary {
+        replica_id: ReplicaId,
+        target_commit_lsn: Lsn,
+        primary_commit_lsn: Option<Lsn>,
+    },
+    SnapshotTransferUnavailable {
+        primary: ReplicaId,
+        replica: ReplicaId,
+        primary_replay_floor: u64,
+    },
+    PrimarySnapshotMissing {
+        primary: ReplicaId,
+        snapshot_lsn: Lsn,
+    },
 }
 
 impl fmt::Display for ReplicatedSimulationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OpenReplica(error) => write!(formatter, "failed to open replica: {error:?}"),
-            Self::RecoverReplica(error) => {
-                write!(formatter, "failed to recover replica: {error:?}")
-            }
-            Self::Protocol(error) => write!(formatter, "replica protocol error: {error:?}"),
-            Self::Read(error) => write!(formatter, "replica read error: {error:?}"),
-            Self::UnknownReplica(replica_id) => {
-                write!(formatter, "unknown replica: {}", replica_id.get())
-            }
-            Self::NotConfiguredPrimary { expected, found } => write!(
-                formatter,
-                "replica {} is not the configured primary {:?}",
-                found.get(),
-                expected.map(ReplicaId::get)
-            ),
-            Self::PendingCommitNotFound(lsn) => {
-                write!(
-                    formatter,
-                    "pending primary commit not found for lsn {}",
-                    lsn.get()
-                )
-            }
-            Self::ReplicaAlreadyCrashed(replica_id) => {
-                write!(formatter, "replica {} is already crashed", replica_id.get())
-            }
-            Self::ReplicaAlreadyRunning(replica_id) => {
-                write!(formatter, "replica {} is already running", replica_id.get())
-            }
-            Self::MessageNotFound(label) => {
-                write!(formatter, "protocol message {label} is not queued")
-            }
-            Self::MessageDeliveryBlocked { label, from, to } => write!(
-                formatter,
-                "protocol message {label} is blocked from {from:?} to {to:?}"
-            ),
-            Self::ViewChangeQuorumUnavailable {
-                candidate,
-                reachable,
-            } => write!(
-                formatter,
-                "replica {} cannot complete view change because only {} active voters are reachable",
-                candidate.get(),
-                reachable
-            ),
-            Self::ViewChangeMissingPreparedEntry { candidate, lsn } => write!(
-                formatter,
-                "replica {} cannot reconstruct committed lsn {} during view change",
-                candidate.get(),
-                lsn.get()
-            ),
+        if let Some(result) = self.format_general_error(formatter) {
+            return result;
         }
+        if let Some(result) = self.format_view_change_error(formatter) {
+            return result;
+        }
+        self.format_rejoin_error(formatter)
     }
 }
 
 impl std::error::Error for ReplicatedSimulationError {}
 
+impl ReplicatedSimulationError {
+    fn format_general_error(&self, formatter: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
+        match self {
+            Self::OpenReplica(error) => {
+                Some(write!(formatter, "failed to open replica: {error:?}"))
+            }
+            Self::RecoverReplica(error) => {
+                Some(write!(formatter, "failed to recover replica: {error:?}"))
+            }
+            Self::Checkpoint(error) => {
+                Some(write!(formatter, "failed to checkpoint replica: {error:?}"))
+            }
+            Self::Protocol(error) => Some(write!(formatter, "replica protocol error: {error:?}")),
+            Self::Read(error) => Some(write!(formatter, "replica read error: {error:?}")),
+            Self::MetadataFile(error) => {
+                Some(write!(formatter, "replica metadata error: {error:?}"))
+            }
+            Self::SnapshotFile(error) => Some(write!(formatter, "snapshot file error: {error:?}")),
+            Self::WalFile(error) => Some(write!(formatter, "wal file error: {error:?}")),
+            Self::UnknownReplica(replica_id) => {
+                Some(write!(formatter, "unknown replica: {}", replica_id.get()))
+            }
+            Self::NotConfiguredPrimary { expected, found } => Some(write!(
+                formatter,
+                "replica {} is not the configured primary {:?}",
+                found.get(),
+                expected.map(ReplicaId::get)
+            )),
+            Self::PendingCommitNotFound(lsn) => Some(write!(
+                formatter,
+                "pending primary commit not found for lsn {}",
+                lsn.get()
+            )),
+            Self::ReplicaAlreadyCrashed(replica_id) => Some(write!(
+                formatter,
+                "replica {} is already crashed",
+                replica_id.get()
+            )),
+            Self::ReplicaAlreadyRunning(replica_id) => Some(write!(
+                formatter,
+                "replica {} is already running",
+                replica_id.get()
+            )),
+            Self::MessageNotFound(label) => {
+                Some(write!(formatter, "protocol message {label} is not queued"))
+            }
+            Self::MessageDeliveryBlocked { label, from, to } => Some(write!(
+                formatter,
+                "protocol message {label} is blocked from {from:?} to {to:?}"
+            )),
+            _ => None,
+        }
+    }
+
+    fn format_view_change_error(&self, formatter: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
+        match self {
+            Self::ViewChangeQuorumUnavailable {
+                candidate,
+                reachable,
+            } => Some(write!(
+                formatter,
+                "replica {} cannot complete view change because only {} active voters are reachable",
+                candidate.get(),
+                reachable
+            )),
+            Self::ViewChangeMissingPreparedEntry { candidate, lsn } => Some(write!(
+                formatter,
+                "replica {} cannot reconstruct committed lsn {} during view change",
+                candidate.get(),
+                lsn.get()
+            )),
+            _ => None,
+        }
+    }
+
+    fn format_rejoin_error(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReplicaFaulted(replica_id) => {
+                write!(formatter, "replica {} is faulted", replica_id.get())
+            }
+            Self::RejoinPrimary(replica_id) => {
+                write!(
+                    formatter,
+                    "replica {} cannot rejoin itself",
+                    replica_id.get()
+                )
+            }
+            Self::ReplicaWalNotClean {
+                replica_id,
+                stop_reason,
+            } => write!(
+                formatter,
+                "replica {} WAL is not clean enough for rejoin: {stop_reason:?}",
+                replica_id.get()
+            ),
+            Self::ReplicaViewAheadOfPrimary {
+                replica_id,
+                highest_known_view,
+                primary_view,
+            } => write!(
+                formatter,
+                "replica {} knows higher view {} than primary view {} during rejoin",
+                replica_id.get(),
+                highest_known_view,
+                primary_view
+            ),
+            Self::ReplicaCommitAheadOfPrimary {
+                replica_id,
+                target_commit_lsn,
+                primary_commit_lsn,
+            } => write!(
+                formatter,
+                "replica {} commit lsn {} is ahead of primary commit {:?}",
+                replica_id.get(),
+                target_commit_lsn.get(),
+                primary_commit_lsn.map(Lsn::get)
+            ),
+            Self::SnapshotTransferUnavailable {
+                primary,
+                replica,
+                primary_replay_floor,
+            } => write!(
+                formatter,
+                "replica {} needs snapshot transfer from primary {} because retained WAL starts after lsn {}",
+                replica.get(),
+                primary.get(),
+                primary_replay_floor
+            ),
+            Self::PrimarySnapshotMissing {
+                primary,
+                snapshot_lsn,
+            } => write!(
+                formatter,
+                "primary {} is missing snapshot lsn {} required for snapshot transfer",
+                primary.get(),
+                snapshot_lsn.get()
+            ),
+            _ => unreachable!("non-rejoin error must already be formatted"),
+        }
+    }
+}
+
 impl From<ReplicaProtocolError> for ReplicatedSimulationError {
     fn from(error: ReplicaProtocolError) -> Self {
         Self::Protocol(error)
+    }
+}
+
+impl From<ReplicaCheckpointError> for ReplicatedSimulationError {
+    fn from(error: ReplicaCheckpointError) -> Self {
+        Self::Checkpoint(error)
     }
 }
 
@@ -242,11 +384,39 @@ impl From<NotPrimaryReadError> for ReplicatedSimulationError {
     }
 }
 
+impl From<ReplicaMetadataFileError> for ReplicatedSimulationError {
+    fn from(error: ReplicaMetadataFileError) -> Self {
+        Self::MetadataFile(error)
+    }
+}
+
+impl From<SnapshotFileError> for ReplicatedSimulationError {
+    fn from(error: SnapshotFileError) -> Self {
+        Self::SnapshotFile(error)
+    }
+}
+
+impl From<WalFileError> for ReplicatedSimulationError {
+    fn from(error: WalFileError) -> Self {
+        Self::WalFile(error)
+    }
+}
+
 #[derive(Debug)]
 struct HarnessReplica {
     identity: ReplicaIdentity,
     paths: ReplicaPaths,
     node: Option<ReplicaNode>,
+}
+
+#[derive(Clone, Debug)]
+struct PrimaryCatchUpState {
+    paths: ReplicaPaths,
+    current_view: u64,
+    commit_lsn: Option<Lsn>,
+    active_snapshot_lsn: Option<Lsn>,
+    retained_frames: Vec<Frame>,
+    replay_floor: u64,
 }
 
 #[derive(Debug)]
@@ -482,6 +652,26 @@ impl ReplicatedSimulationHarness {
         self.published_results.get(&lsn.get())
     }
 
+    pub(crate) fn checkpoint_replica(
+        &mut self,
+        replica_id: ReplicaId,
+    ) -> Result<CheckpointResult, ReplicatedSimulationError> {
+        let node = self
+            .replica_entry_mut(replica_id)?
+            .node
+            .as_mut()
+            .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(replica_id))?;
+        let result = node.checkpoint_local_state()?;
+        info!(
+            "ReplicaCheckpointCompleted: replica_id={} snapshot_lsn={:?} previous_snapshot_lsn={:?} retained_frame_count={}",
+            replica_id.get(),
+            result.snapshot_lsn,
+            result.previous_snapshot_lsn,
+            result.retained_frame_count
+        );
+        Ok(result)
+    }
+
     pub(crate) fn read_resource(
         &mut self,
         replica_id: ReplicaId,
@@ -496,6 +686,38 @@ impl ReplicatedSimulationHarness {
         Ok(node
             .engine()
             .and_then(|engine| engine.db().resource(resource_id)))
+    }
+
+    pub(crate) fn rejoin_replica(
+        &mut self,
+        replica_id: ReplicaId,
+        primary: ReplicaId,
+    ) -> Result<ReplicaRejoinMethod, ReplicatedSimulationError> {
+        let (source, target_metadata) = self.validate_rejoin_request(replica_id, primary)?;
+        let (paths, target_recovered_wal) = self.prepare_rejoin_target(replica_id)?;
+        let method = self.write_rejoin_state(
+            replica_id,
+            primary,
+            &source,
+            target_metadata,
+            &target_recovered_wal,
+            &paths,
+        )?;
+        self.restart_rejoined_replica(replica_id, &paths, source.current_view)?;
+
+        let active_snapshot_lsn = self
+            .replica(replica_id)?
+            .and_then(|node| node.metadata().active_snapshot_lsn);
+        info!(
+            "ReplicaRejoined: replica_id={} primary={} method={:?} view={} commit_lsn={:?} active_snapshot_lsn={:?}",
+            replica_id.get(),
+            primary.get(),
+            method,
+            source.current_view,
+            source.commit_lsn,
+            active_snapshot_lsn
+        );
+        Ok(method)
     }
 
     pub(crate) fn complete_view_change(
@@ -1203,6 +1425,227 @@ impl ReplicatedSimulationHarness {
         }
         Ok(None)
     }
+
+    fn capture_primary_catch_up_state(
+        &self,
+        primary: ReplicaId,
+    ) -> Result<PrimaryCatchUpState, ReplicatedSimulationError> {
+        let node = self
+            .replica(primary)?
+            .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(primary))?;
+        if node.status() != ReplicaNodeStatus::Active
+            || node.metadata().role != ReplicaRole::Primary
+        {
+            return Err(ReplicatedSimulationError::NotConfiguredPrimary {
+                expected: self.configured_primary,
+                found: primary,
+            });
+        }
+
+        let retained_frames = read_primary_wal_frames(
+            primary,
+            node.engine()
+                .expect("active primary must keep one live engine")
+                .wal_path(),
+            self.engine_config.max_command_bytes,
+        )?;
+        Ok(PrimaryCatchUpState {
+            paths: node.paths().clone(),
+            current_view: node.metadata().current_view,
+            commit_lsn: node.metadata().commit_lsn,
+            active_snapshot_lsn: node.metadata().active_snapshot_lsn,
+            replay_floor: retained_replay_floor(
+                &retained_frames,
+                node.metadata().active_snapshot_lsn,
+            ),
+            retained_frames,
+        })
+    }
+
+    fn validate_rejoin_request(
+        &mut self,
+        replica_id: ReplicaId,
+        primary: ReplicaId,
+    ) -> Result<(PrimaryCatchUpState, ReplicaMetadata), ReplicatedSimulationError> {
+        self.fail_primary_closed_if_quorum_lost()?;
+        if replica_id == primary {
+            return Err(ReplicatedSimulationError::RejoinPrimary(replica_id));
+        }
+        if self.configured_primary != Some(primary) {
+            return Err(ReplicatedSimulationError::NotConfiguredPrimary {
+                expected: self.configured_primary,
+                found: primary,
+            });
+        }
+
+        let source = self.capture_primary_catch_up_state(primary)?;
+        let target_metadata = self.load_replica_metadata(replica_id)?;
+        let highest_known_view = metadata_highest_known_view(target_metadata);
+        if highest_known_view > source.current_view {
+            return Err(ReplicatedSimulationError::ReplicaViewAheadOfPrimary {
+                replica_id,
+                highest_known_view,
+                primary_view: source.current_view,
+            });
+        }
+        if target_metadata.commit_lsn.is_some_and(|commit_lsn| {
+            source
+                .commit_lsn
+                .is_none_or(|primary_commit| commit_lsn.get() > primary_commit.get())
+        }) {
+            return Err(ReplicatedSimulationError::ReplicaCommitAheadOfPrimary {
+                replica_id,
+                target_commit_lsn: target_metadata.commit_lsn.expect("checked above"),
+                primary_commit_lsn: source.commit_lsn,
+            });
+        }
+
+        Ok((source, target_metadata))
+    }
+
+    fn prepare_rejoin_target(
+        &mut self,
+        replica_id: ReplicaId,
+    ) -> Result<(ReplicaPaths, RecoveredWal), ReplicatedSimulationError> {
+        if let Some(node) = self.replica_entry_mut(replica_id)?.node.as_mut() {
+            if node.status() != ReplicaNodeStatus::Active {
+                return Err(ReplicatedSimulationError::ReplicaFaulted(replica_id));
+            }
+            node.discard_uncommitted_suffix()?;
+        }
+
+        let paths = {
+            let replica = self.replica_entry_mut(replica_id)?;
+            drop(replica.node.take());
+            replica.paths.clone()
+        };
+        let recovered_wal = recover_replica_wal(
+            replica_id,
+            &paths.wal_path,
+            self.engine_config.max_command_bytes,
+        )?;
+        Ok((paths, recovered_wal))
+    }
+
+    fn write_rejoin_state(
+        &self,
+        replica_id: ReplicaId,
+        primary: ReplicaId,
+        source: &PrimaryCatchUpState,
+        target_metadata: ReplicaMetadata,
+        target_recovered_wal: &RecoveredWal,
+        paths: &ReplicaPaths,
+    ) -> Result<ReplicaRejoinMethod, ReplicatedSimulationError> {
+        let method = if target_metadata.commit_lsn.map_or(0, Lsn::get) >= source.replay_floor {
+            ReplicaRejoinMethod::SuffixOnly
+        } else {
+            ReplicaRejoinMethod::SnapshotTransfer
+        };
+
+        let wal_frames = match method {
+            ReplicaRejoinMethod::SuffixOnly => suffix_rejoin_frames(
+                target_metadata.commit_lsn,
+                &target_recovered_wal.scan_result.frames,
+                &source.retained_frames,
+            ),
+            ReplicaRejoinMethod::SnapshotTransfer => {
+                let snapshot_lsn = source.active_snapshot_lsn.ok_or(
+                    ReplicatedSimulationError::SnapshotTransferUnavailable {
+                        primary,
+                        replica: replica_id,
+                        primary_replay_floor: source.replay_floor,
+                    },
+                )?;
+                copy_snapshot(
+                    primary,
+                    &source.paths.snapshot_path,
+                    &paths.snapshot_path,
+                    snapshot_lsn,
+                )?;
+                source.retained_frames.clone()
+            }
+        };
+
+        rewrite_wal(
+            &paths.wal_path,
+            self.engine_config.max_command_bytes,
+            &wal_frames,
+        )?;
+        remove_if_exists(&prepare_log_path(&paths.metadata_path));
+
+        let mut rejoin_metadata = target_metadata;
+        rejoin_metadata.current_view = source.current_view;
+        rejoin_metadata.role = ReplicaRole::Backup;
+        rejoin_metadata.commit_lsn = source.commit_lsn;
+        rejoin_metadata.active_snapshot_lsn = match method {
+            ReplicaRejoinMethod::SuffixOnly => target_metadata.active_snapshot_lsn,
+            ReplicaRejoinMethod::SnapshotTransfer => source.active_snapshot_lsn,
+        };
+        rejoin_metadata.last_normal_view = Some(source.current_view);
+        rejoin_metadata.durable_vote = None;
+        ReplicaMetadataFile::new(&paths.metadata_path).write_metadata(&rejoin_metadata)?;
+
+        Ok(method)
+    }
+
+    fn restart_rejoined_replica(
+        &mut self,
+        replica_id: ReplicaId,
+        paths: &ReplicaPaths,
+        current_view: u64,
+    ) -> Result<(), ReplicatedSimulationError> {
+        let identity = self.replica_entry(replica_id)?.identity;
+        let recovered = ReplicaNode::recover(
+            self.core_config.clone(),
+            self.engine_config,
+            identity,
+            paths.clone(),
+        )
+        .map_err(ReplicatedSimulationError::RecoverReplica)?;
+        let is_faulted = recovered.status() != ReplicaNodeStatus::Active;
+        self.replica_entry_mut(replica_id)?.node = Some(recovered);
+        if is_faulted {
+            return Err(ReplicatedSimulationError::ReplicaFaulted(replica_id));
+        }
+        self.replica_entry_mut(replica_id)?
+            .node
+            .as_mut()
+            .expect("recovered replica must be present")
+            .configure_normal_role(current_view, ReplicaRole::Backup)?;
+        self.prune_replica_protocol_state(replica_id);
+        Ok(())
+    }
+
+    fn load_replica_metadata(
+        &self,
+        replica_id: ReplicaId,
+    ) -> Result<ReplicaMetadata, ReplicatedSimulationError> {
+        match self.replica(replica_id)? {
+            Some(node)
+                if node.status() == ReplicaNodeStatus::Active
+                    && node.metadata().role != ReplicaRole::Faulted =>
+            {
+                Ok(*node.metadata())
+            }
+            Some(_) | None => Err(ReplicatedSimulationError::ReplicaFaulted(replica_id)),
+        }
+    }
+
+    fn prune_replica_protocol_state(&mut self, replica_id: ReplicaId) {
+        let pending_messages_before = self.pending_messages.len();
+        self.pending_messages
+            .retain(|message| message.from != replica_id && message.to != replica_id);
+        for pending in self.pending_commits.values_mut() {
+            pending.acked_replicas.remove(&replica_id.get());
+        }
+        info!(
+            "ReplicaProtocolStatePruned: replica_id={} removed_messages={} pending_messages={} pending_commits={}",
+            replica_id.get(),
+            pending_messages_before.saturating_sub(self.pending_messages.len()),
+            self.pending_messages.len(),
+            self.pending_commits.len()
+        );
+    }
 }
 
 impl Drop for ReplicatedSimulationHarness {
@@ -1269,6 +1712,105 @@ fn protocol_message_view(message: &ProtocolMessage) -> Option<u64> {
             Some(*view)
         }
     }
+}
+
+fn read_primary_wal_frames(
+    replica_id: ReplicaId,
+    path: &Path,
+    max_command_bytes: usize,
+) -> Result<Vec<Frame>, ReplicatedSimulationError> {
+    let wal = WalFile::open(path, max_command_bytes)?;
+    let recovered = wal.recover()?;
+    match recovered.scan_result.stop_reason {
+        ScanStopReason::CleanEof => Ok(recovered.scan_result.frames),
+        stop_reason => Err(ReplicatedSimulationError::ReplicaWalNotClean {
+            replica_id,
+            stop_reason,
+        }),
+    }
+}
+
+fn recover_replica_wal(
+    replica_id: ReplicaId,
+    path: &Path,
+    max_command_bytes: usize,
+) -> Result<RecoveredWal, ReplicatedSimulationError> {
+    let wal = WalFile::open(path, max_command_bytes)?;
+    let recovered = wal.recover()?;
+    if matches!(
+        recovered.scan_result.stop_reason,
+        ScanStopReason::Corruption { .. }
+    ) {
+        return Err(ReplicatedSimulationError::ReplicaWalNotClean {
+            replica_id,
+            stop_reason: recovered.scan_result.stop_reason,
+        });
+    }
+    Ok(recovered)
+}
+
+fn retained_replay_floor(retained_frames: &[Frame], active_snapshot_lsn: Option<Lsn>) -> u64 {
+    retained_frames
+        .iter()
+        .filter(|frame| !matches!(frame.record_type, RecordType::SnapshotMarker))
+        .map(|frame| frame.lsn.get().saturating_sub(1))
+        .min()
+        .unwrap_or_else(|| active_snapshot_lsn.map_or(0, Lsn::get))
+}
+
+fn suffix_rejoin_frames(
+    target_commit_lsn: Option<Lsn>,
+    target_frames: &[Frame],
+    primary_frames: &[Frame],
+) -> Vec<Frame> {
+    let target_commit = target_commit_lsn.map_or(0, Lsn::get);
+    let mut frames = target_frames
+        .iter()
+        .filter(|frame| frame.lsn.get() <= target_commit)
+        .cloned()
+        .collect::<Vec<_>>();
+    frames.extend(
+        primary_frames
+            .iter()
+            .filter(|frame| {
+                frame.lsn.get() > target_commit
+                    && !matches!(frame.record_type, RecordType::SnapshotMarker)
+            })
+            .cloned(),
+    );
+    frames
+}
+
+fn rewrite_wal(
+    path: &Path,
+    max_command_bytes: usize,
+    frames: &[Frame],
+) -> Result<(), ReplicatedSimulationError> {
+    let mut wal = WalFile::open(path, max_command_bytes)?;
+    wal.replace_with_frames(frames)?;
+    Ok(())
+}
+
+fn copy_snapshot(
+    primary: ReplicaId,
+    source_path: &Path,
+    target_path: &Path,
+    snapshot_lsn: Lsn,
+) -> Result<(), ReplicatedSimulationError> {
+    let snapshot = SnapshotFile::new(source_path).load_snapshot()?.ok_or(
+        ReplicatedSimulationError::PrimarySnapshotMissing {
+            primary,
+            snapshot_lsn,
+        },
+    )?;
+    SnapshotFile::new(target_path).write_snapshot(&snapshot)?;
+    Ok(())
+}
+
+fn metadata_highest_known_view(metadata: ReplicaMetadata) -> u64 {
+    metadata.durable_vote.map_or(metadata.current_view, |vote| {
+        metadata.current_view.max(vote.view)
+    })
 }
 
 fn remove_if_exists(path: &Path) {

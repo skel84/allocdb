@@ -281,6 +281,17 @@ Protocol-aware recovery rule:
 
 - the primary may use knowledge of committed `lsn` and snapshot anchor to decide whether suffix
   catch-up is sufficient or snapshot transfer is required
+- suffix-only catch-up is allowed only when the stale replica already retains one committed durable
+  prefix recent enough for the primary's current retained WAL window
+- when the target is older than that retained-WAL floor, the primary must transfer one validated
+  snapshot plus its retained WAL suffix instead of assuming the missing prefix still exists locally
+- rejoin clears any prepared-but-uncommitted suffix before the replica returns to backup mode, and
+  it also drops stale protocol messages that still reference the rejoined replica's old state
+- rejoin must not move one replica backward in durable view knowledge; a target that has already
+  observed or voted in a higher view than the current primary stays out of service until a
+  compatible higher-view recovery path is available
+- a replica already in `faulted` state is not auto-repaired by rejoin; it stays out of service
+  until an operator repairs or replaces it
 - recovery must preserve the same committed prefix seen by healthy replicas
 
 ## Expiration And Logical Time Under Replication
