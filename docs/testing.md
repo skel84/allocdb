@@ -308,6 +308,14 @@ The recommended implementation sequence is:
 This keeps the first replicated simulator narrow enough to validate protocol behavior before
 expanding into broader randomized search.
 
+Current executable replicated coverage already proves:
+
+- a quorum-lost primary fails closed for new writes and strict reads even when it still has local
+  committed state
+- a higher-view takeover can reconstruct the latest committed prefix on a new primary before that
+  replica returns to normal mode
+- stale or quorum-lost primaries reject reads after failover instead of serving stale success
+
 ## Jepsen Validation Gate
 
 `M6-T03` defines the external validation required before any replicated release.

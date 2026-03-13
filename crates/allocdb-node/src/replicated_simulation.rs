@@ -161,6 +161,14 @@ pub(crate) enum ReplicatedSimulationError {
         from: ClusterEndpoint,
         to: ClusterEndpoint,
     },
+    ViewChangeQuorumUnavailable {
+        candidate: ReplicaId,
+        reachable: usize,
+    },
+    ViewChangeMissingPreparedEntry {
+        candidate: ReplicaId,
+        lsn: Lsn,
+    },
 }
 
 impl fmt::Display for ReplicatedSimulationError {
@@ -200,6 +208,21 @@ impl fmt::Display for ReplicatedSimulationError {
             Self::MessageDeliveryBlocked { label, from, to } => write!(
                 formatter,
                 "protocol message {label} is blocked from {from:?} to {to:?}"
+            ),
+            Self::ViewChangeQuorumUnavailable {
+                candidate,
+                reachable,
+            } => write!(
+                formatter,
+                "replica {} cannot complete view change because only {} active voters are reachable",
+                candidate.get(),
+                reachable
+            ),
+            Self::ViewChangeMissingPreparedEntry { candidate, lsn } => write!(
+                formatter,
+                "replica {} cannot reconstruct committed lsn {} during view change",
+                candidate.get(),
+                lsn.get()
             ),
         }
     }
@@ -374,6 +397,10 @@ impl ReplicatedSimulationHarness {
         &self.pending_messages
     }
 
+    pub(crate) const fn configured_primary(&self) -> Option<ReplicaId> {
+        self.configured_primary
+    }
+
     pub(crate) fn configure_primary(
         &mut self,
         replica_id: ReplicaId,
@@ -402,6 +429,7 @@ impl ReplicatedSimulationHarness {
         payload: &[u8],
         label_prefix: &str,
     ) -> Result<ReplicaPreparedEntry, ReplicatedSimulationError> {
+        self.fail_primary_closed_if_quorum_lost()?;
         if self.configured_primary != Some(primary) {
             return Err(ReplicatedSimulationError::NotConfiguredPrimary {
                 expected: self.configured_primary,
@@ -455,11 +483,12 @@ impl ReplicatedSimulationHarness {
     }
 
     pub(crate) fn read_resource(
-        &self,
+        &mut self,
         replica_id: ReplicaId,
         resource_id: ResourceId,
         required_lsn: Option<Lsn>,
     ) -> Result<Option<ResourceRecord>, ReplicatedSimulationError> {
+        self.fail_primary_closed_if_quorum_lost()?;
         let node = self
             .replica(replica_id)?
             .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(replica_id))?;
@@ -467,6 +496,37 @@ impl ReplicatedSimulationHarness {
         Ok(node
             .engine()
             .and_then(|engine| engine.db().resource(resource_id)))
+    }
+
+    pub(crate) fn complete_view_change(
+        &mut self,
+        new_primary: ReplicaId,
+        new_view: u64,
+    ) -> Result<(), ReplicatedSimulationError> {
+        self.fail_primary_closed_if_quorum_lost()?;
+        let voters = self.require_view_change_quorum(new_primary)?;
+        let target_commit_lsn = self.view_change_target_commit_lsn(&voters)?;
+        self.record_view_change_votes(&voters, new_primary, new_view)?;
+        self.reconstruct_view_change_prefix(new_primary, &voters, target_commit_lsn)?;
+        self.install_view_change_roles(&voters, new_primary, new_view)?;
+
+        self.configured_primary = Some(new_primary);
+        self.pending_commits
+            .retain(|_, pending| pending.entry.view >= new_view);
+        self.pending_messages.retain(|message| {
+            protocol_message_view(&message.payload)
+                .is_none_or(|message_view| message_view >= new_view)
+        });
+        info!(
+            "ReplicaViewChangeCompleted: primary={} view={} voters={} target_commit_lsn={:?} pending_messages={} pending_commits={}",
+            new_primary.get(),
+            new_view,
+            voters.len(),
+            target_commit_lsn,
+            self.pending_messages.len(),
+            self.pending_commits.len()
+        );
+        Ok(())
     }
 
     pub(crate) fn connectivity_allows(
@@ -488,6 +548,7 @@ impl ReplicatedSimulationHarness {
         let from_index = self.endpoint_index(from)?;
         let to_index = self.endpoint_index(to)?;
         self.connectivity.set(from_index, to_index, allowed);
+        self.fail_primary_closed_if_quorum_lost()?;
         Ok(ReplicatedScheduleObservationKind::ConnectivityChanged { from, to, allowed })
     }
 
@@ -653,6 +714,13 @@ impl ReplicatedSimulationHarness {
         lsn: Lsn,
         from: ReplicaId,
     ) -> Result<(), ReplicatedSimulationError> {
+        self.fail_primary_closed_if_quorum_lost()?;
+        if self.configured_primary != Some(primary) {
+            return Err(ReplicatedSimulationError::NotConfiguredPrimary {
+                expected: self.configured_primary,
+                found: primary,
+            });
+        }
         let mut commit_view = None;
         {
             let pending = self
@@ -732,6 +800,7 @@ impl ReplicatedSimulationHarness {
         }
         log_replica_lifecycle_event("ReplicaCrashStarting", &before);
         drop(self.replica_entry_mut(replica_id)?.node.take());
+        self.fail_primary_closed_if_quorum_lost()?;
         let after = self.replica_observation(replica_id)?;
         log_replica_lifecycle_event("ReplicaCrashed", &after);
         Ok(ReplicatedScheduleObservationKind::ReplicaCrashed { before, after })
@@ -776,6 +845,7 @@ impl ReplicatedSimulationHarness {
         let recovered = ReplicaNode::recover(core_config, engine_config, identity, paths)
             .map_err(ReplicatedSimulationError::RecoverReplica)?;
         self.replica_entry_mut(replica_id)?.node = Some(recovered);
+        self.fail_primary_closed_if_quorum_lost()?;
         let after = self.replica_observation(replica_id)?;
         log_replica_lifecycle_event("ReplicaRestarted", &after);
         Ok(ReplicatedScheduleObservationKind::ReplicaRestarted { before, after })
@@ -914,6 +984,225 @@ impl ReplicatedSimulationHarness {
         let index = self.replica_index(replica_id)?;
         Ok(&mut self.replicas[index])
     }
+
+    fn fail_primary_closed_if_quorum_lost(&mut self) -> Result<(), ReplicatedSimulationError> {
+        let Some(primary) = self.configured_primary else {
+            return Ok(());
+        };
+
+        let has_quorum = self.reachable_active_voters(primary)?.len() >= majority_quorum();
+        if has_quorum {
+            return Ok(());
+        }
+
+        if let Some(node) = self.replica_entry_mut(primary)?.node.as_mut() {
+            if node.status() == ReplicaNodeStatus::Active {
+                node.enter_view_uncertain()?;
+            }
+        }
+        self.configured_primary = None;
+        info!("ReplicaPrimaryLostQuorum: replica_id={}", primary.get());
+        Ok(())
+    }
+
+    fn require_view_change_quorum(
+        &self,
+        new_primary: ReplicaId,
+    ) -> Result<Vec<ReplicaId>, ReplicatedSimulationError> {
+        let voters = self.reachable_active_voters(new_primary)?;
+        if voters.len() < majority_quorum() {
+            return Err(ReplicatedSimulationError::ViewChangeQuorumUnavailable {
+                candidate: new_primary,
+                reachable: voters.len(),
+            });
+        }
+        Ok(voters)
+    }
+
+    fn view_change_target_commit_lsn(
+        &self,
+        voters: &[ReplicaId],
+    ) -> Result<Option<Lsn>, ReplicatedSimulationError> {
+        let mut target_commit_lsn = None;
+        for replica_id in voters {
+            let Some(node) = self.replica(*replica_id)? else {
+                continue;
+            };
+            target_commit_lsn = target_commit_lsn.max(node.metadata().commit_lsn);
+        }
+        Ok(target_commit_lsn)
+    }
+
+    fn record_view_change_votes(
+        &mut self,
+        voters: &[ReplicaId],
+        new_primary: ReplicaId,
+        new_view: u64,
+    ) -> Result<(), ReplicatedSimulationError> {
+        for voter in voters {
+            let node = self
+                .replica_entry_mut(*voter)?
+                .node
+                .as_mut()
+                .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(*voter))?;
+            node.record_durable_vote(new_view, new_primary)?;
+            if *voter != new_primary {
+                node.enter_view_uncertain()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn reconstruct_view_change_prefix(
+        &mut self,
+        new_primary: ReplicaId,
+        voters: &[ReplicaId],
+        target_commit_lsn: Option<Lsn>,
+    ) -> Result<(), ReplicatedSimulationError> {
+        let Some(target_commit_lsn) = target_commit_lsn else {
+            self.replica_entry_mut(new_primary)?
+                .node
+                .as_mut()
+                .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(
+                    new_primary,
+                ))?
+                .enter_view_uncertain()?;
+            return Ok(());
+        };
+
+        let next_needed_lsn = self
+            .replica(new_primary)?
+            .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(
+                new_primary,
+            ))?
+            .metadata()
+            .commit_lsn
+            .and_then(|lsn| lsn.get().checked_add(1))
+            .unwrap_or(1);
+        for raw_lsn in next_needed_lsn..=target_commit_lsn.get() {
+            let lsn = Lsn(raw_lsn);
+            let already_present = self
+                .replica(new_primary)?
+                .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(
+                    new_primary,
+                ))?
+                .prepared_entry(lsn)
+                .is_some();
+            if already_present {
+                continue;
+            }
+
+            let entry = self.find_prepared_entry(voters, new_primary, lsn)?.ok_or(
+                ReplicatedSimulationError::ViewChangeMissingPreparedEntry {
+                    candidate: new_primary,
+                    lsn,
+                },
+            )?;
+            self.replica_entry_mut(new_primary)?
+                .node
+                .as_mut()
+                .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(
+                    new_primary,
+                ))?
+                .append_prepared_entry(entry)?;
+        }
+
+        let node = self.replica_entry_mut(new_primary)?.node.as_mut().ok_or(
+            ReplicatedSimulationError::ReplicaAlreadyCrashed(new_primary),
+        )?;
+        node.enter_view_uncertain()?;
+        node.reconstruct_committed_prefix_through(target_commit_lsn)?;
+        Ok(())
+    }
+
+    fn install_view_change_roles(
+        &mut self,
+        voters: &[ReplicaId],
+        new_primary: ReplicaId,
+        new_view: u64,
+    ) -> Result<(), ReplicatedSimulationError> {
+        for voter in voters {
+            let role = if *voter == new_primary {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::Backup
+            };
+            let node = self
+                .replica_entry_mut(*voter)?
+                .node
+                .as_mut()
+                .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(*voter))?;
+            node.discard_uncommitted_suffix()?;
+            node.configure_normal_role(new_view, role)?;
+        }
+        Ok(())
+    }
+
+    fn reachable_active_voters(
+        &self,
+        candidate: ReplicaId,
+    ) -> Result<Vec<ReplicaId>, ReplicatedSimulationError> {
+        if !self.replica_is_active(candidate)? {
+            return Ok(Vec::new());
+        }
+
+        let mut voters = Vec::with_capacity(REPLICA_COUNT);
+        for replica in &self.replicas {
+            let replica_id = replica.identity.replica_id;
+            if !self.replica_is_active(replica_id)? {
+                continue;
+            }
+            if self.replicas_are_bidirectionally_connected(candidate, replica_id)? {
+                voters.push(replica_id);
+            }
+        }
+        Ok(voters)
+    }
+
+    fn replica_is_active(&self, replica_id: ReplicaId) -> Result<bool, ReplicatedSimulationError> {
+        Ok(matches!(
+            self.replica_observation(replica_id)?.runtime_status,
+            ReplicaRuntimeStatus::Running(ReplicaNodeStatus::Active)
+        ))
+    }
+
+    fn replicas_are_bidirectionally_connected(
+        &self,
+        left: ReplicaId,
+        right: ReplicaId,
+    ) -> Result<bool, ReplicatedSimulationError> {
+        if left == right {
+            return Ok(true);
+        }
+
+        Ok(self.connectivity_allows(
+            ClusterEndpoint::Replica(left),
+            ClusterEndpoint::Replica(right),
+        )? && self.connectivity_allows(
+            ClusterEndpoint::Replica(right),
+            ClusterEndpoint::Replica(left),
+        )?)
+    }
+
+    fn find_prepared_entry(
+        &self,
+        voters: &[ReplicaId],
+        candidate: ReplicaId,
+        lsn: Lsn,
+    ) -> Result<Option<ReplicaPreparedEntry>, ReplicatedSimulationError> {
+        for voter in voters {
+            if *voter == candidate {
+                continue;
+            }
+            let Some(node) = self.replica(*voter)? else {
+                continue;
+            };
+            if let Some(entry) = node.prepared_entry(lsn) {
+                return Ok(Some(entry.clone()));
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl Drop for ReplicatedSimulationHarness {
@@ -970,6 +1259,16 @@ fn log_replica_lifecycle_event(event: &str, observation: &ReplicaObservation) {
         observation.commit_lsn,
         observation.active_snapshot_lsn
     );
+}
+
+fn protocol_message_view(message: &ProtocolMessage) -> Option<u64> {
+    match message {
+        ProtocolMessage::Opaque => None,
+        ProtocolMessage::Prepare { entry } => Some(entry.view),
+        ProtocolMessage::PrepareAck { view, .. } | ProtocolMessage::Commit { view, .. } => {
+            Some(*view)
+        }
+    }
 }
 
 fn remove_if_exists(path: &Path) {

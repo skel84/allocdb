@@ -22,7 +22,7 @@ mod non_unix_tests;
 
 const MAX_REPLICA_METADATA_BYTES: u64 = 256;
 const REPLICA_METADATA_MAGIC: [u8; 4] = *b"RPLM";
-const REPLICA_METADATA_VERSION: u8 = 1;
+const REPLICA_METADATA_VERSION: u8 = 2;
 const REPLICA_PREPARE_LOG_MAGIC: [u8; 4] = *b"RPLP";
 const REPLICA_PREPARE_LOG_VERSION: u8 = 1;
 
@@ -52,6 +52,7 @@ pub struct ReplicaIdentity {
 pub enum ReplicaRole {
     Primary,
     Backup,
+    ViewUncertain,
     Recovering,
     Faulted,
 }
@@ -366,6 +367,10 @@ pub enum ReplicaProtocolError {
     UnsupportedNormalRole(ReplicaRole),
     RoleMismatch {
         expected: ReplicaRole,
+        found: ReplicaRole,
+    },
+    RoleSetMismatch {
+        expected: &'static str,
         found: ReplicaRole,
     },
     ViewRegression {
@@ -746,9 +751,10 @@ impl ReplicaNode {
         if !matches!(role, ReplicaRole::Primary | ReplicaRole::Backup) {
             return Err(ReplicaProtocolError::UnsupportedNormalRole(role));
         }
-        if current_view < self.metadata.current_view {
+        let highest_known_view = self.highest_known_view();
+        if current_view < highest_known_view {
             return Err(ReplicaProtocolError::ViewRegression {
-                current_view: self.metadata.current_view,
+                current_view: highest_known_view,
                 requested_view: current_view,
             });
         }
@@ -759,6 +765,64 @@ impl ReplicaNode {
         self.metadata.durable_vote = None;
         self.persist_metadata()?;
         Ok(())
+    }
+
+    /// Records one durable vote for a higher view without entering normal mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicaProtocolError`] if the replica is faulted, the requested view would move
+    /// backwards relative to the highest persisted local view knowledge, or the updated metadata
+    /// cannot be persisted durably.
+    pub fn record_durable_vote(
+        &mut self,
+        voted_view: u64,
+        voted_for: ReplicaId,
+    ) -> Result<(), ReplicaProtocolError> {
+        self.ensure_active()?;
+        let highest_known_view = self.highest_known_view();
+        if voted_view < highest_known_view {
+            return Err(ReplicaProtocolError::ViewRegression {
+                current_view: highest_known_view,
+                requested_view: voted_view,
+            });
+        }
+
+        self.metadata.durable_vote = Some(DurableVote {
+            view: voted_view,
+            voted_for,
+        });
+        self.persist_metadata()?;
+        Ok(())
+    }
+
+    /// Moves one active replica into explicit view-uncertain mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicaProtocolError`] if the replica is faulted or if the metadata update cannot
+    /// be persisted durably.
+    pub fn enter_view_uncertain(&mut self) -> Result<(), ReplicaProtocolError> {
+        self.ensure_active()?;
+        if self.metadata.role == ReplicaRole::ViewUncertain {
+            return Ok(());
+        }
+
+        self.metadata.role = ReplicaRole::ViewUncertain;
+        self.persist_metadata()?;
+        Ok(())
+    }
+
+    /// Discards any uncommitted prepared suffix from local replica state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicaProtocolError`] if the replica is faulted or if the prepared-entry sidecar
+    /// cannot be updated durably.
+    pub fn discard_uncommitted_suffix(&mut self) -> Result<(), ReplicaProtocolError> {
+        self.ensure_active()?;
+        self.prepared_entries.clear();
+        self.persist_prepared_entries()
     }
 
     /// Validates and durably prepares one client request on the current primary.
@@ -838,56 +902,34 @@ impl ReplicaNode {
         commit_lsn: Lsn,
     ) -> Result<Option<SubmissionResult>, ReplicaProtocolError> {
         self.ensure_normal_role()?;
-        let first_pending = self
-            .metadata
-            .commit_lsn
-            .and_then(|lsn| lsn.get().checked_add(1))
-            .unwrap_or(1);
-        if commit_lsn.get() < first_pending {
-            return Ok(None);
+        self.commit_prepared_through_impl(commit_lsn)
+    }
+
+    /// Applies prepared entries through one already reconstructed committed prefix while the
+    /// replica remains outside normal mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicaProtocolError`] if the replica is faulted, if the local role is not
+    /// `backup` or `view_uncertain`, if any committed LSN is missing from the prepared buffer, if
+    /// the entry view no longer matches the local view, if the single-node executor rejects the
+    /// payload, if the applied LSN diverges from the prepared position, or if the updated metadata
+    /// / prepared-entry sidecar cannot be persisted.
+    pub fn reconstruct_committed_prefix_through(
+        &mut self,
+        commit_lsn: Lsn,
+    ) -> Result<Option<SubmissionResult>, ReplicaProtocolError> {
+        self.ensure_active()?;
+        if !matches!(
+            self.metadata.role,
+            ReplicaRole::Backup | ReplicaRole::ViewUncertain
+        ) {
+            return Err(ReplicaProtocolError::RoleSetMismatch {
+                expected: "backup or view_uncertain",
+                found: self.metadata.role,
+            });
         }
-
-        let entries = (first_pending..=commit_lsn.get())
-            .map(|lsn| {
-                self.prepared_entries
-                    .get(&lsn)
-                    .cloned()
-                    .ok_or(ReplicaProtocolError::MissingPreparedEntry { lsn: Lsn(lsn) })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut last_result = None;
-        for entry in &entries {
-            if entry.view != self.metadata.current_view {
-                return Err(ReplicaProtocolError::ViewMismatch {
-                    expected: self.metadata.current_view,
-                    found: entry.view,
-                });
-            }
-            let result = self
-                .engine_mut()?
-                .submit_encoded(entry.request_slot, &entry.payload)?;
-            if result.applied_lsn != entry.lsn {
-                return Err(ReplicaProtocolError::AppliedLsnMismatch {
-                    expected: entry.lsn,
-                    found: result.applied_lsn,
-                });
-            }
-            self.metadata.commit_lsn = Some(entry.lsn);
-            self.metadata.active_snapshot_lsn = self
-                .engine
-                .as_ref()
-                .and_then(SingleNodeEngine::active_snapshot_lsn);
-            last_result = Some(result);
-        }
-
-        for entry in &entries {
-            self.prepared_entries.remove(&entry.lsn.get());
-        }
-
-        self.persist_prepared_entries()?;
-        self.persist_metadata()?;
-        Ok(last_result)
+        self.commit_prepared_through_impl(commit_lsn)
     }
 
     /// Enforces the first replicated-release read rule: only the current primary may serve reads.
@@ -943,6 +985,14 @@ impl ReplicaNode {
         }
     }
 
+    fn highest_known_view(&self) -> u64 {
+        self.metadata
+            .durable_vote
+            .map_or(self.metadata.current_view, |vote| {
+                self.metadata.current_view.max(vote.view)
+            })
+    }
+
     fn next_prepared_lsn(&self) -> Result<Lsn, ReplicaProtocolError> {
         let last_lsn = self
             .prepared_entries
@@ -963,6 +1013,62 @@ impl ReplicaNode {
         self.prepare_log_file
             .write_entries(&self.prepared_entries)
             .map_err(|error| ReplicaProtocolError::PrepareStorage(error.kind()))
+    }
+
+    fn commit_prepared_through_impl(
+        &mut self,
+        commit_lsn: Lsn,
+    ) -> Result<Option<SubmissionResult>, ReplicaProtocolError> {
+        let first_pending = self
+            .metadata
+            .commit_lsn
+            .and_then(|lsn| lsn.get().checked_add(1))
+            .unwrap_or(1);
+        if commit_lsn.get() < first_pending {
+            return Ok(None);
+        }
+
+        let entries = (first_pending..=commit_lsn.get())
+            .map(|lsn| {
+                self.prepared_entries
+                    .get(&lsn)
+                    .cloned()
+                    .ok_or(ReplicaProtocolError::MissingPreparedEntry { lsn: Lsn(lsn) })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut last_result = None;
+        for entry in &entries {
+            if entry.view != self.metadata.current_view {
+                return Err(ReplicaProtocolError::ViewMismatch {
+                    expected: self.metadata.current_view,
+                    found: entry.view,
+                });
+            }
+            let result = self
+                .engine_mut()?
+                .submit_encoded(entry.request_slot, &entry.payload)?;
+            if result.applied_lsn != entry.lsn {
+                return Err(ReplicaProtocolError::AppliedLsnMismatch {
+                    expected: entry.lsn,
+                    found: result.applied_lsn,
+                });
+            }
+            self.metadata.commit_lsn = Some(entry.lsn);
+            self.metadata.active_snapshot_lsn = self
+                .engine
+                .as_ref()
+                .and_then(SingleNodeEngine::active_snapshot_lsn);
+            last_result = Some(result);
+        }
+
+        for entry in &entries {
+            self.prepared_entries.remove(&entry.lsn.get());
+        }
+
+        self.persist_prepared_entries()?;
+        self.persist_metadata()?;
+        Ok(last_result)
     }
 
     fn engine_mut(&mut self) -> Result<&mut SingleNodeEngine, ReplicaProtocolError> {
@@ -1164,8 +1270,9 @@ const fn encode_role(role: ReplicaRole) -> u8 {
     match role {
         ReplicaRole::Primary => 1,
         ReplicaRole::Backup => 2,
-        ReplicaRole::Recovering => 3,
-        ReplicaRole::Faulted => 4,
+        ReplicaRole::ViewUncertain => 3,
+        ReplicaRole::Recovering => 4,
+        ReplicaRole::Faulted => 5,
     }
 }
 
@@ -1173,8 +1280,9 @@ fn decode_role(value: u8) -> Result<ReplicaRole, ReplicaMetadataDecodeError> {
     match value {
         1 => Ok(ReplicaRole::Primary),
         2 => Ok(ReplicaRole::Backup),
-        3 => Ok(ReplicaRole::Recovering),
-        4 => Ok(ReplicaRole::Faulted),
+        3 => Ok(ReplicaRole::ViewUncertain),
+        4 => Ok(ReplicaRole::Recovering),
+        5 => Ok(ReplicaRole::Faulted),
         _ => Err(ReplicaMetadataDecodeError::InvalidRole(value)),
     }
 }

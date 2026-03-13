@@ -239,6 +239,16 @@ The protocol rules are:
 - committed entries survive the view change unchanged
 - uncommitted suffix entries from the old primary may be discarded
 
+The current replicated prototype realizes those rules with one explicit `view_uncertain` role and
+durable higher-view vote metadata:
+
+- a replica that loses quorum or votes for a higher view leaves normal mode and stops serving reads
+  or accepting fresh client writes
+- the new primary records one durable vote from a reachable majority before it re-enters normal
+  mode
+- view change reconstructs the latest committed prefix on the new primary, discards stale
+  uncommitted suffix state, and drops old-view protocol messages instead of trying to finish them
+
 Client impact:
 
 - if the old primary fails before replying, the client still has an indefinite outcome

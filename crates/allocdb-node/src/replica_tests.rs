@@ -11,8 +11,8 @@ use crate::engine::{EngineConfig, SingleNodeEngine};
 use crate::replica::{
     DurableVote, ReplicaFaultReason, ReplicaId, ReplicaIdentity, ReplicaMetadata,
     ReplicaMetadataDecodeError, ReplicaMetadataFile, ReplicaMetadataFileError,
-    ReplicaMetadataLoadError, ReplicaNode, ReplicaNodeStatus, ReplicaPaths, ReplicaRole,
-    ReplicaStartupValidationError, prepare_log_path,
+    ReplicaMetadataLoadError, ReplicaNode, ReplicaNodeStatus, ReplicaPaths, ReplicaPreparedEntry,
+    ReplicaRole, ReplicaStartupValidationError, prepare_log_path,
 };
 
 fn test_path(name: &str, extension: &str) -> PathBuf {
@@ -153,6 +153,39 @@ fn replica_metadata_file_round_trips() {
 }
 
 #[test]
+fn replica_metadata_file_rejects_previous_role_encoding_version() {
+    let path = metadata_path("metadata-old-version");
+    let file = ReplicaMetadataFile::new(&path);
+    let metadata = ReplicaMetadata {
+        identity: identity(),
+        current_view: 4,
+        role: ReplicaRole::ViewUncertain,
+        commit_lsn: Some(Lsn(17)),
+        active_snapshot_lsn: Some(Lsn(12)),
+        last_normal_view: Some(3),
+        durable_vote: Some(DurableVote {
+            view: 5,
+            voted_for: ReplicaId(2),
+        }),
+    };
+
+    file.write_metadata(&metadata).unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[4] = 1;
+    fs::write(&path, &bytes).unwrap();
+
+    let loaded = file.load_metadata();
+    assert!(matches!(
+        loaded,
+        Err(ReplicaMetadataFileError::Decode(
+            ReplicaMetadataDecodeError::UnsupportedVersion(1)
+        ))
+    ));
+
+    remove_if_exists(&path);
+}
+
+#[test]
 fn replica_open_bootstraps_missing_metadata() {
     let paths = ReplicaPaths::new(
         metadata_path("bootstrap-open"),
@@ -244,6 +277,104 @@ fn replica_prepare_and_commit_keep_apply_gated_by_commit() {
             .resource(ResourceId(11))
             .is_some()
     );
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_vote_persists_view_uncertainty_and_blocks_view_regression() {
+    let paths = ReplicaPaths::new(
+        metadata_path("vote-view-uncertain"),
+        snapshot_path("vote-view-uncertain"),
+        wal_path("vote-view-uncertain"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(2, ReplicaRole::Backup).unwrap();
+
+    node.record_durable_vote(3, ReplicaId(2)).unwrap();
+    node.enter_view_uncertain().unwrap();
+
+    let persisted = ReplicaMetadataFile::new(node.metadata_path())
+        .load_metadata()
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.current_view, 2);
+    assert_eq!(persisted.role, ReplicaRole::ViewUncertain);
+    assert_eq!(
+        persisted.durable_vote,
+        Some(DurableVote {
+            view: 3,
+            voted_for: ReplicaId(2),
+        })
+    );
+    assert!(matches!(
+        node.configure_normal_role(2, ReplicaRole::Primary),
+        Err(crate::replica::ReplicaProtocolError::ViewRegression {
+            current_view: 3,
+            requested_view: 2,
+        })
+    ));
+
+    node.configure_normal_role(3, ReplicaRole::Primary).unwrap();
+    assert_eq!(node.metadata().current_view, 3);
+    assert_eq!(node.metadata().role, ReplicaRole::Primary);
+    assert_eq!(node.metadata().durable_vote, None);
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_reconstructs_committed_prefix_and_discards_uncommitted_suffix() {
+    let paths = ReplicaPaths::new(
+        metadata_path("reconstruct-prefix"),
+        snapshot_path("reconstruct-prefix"),
+        wal_path("reconstruct-prefix"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Backup).unwrap();
+
+    node.append_prepared_entry(ReplicaPreparedEntry {
+        view: 1,
+        lsn: Lsn(1),
+        request_slot: Slot(1),
+        payload: encode_client_request(create(11, 1)),
+    })
+    .unwrap();
+    node.append_prepared_entry(ReplicaPreparedEntry {
+        view: 1,
+        lsn: Lsn(2),
+        request_slot: Slot(2),
+        payload: encode_client_request(create(12, 2)),
+    })
+    .unwrap();
+    node.enter_view_uncertain().unwrap();
+
+    let committed = node
+        .reconstruct_committed_prefix_through(Lsn(1))
+        .unwrap()
+        .expect("reconstructed prefix should apply one committed entry");
+    assert_eq!(committed.applied_lsn, Lsn(1));
+    assert_eq!(node.metadata().commit_lsn, Some(Lsn(1)));
+    assert_eq!(node.prepared_len(), 1);
+    assert!(
+        node.engine()
+            .unwrap()
+            .db()
+            .resource(ResourceId(11))
+            .is_some()
+    );
+    assert!(
+        node.engine()
+            .unwrap()
+            .db()
+            .resource(ResourceId(12))
+            .is_none()
+    );
+
+    node.discard_uncommitted_suffix().unwrap();
+    assert_eq!(node.prepared_len(), 0);
 
     cleanup(&paths);
 }

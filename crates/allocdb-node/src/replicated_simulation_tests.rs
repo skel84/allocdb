@@ -228,6 +228,28 @@ fn pending_labels(harness: &ReplicatedSimulationHarness) -> Vec<&str> {
         .collect()
 }
 
+fn set_replica_link(
+    harness: &mut ReplicatedSimulationHarness,
+    left: u64,
+    right: u64,
+    allowed: bool,
+) {
+    harness
+        .set_connectivity(
+            ClusterEndpoint::Replica(replica(left)),
+            ClusterEndpoint::Replica(replica(right)),
+            allowed,
+        )
+        .unwrap();
+    harness
+        .set_connectivity(
+            ClusterEndpoint::Replica(replica(right)),
+            ClusterEndpoint::Replica(replica(left)),
+            allowed,
+        )
+        .unwrap();
+}
+
 #[test]
 fn replicated_harness_bootstraps_three_real_replicas_with_independent_workspaces() {
     let harness = ReplicatedSimulationHarness::new(
@@ -666,5 +688,157 @@ fn reads_are_served_only_from_the_primary_after_local_commit() {
         Err(ReplicatedSimulationError::Read(NotPrimaryReadError::Role(
             ReplicaRole::Backup
         )))
+    ));
+}
+
+#[test]
+fn quorum_lost_primary_fails_closed_for_reads_and_writes() {
+    let mut harness = primary_harness("replicated-quorum-loss", 0x5a3);
+
+    let entry = harness
+        .client_submit(replica(1), Slot(1), &create_payload(31, 3), "quorum-loss")
+        .unwrap();
+    harness
+        .deliver_protocol_message("quorum-loss-prepare-1-to-2")
+        .unwrap();
+    harness
+        .deliver_protocol_message("quorum-loss-prepare-1-to-2-ack")
+        .unwrap();
+
+    let before_loss = harness
+        .read_resource(replica(1), ResourceId(31), Some(entry.lsn))
+        .unwrap()
+        .expect("primary should serve reads before quorum loss");
+    assert_eq!(before_loss.resource_id, ResourceId(31));
+
+    set_replica_link(&mut harness, 1, 2, false);
+    set_replica_link(&mut harness, 1, 3, false);
+
+    assert_eq!(harness.configured_primary(), None);
+    assert_eq!(
+        harness
+            .replica(replica(1))
+            .unwrap()
+            .unwrap()
+            .metadata()
+            .role,
+        ReplicaRole::ViewUncertain
+    );
+
+    let stale_read = harness.read_resource(replica(1), ResourceId(31), Some(entry.lsn));
+    assert!(matches!(
+        stale_read,
+        Err(ReplicatedSimulationError::Read(NotPrimaryReadError::Role(
+            ReplicaRole::ViewUncertain
+        )))
+    ));
+
+    let stale_write = harness.client_submit(
+        replica(1),
+        Slot(2),
+        &create_payload(32, 4),
+        "quorum-loss-retry",
+    );
+    assert!(matches!(
+        stale_write,
+        Err(ReplicatedSimulationError::NotConfiguredPrimary {
+            expected: None,
+            found
+        }) if found == replica(1)
+    ));
+}
+
+#[test]
+fn higher_view_takeover_reconstructs_prefix_and_rejects_stale_primary_reads() {
+    let mut harness = primary_harness("replicated-view-change", 0x5a4);
+
+    let entry = harness
+        .client_submit(replica(1), Slot(1), &create_payload(41, 5), "view-change")
+        .unwrap();
+    harness
+        .deliver_protocol_message("view-change-prepare-1-to-2")
+        .unwrap();
+    harness
+        .deliver_protocol_message("view-change-prepare-1-to-3")
+        .unwrap();
+    harness
+        .deliver_protocol_message("view-change-prepare-1-to-3-ack")
+        .unwrap();
+    harness.deliver_protocol_message("commit-1-to-3").unwrap();
+
+    assert_eq!(replica_last_applied_lsn(&harness, 1), Some(entry.lsn));
+    assert_eq!(replica_last_applied_lsn(&harness, 2), None);
+    assert_eq!(replica_prepared_len(&harness, 2), 1);
+    assert_eq!(replica_last_applied_lsn(&harness, 3), Some(entry.lsn));
+
+    set_replica_link(&mut harness, 1, 2, false);
+    set_replica_link(&mut harness, 1, 3, false);
+    assert_eq!(harness.configured_primary(), None);
+
+    harness.complete_view_change(replica(2), 2).unwrap();
+
+    assert_eq!(harness.configured_primary(), Some(replica(2)));
+    assert_eq!(
+        harness
+            .replica(replica(2))
+            .unwrap()
+            .unwrap()
+            .metadata()
+            .role,
+        ReplicaRole::Primary
+    );
+    assert_eq!(
+        harness
+            .replica(replica(2))
+            .unwrap()
+            .unwrap()
+            .metadata()
+            .current_view,
+        2
+    );
+    assert_eq!(replica_last_applied_lsn(&harness, 2), Some(entry.lsn));
+    assert_eq!(replica_prepared_len(&harness, 2), 0);
+    assert_eq!(
+        harness
+            .replica(replica(3))
+            .unwrap()
+            .unwrap()
+            .metadata()
+            .role,
+        ReplicaRole::Backup
+    );
+    assert_eq!(
+        harness
+            .replica(replica(3))
+            .unwrap()
+            .unwrap()
+            .metadata()
+            .current_view,
+        2
+    );
+    assert!(pending_labels(&harness).is_empty());
+
+    let new_primary_read = harness
+        .read_resource(replica(2), ResourceId(41), Some(entry.lsn))
+        .unwrap()
+        .expect("new primary should serve the committed prefix after failover");
+    assert_eq!(new_primary_read.resource_id, ResourceId(41));
+
+    let stale_primary_read = harness.read_resource(replica(1), ResourceId(41), Some(entry.lsn));
+    assert!(matches!(
+        stale_primary_read,
+        Err(ReplicatedSimulationError::Read(NotPrimaryReadError::Role(
+            ReplicaRole::ViewUncertain
+        )))
+    ));
+
+    let stale_primary_write =
+        harness.client_submit(replica(1), Slot(2), &create_payload(42, 6), "stale-primary");
+    assert!(matches!(
+        stale_primary_write,
+        Err(ReplicatedSimulationError::NotConfiguredPrimary {
+            expected: Some(expected),
+            found
+        }) if expected == replica(2) && found == replica(1)
     ));
 }
