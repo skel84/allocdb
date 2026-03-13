@@ -12,9 +12,9 @@
   - `M1H` constant-time core hardening: complete
   - `M2` durability and recovery: implemented
   - `M3` submission pipeline: implemented
-  - `M4` simulation: in progress
-  - `M5` single-node alpha surface: in progress
-  - `M6` replication design: not started
+  - `M4` simulation: implemented
+  - `M5` single-node alpha surface: implemented
+  - `M6` replication design: in progress
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -78,6 +78,11 @@
 - Operator documentation:
   - operator-facing runbook for single-node startup, restart, checkpoint, overload, expiration
     maintenance, and corruption/fail-closed handling
+- Replication design draft:
+  - VSR-style primary/backup replicated log with fixed membership and majority quorums
+  - leader-only reads in the first replicated release
+  - protocol invariants that preserve single-node idempotency, strict-read, TTL, and
+    reservation-ID semantics across failover
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -123,11 +128,11 @@
 
 ## Current Focus
 
-- `M4-T04`: extend the seeded simulation driver with reproducible schedule exploration over
-  ingress order, expiration order, and retry timing
-- keep `M4-T02` and `M4-T03` regression coverage green while broadening the schedule matrix
-- keep the operator runbook, testing notes, and status snapshot aligned as new simulation evidence
-  lands
+- `M6-T02`: define how deterministic simulation extends to replicated execution for partitions,
+  leader crash, and rejoin on top of the protocol draft in `docs/replication.md`
+- follow with `M6-T03` to define the Jepsen gate for any replicated release
+- keep `docs/status.md`, `docs/testing.md`, and `docs/replication.md` aligned as replication
+  design work becomes more concrete
 
 ## How To Check Progress
 
