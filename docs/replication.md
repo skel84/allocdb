@@ -137,6 +137,23 @@ The exact persisted election record may look like `voted_for`, `last_normal_view
 equivalent durable view-participation marker. The implementation detail can vary; the safety
 obligation cannot.
 
+The first `M7-T01` implementation persists this wrapper state in one dedicated local metadata file
+alongside the replica workspace. The current persisted fields are:
+
+- `replica_id`
+- `shard_id`
+- `current_view`
+- `role`
+- `commit_lsn`
+- `active_snapshot_lsn`
+- `last_normal_view`
+- optional durable vote record `(view, voted_for)`
+
+Replica startup validates identity, vote/view ordering, commit-versus-snapshot consistency, and
+the local applied/snapshot state against this metadata before a replica can join. Decode failure,
+metadata inconsistency, or an explicitly persisted `faulted` role leaves the replica in `faulted`
+state until repaired.
+
 ## Replicated Log Contents
 
 The replicated log contains allocator-relevant entries only:

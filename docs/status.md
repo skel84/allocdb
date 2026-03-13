@@ -2,7 +2,7 @@
 
 ## Current State
 
-- Phase: replicated implementation planning
+- Phase: replicated implementation
 - Planning IDs:
   - tasks use `M#-T#`
   - spikes use `M#-S#`
@@ -15,7 +15,7 @@
   - `M4` simulation: implemented
   - `M5` single-node alpha surface: implemented
   - `M6` replication design: implemented
-  - `M7` replicated core prototype: planned
+  - `M7` replicated core prototype: in progress
   - `M8` external cluster validation: planned
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
@@ -34,7 +34,9 @@
     `u64::MAX`, deterministic storage-fault injection for append failures, sync-failure
     ambiguity, checksum-mismatch fail-closed recovery, and torn-tail truncation over the real WAL
     restart path, plus replayable seeded schedule exploration over ingress contention,
-    due-expiration selection with earliest-deadline priority, and retry timing
+    due-expiration selection with earliest-deadline priority, retry timing, and a replicated-node
+    wrapper with durable replica metadata bootstrap, restart validation, and explicit faulted-state
+    entry on invalid local protocol metadata
 
 ## What Exists
 
@@ -91,6 +93,13 @@
   - Jepsen gate with explicit contention, ambiguity, failover, and expiration workloads
   - retry-aware history interpretation and release-blocking invariants for duplicate execution,
     stale successful reads, double allocation, and early reuse
+- Replicated node scaffolding:
+  - dedicated replica metadata file with temp-write, rename, and directory-sync durability
+  - persisted replica identity, role, view, commit point, snapshot anchor, last-normal view, and
+    optional durable vote metadata
+  - startup bootstrap for missing metadata on both fresh-open and recover paths
+  - fail-closed `faulted` state when metadata bytes are corrupt, identity is mismatched, or local
+    applied/snapshot state contradicts the persisted replicated metadata
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -130,15 +139,16 @@
   - `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
   - `cargo test -p allocdb-node api_reservation_reports_retired_history`
   - `cargo test -p allocdb-node engine -- --nocapture`
+  - `cargo test -p allocdb-node replica -- --nocapture`
   - `cargo test -p allocdb-node simulation -- --nocapture`
   - `cargo run -p allocdb-bench -- --scenario all`
   - `scripts/preflight.sh`
 
 ## Current Focus
 
-- `M7-T01`: add replicated node state and durable protocol metadata
 - `M7-T02`: build the deterministic 3-replica cluster harness
 - `M7-T03`: implement the first quorum write path with one configured primary
+- finish `M7-T01` review and merge, then use the new replica wrapper as the base for `M7-T02`
 - follow with `M7-T04` through `M7-T06` for view change, rejoin, and executable replicated
   simulation coverage
 - use `M8` for the external multi-process, QEMU, and Jepsen layers after the in-process replicated
