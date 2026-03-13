@@ -229,7 +229,7 @@ The first replicated simulation plan must cover these families explicitly.
 
 Key checks:
 
-- no split brain commit
+- no split-brain commit
 - no read served from a view-uncertain or quorum-lost replica
 - retries with the same `operation_id` resolve ambiguity without duplicate execution
 
