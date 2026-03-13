@@ -376,6 +376,73 @@ fn connectivity_matrix_controls_delivery_until_partition_heals() {
 }
 
 #[test]
+fn invalid_replica_access_returns_unknown_replica() {
+    let harness = ReplicatedSimulationHarness::new(
+        "replicated-unknown-replica",
+        0x999,
+        core_config(),
+        engine_config(),
+    )
+    .unwrap();
+
+    let error = harness.replica_paths(replica(9)).unwrap_err();
+    assert!(matches!(
+        error,
+        ReplicatedSimulationError::UnknownReplica(replica_id) if replica_id == replica(9)
+    ));
+}
+
+#[test]
+fn queue_and_deliver_reject_crashed_replicas() {
+    let mut harness = ReplicatedSimulationHarness::new(
+        "replicated-crashed-errors",
+        0x998,
+        core_config(),
+        engine_config(),
+    )
+    .unwrap();
+
+    harness.crash_replica(replica(2)).unwrap();
+
+    let queued_from_crashed = harness
+        .queue_protocol_message(replica(2), replica(1), "prepare-from-crashed")
+        .unwrap_err();
+    assert!(matches!(
+        queued_from_crashed,
+        ReplicatedSimulationError::ReplicaAlreadyCrashed(replica_id) if replica_id == replica(2)
+    ));
+
+    harness
+        .queue_protocol_message(replica(1), replica(2), "prepare-to-crashed")
+        .unwrap();
+    let delivered_to_crashed = harness
+        .deliver_protocol_message("prepare-to-crashed")
+        .unwrap_err();
+    assert!(matches!(
+        delivered_to_crashed,
+        ReplicatedSimulationError::ReplicaAlreadyCrashed(replica_id) if replica_id == replica(2)
+    ));
+    assert_eq!(harness.pending_messages().len(), 1);
+}
+
+#[test]
+fn restart_rejects_running_replica() {
+    let mut harness = ReplicatedSimulationHarness::new(
+        "replicated-running-restart",
+        0x997,
+        core_config(),
+        engine_config(),
+    )
+    .unwrap();
+
+    let error = harness.restart_replica(replica(1)).unwrap_err();
+    assert!(matches!(
+        error,
+        ReplicatedSimulationError::ReplicaAlreadyRunning(replica_id) if replica_id == replica(1)
+    ));
+}
+
+#[test]
 fn crash_and_restart_keep_replica_workspace_stable() {
     let mut harness = ReplicatedSimulationHarness::new(
         "replicated-restart",

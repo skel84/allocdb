@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use allocdb_core::config::Config;
 use allocdb_core::ids::{Lsn, Slot};
+use log::debug;
 
 use crate::engine::EngineConfig;
 use crate::replica::{
@@ -352,6 +353,12 @@ impl ReplicatedSimulationHarness {
         };
         self.next_message_id += 1;
         self.pending_messages.push(message.clone());
+        log_protocol_message_event(
+            "ProtocolMessageQueued",
+            &message,
+            self.pending_messages.len(),
+            self.next_message_id,
+        );
         Ok(ReplicatedScheduleObservationKind::ProtocolMessageQueued {
             message,
             pending_messages: self.pending_messages.len(),
@@ -380,6 +387,12 @@ impl ReplicatedSimulationHarness {
         }
 
         self.pending_messages.remove(index);
+        log_protocol_message_event(
+            "ProtocolMessageDelivered",
+            &message,
+            self.pending_messages.len(),
+            self.next_message_id,
+        );
         Ok(
             ReplicatedScheduleObservationKind::ProtocolMessageDelivered {
                 message,
@@ -395,6 +408,12 @@ impl ReplicatedSimulationHarness {
     ) -> Result<ReplicatedScheduleObservationKind, ReplicatedSimulationError> {
         let index = self.pending_message_index(message_label)?;
         let message = self.pending_messages.remove(index);
+        log_protocol_message_event(
+            "ProtocolMessageDropped",
+            &message,
+            self.pending_messages.len(),
+            self.next_message_id,
+        );
         Ok(ReplicatedScheduleObservationKind::ProtocolMessageDropped {
             message,
             pending_messages: self.pending_messages.len(),
@@ -593,6 +612,23 @@ fn metadata_temp_path(path: &Path) -> PathBuf {
         .map_or_else(|| "tmp".to_owned(), |value| format!("{value}.tmp"));
     temp_path.set_extension(extension);
     temp_path
+}
+
+fn log_protocol_message_event(
+    event: &str,
+    message: &QueuedProtocolMessage,
+    pending_messages: usize,
+    next_message_id: u64,
+) {
+    debug!(
+        "{event}: message_id={} label={} from={} to={} pending_messages={} next_message_id={}",
+        message.message_id,
+        message.label,
+        message.from.get(),
+        message.to.get(),
+        pending_messages,
+        next_message_id
+    );
 }
 
 fn remove_if_exists(path: &Path) {
