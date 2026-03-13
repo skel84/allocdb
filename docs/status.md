@@ -41,7 +41,10 @@
     delivered, dropped, crashed, and restarted replica actions, plus the first majority-backed
     quorum write path with one configured primary, durable prepared-entry buffering, real
     `prepare`/`prepare_ack`/`commit` queue semantics, commit publication only after majority
-    durable append, and primary-only read enforcement on locally applied committed state
+    durable append, primary-only read enforcement on locally applied committed state, explicit
+    quorum-loss demotion into `view_uncertain`, durable higher-view vote recording, higher-view
+    takeover that reconstructs the latest committed prefix before normal mode, stale-message
+    discard across view change, and fail-closed stale-primary read and write rejection
 
 ## What Exists
 
@@ -106,6 +109,8 @@
   - fail-closed `faulted` state when metadata bytes are corrupt, identity is mismatched, or local
     applied/snapshot state contradicts the persisted replicated metadata
   - configurable normal-mode `primary` and `backup` roles for one current view
+  - explicit `view_uncertain` role plus durable higher-view voting for replicas that lost quorum
+    or are participating in failover
   - durable prepared-entry sidecar for pre-commit replicated client commands
   - prepare append, commit-through, and strict primary-read guards built around the existing
     single-node executor rather than a second apply path
@@ -151,7 +156,13 @@
     append
   - backup replicas that durably append prepares but do not apply allocator state until commit
   - primary-only resource reads guarded by the existing strict-read fence after local commit
+  - automatic quorum-loss detection that demotes a stranded primary out of service
+  - explicit higher-view takeover that records durable votes from a reachable majority,
+    reconstructs the safe committed prefix on the new primary, discards stale uncommitted suffix,
+    and drops old-view protocol messages
   - replica crash as loss of volatile state with restart through real `ReplicaNode::recover`
+  - regression coverage for quorum-loss fail-closed reads and writes plus higher-view takeover
+    with stale-primary read rejection
 - Validation:
   - `cargo test -p allocdb-core wal -- --nocapture`
   - `cargo test -p allocdb-core snapshot -- --nocapture`
@@ -167,10 +178,11 @@
 
 ## Current Focus
 
-- `M7-T03` is implemented on this branch; the next execution target is `M7-T04`
-- add higher-view takeover and fail-closed read behavior when the old primary loses quorum
-- preserve the committed prefix from `M7-T03` while introducing view change and quorum-loss tests
-- follow with `M7-T05` and `M7-T06` for rejoin and executable replicated simulation coverage
+- `M7-T04` is implemented on this branch; the next execution target is `M7-T05`
+- add suffix catch-up, snapshot transfer, and safe rejoin for stale replicas
+- preserve the committed-prefix and fail-closed view-change rules now established by `M7-T04`
+- follow with `M7-T06` and then `M8` for broader executable replicated coverage and external
+  cluster validation
 - use `M8` for the external multi-process, QEMU, and Jepsen layers after the in-process replicated
   prototype is credible
 
