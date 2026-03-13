@@ -3,9 +3,7 @@
 ## Current State
 
 - Phase: replicated implementation
-- Planning IDs:
-  - tasks use `M#-T#`
-  - spikes use `M#-S#`
+- Planning IDs: tasks use `M#-T#`; spikes use `M#-S#`
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
   - `M1` pure state machine: implemented
@@ -49,11 +47,14 @@
     holds a recent enough committed durable prefix, falls back to snapshot transfer when the
     primary has already pruned older history, discards divergent uncommitted prepared suffix
     during rejoin, rejects faulted replicas instead of auto-repairing them, and fails closed if a
-    target already knows a higher durable view than the current primary, plus the first
-    multi-process local cluster runner with one persisted `cluster-layout.txt`, stable
-    three-replica workspaces, per-replica pid and log files, reserved loopback addresses, and a
-    smoke-tested `start`/`status`/`stop` command surface that preserves replica identity and
-    on-disk layout across restart
+    target already knows a higher durable view than the current primary, plus promoted
+    deterministic partition and primary-crash scenarios that prove minority-partition catch-up,
+    full-split fail-closed behavior, pre-quorum retry replay, majority-appended failover
+    reconstruction, prepared-suffix recovery from another voter during takeover, and post-reply
+    retry/read preservation on the new primary, and the first multi-process local cluster runner
+    with one persisted `cluster-layout.txt`, stable three-replica workspaces, per-replica pid and
+    log files, reserved loopback addresses, and a smoke-tested `start`/`status`/`stop` command
+    surface that preserves replica identity and on-disk layout across restart
 
 ## What Exists
 
@@ -98,7 +99,7 @@
   - metrics exposure through the same API boundary
 - Operator documentation:
   - operator-facing runbook for the single-node alpha and local replicated cluster runner,
-    including workspace layout, start/stop/status usage, and current control-hook limits
+    including workspace layout plus start/stop/status usage and current control-hook limits
 - Replication design draft:
   - VSR-style primary/backup replicated log with fixed membership and majority quorums
   - primary-only reads in the first replicated release
@@ -127,8 +128,7 @@
   - CLI entrypoint at `cargo run -p allocdb-node --bin allocdb-local-cluster -- <start|stop|status> --workspace <path>` with one persisted `cluster-layout.txt`
   - stable replica identities, local bounds, and three external replica processes from one command surface
   - per-replica loopback `control`, `client`, and `protocol` listeners with `status` and `stop` hooks on `control`
-  - per-replica pid, log, WAL, snapshot, metadata, and prepared-log paths exposed through `status`
-  - restart through the real `ReplicaNode::recover` path with stable durable workspace reuse
+  - per-replica pid, log, WAL, snapshot, metadata, and prepared-log paths exposed through `status`, with restart through the real `ReplicaNode::recover` path and stable durable workspace reuse
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -169,6 +169,8 @@
   - real `prepare`, `prepare_ack`, and `commit` protocol payload delivery on that queue
   - configured-primary client submit flow with result publication only after majority durable
     append
+  - retry-aware client submit helper that returns one cached committed result on the current
+    primary instead of assigning a fresh replicated LSN
   - backup replicas that durably append prepares but do not apply allocator state until commit
   - primary-only resource reads guarded by the existing strict-read fence after local commit
   - automatic quorum-loss detection that demotes a stranded primary out of service
@@ -180,28 +182,25 @@
     snapshot transfer, then restarts through the real recovery path before returning the replica
     to backup mode
   - regression coverage for quorum-loss fail-closed reads and writes, higher-view takeover with
-    stale-primary read rejection, suffix-only rejoin, snapshot-transfer rejoin, and faulted
-    rejoin rejection
+    stale-primary read rejection, prepared-suffix recovery from another voter during takeover,
+    isolated-backup partition heal and catch-up, non-quorum split fail-closed behavior with later
+    rejoin convergence, primary crash before quorum append, primary crash after majority append,
+    primary crash after reply, suffix-only rejoin, snapshot-transfer rejoin, and faulted rejoin
+    rejection
 - Validation:
-  - `cargo test -p allocdb-node local_cluster -- --nocapture`
-  - `cargo test -p allocdb-core wal -- --nocapture`
-  - `cargo test -p allocdb-core snapshot -- --nocapture`
-  - `cargo test -p allocdb-core recovery -- --nocapture`
-  - `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
-  - `cargo test -p allocdb-node api_reservation_reports_retired_history`
-  - `cargo test -p allocdb-node engine -- --nocapture`
-  - `cargo test -p allocdb-node replica -- --nocapture`
-  - `cargo test -p allocdb-node simulation -- --nocapture`
-  - `cargo test -p allocdb-node replicated_simulation -- --nocapture`
-  - `cargo run -p allocdb-bench -- --scenario all`
-  - `scripts/preflight.sh`
+  - core durability: `cargo test -p allocdb-core wal -- --nocapture`, `cargo test -p allocdb-core snapshot -- --nocapture`, `cargo test -p allocdb-core recovery -- --nocapture`, `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
+  - node runtime: `cargo test -p allocdb-node api_reservation_reports_retired_history`, `cargo test -p allocdb-node engine -- --nocapture`, `cargo test -p allocdb-node replica -- --nocapture`
+  - simulation: `cargo test -p allocdb-node simulation -- --nocapture`, `cargo test -p allocdb-node replicated_simulation -- --nocapture`
+  - local cluster and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo run -p allocdb-bench -- --scenario all`
+  - repo gate: `scripts/preflight.sh`
 
 ## Current Focus
 
 - `M8-T01` is implemented on this branch; the next execution target is `M8-T02`
 - build the first fault-control harness on top of the new local cluster layout and control sockets
 - keep the local runner narrow: preserve stable identities, addresses, and durable workspaces
-- follow `M8-T02` with the local QEMU testbed and Jepsen gate after process and network faults are scriptable
+- keep the replicated prototype stable while extending the external harness, with suffix-only catch-up when retained WAL still covers the target’s durable prefix, snapshot transfer otherwise, and fail-closed handling for faulted replicas
+- follow `M8-T02` with the local QEMU testbed and Jepsen gate after process and network faults become scriptable
 
 ## How To Check Progress
 
