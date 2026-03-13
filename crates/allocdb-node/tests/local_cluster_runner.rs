@@ -3,6 +3,7 @@ use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use allocdb_node::local_cluster::{
@@ -21,6 +22,14 @@ fn temp_workspace(name: &str) -> PathBuf {
 
 fn cluster_binary() -> &'static str {
     env!("CARGO_BIN_EXE_allocdb-local-cluster")
+}
+
+fn local_cluster_test_guard() -> MutexGuard<'static, ()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("local cluster test guard should not be poisoned")
 }
 
 fn run_cluster_command(workspace_root: &Path, command: &str) -> Output {
@@ -79,6 +88,7 @@ fn read_listener_response(addr: SocketAddr) -> String {
 
 #[test]
 fn local_cluster_runner_starts_stops_and_reuses_stable_layout() {
+    let _serial_guard = local_cluster_test_guard();
     let workspace_root = temp_workspace("smoke");
     let _guard = ClusterGuard::new(workspace_root.clone());
 
@@ -143,6 +153,7 @@ fn local_cluster_runner_starts_stops_and_reuses_stable_layout() {
 
 #[test]
 fn local_cluster_fault_harness_crashes_restarts_and_records_isolation() {
+    let _serial_guard = local_cluster_test_guard();
     let workspace_root = temp_workspace("fault-harness");
     let _guard = ClusterGuard::new(workspace_root.clone());
 

@@ -1109,7 +1109,7 @@ mod tests {
         assert!(running.borrow().is_empty());
         assert_eq!(
             stopped.borrow().as_slice(),
-            &[layout.control_guest.name.clone()]
+            std::slice::from_ref(&layout.control_guest.name)
         );
 
         let retry_result = start_prepared_testbed(
