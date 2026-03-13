@@ -22,7 +22,7 @@ mod non_unix_tests;
 
 const MAX_REPLICA_METADATA_BYTES: u64 = 256;
 const REPLICA_METADATA_MAGIC: [u8; 4] = *b"RPLM";
-const REPLICA_METADATA_VERSION: u8 = 1;
+const REPLICA_METADATA_VERSION: u8 = 2;
 const REPLICA_PREPARE_LOG_MAGIC: [u8; 4] = *b"RPLP";
 const REPLICA_PREPARE_LOG_VERSION: u8 = 1;
 
@@ -367,6 +367,10 @@ pub enum ReplicaProtocolError {
     UnsupportedNormalRole(ReplicaRole),
     RoleMismatch {
         expected: ReplicaRole,
+        found: ReplicaRole,
+    },
+    RoleSetMismatch {
+        expected: &'static str,
         found: ReplicaRole,
     },
     ViewRegression {
@@ -920,8 +924,8 @@ impl ReplicaNode {
             self.metadata.role,
             ReplicaRole::Backup | ReplicaRole::ViewUncertain
         ) {
-            return Err(ReplicaProtocolError::RoleMismatch {
-                expected: ReplicaRole::Backup,
+            return Err(ReplicaProtocolError::RoleSetMismatch {
+                expected: "backup or view_uncertain",
                 found: self.metadata.role,
             });
         }

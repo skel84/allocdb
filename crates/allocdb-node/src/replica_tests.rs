@@ -153,6 +153,39 @@ fn replica_metadata_file_round_trips() {
 }
 
 #[test]
+fn replica_metadata_file_rejects_previous_role_encoding_version() {
+    let path = metadata_path("metadata-old-version");
+    let file = ReplicaMetadataFile::new(&path);
+    let metadata = ReplicaMetadata {
+        identity: identity(),
+        current_view: 4,
+        role: ReplicaRole::ViewUncertain,
+        commit_lsn: Some(Lsn(17)),
+        active_snapshot_lsn: Some(Lsn(12)),
+        last_normal_view: Some(3),
+        durable_vote: Some(DurableVote {
+            view: 5,
+            voted_for: ReplicaId(2),
+        }),
+    };
+
+    file.write_metadata(&metadata).unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[4] = 1;
+    fs::write(&path, &bytes).unwrap();
+
+    let loaded = file.load_metadata();
+    assert!(matches!(
+        loaded,
+        Err(ReplicaMetadataFileError::Decode(
+            ReplicaMetadataDecodeError::UnsupportedVersion(1)
+        ))
+    ));
+
+    remove_if_exists(&path);
+}
+
+#[test]
 fn replica_open_bootstraps_missing_metadata() {
     let paths = ReplicaPaths::new(
         metadata_path("bootstrap-open"),
