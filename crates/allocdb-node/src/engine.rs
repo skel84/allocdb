@@ -588,6 +588,27 @@ impl SingleNodeEngine {
         self.enqueue_validated(request_slot, request, encoded.to_vec())
     }
 
+    /// Validates one encoded client request against the current engine bounds without enqueuing or
+    /// applying it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmissionError`] if decoding fails, the payload is oversized, the engine is
+    /// halted, or the request slot would overflow the allocator's bounded windows.
+    pub fn validate_encoded_submission(
+        &self,
+        request_slot: Slot,
+        encoded: &[u8],
+    ) -> Result<(), SubmissionError> {
+        if !self.accepting_writes {
+            return Err(SubmissionError::EngineHalted);
+        }
+
+        self.validate_bytes(encoded)?;
+        let request = decode_client_request(encoded).map_err(SubmissionError::InvalidRequest)?;
+        self.validate_client_request_slot(request_slot, request.command)
+    }
+
     /// Processes one queued submission by assigning an LSN, appending it to the WAL, syncing, and
     /// applying through the live allocator path.
     ///

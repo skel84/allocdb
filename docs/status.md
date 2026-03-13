@@ -38,7 +38,10 @@
     wrapper with durable replica metadata bootstrap, restart validation, and explicit faulted-state
     entry on invalid local protocol metadata, and a deterministic three-replica harness with one
     explicit message queue, one connectivity matrix, and replayable transcripts for queued,
-    delivered, dropped, crashed, and restarted replica actions
+    delivered, dropped, crashed, and restarted replica actions, plus the first majority-backed
+    quorum write path with one configured primary, durable prepared-entry buffering, real
+    `prepare`/`prepare_ack`/`commit` queue semantics, commit publication only after majority
+    durable append, and primary-only read enforcement on locally applied committed state
 
 ## What Exists
 
@@ -102,6 +105,10 @@
   - startup bootstrap for missing metadata on both fresh-open and recover paths
   - fail-closed `faulted` state when metadata bytes are corrupt, identity is mismatched, or local
     applied/snapshot state contradicts the persisted replicated metadata
+  - configurable normal-mode `primary` and `backup` roles for one current view
+  - durable prepared-entry sidecar for pre-commit replicated client commands
+  - prepare append, commit-through, and strict primary-read guards built around the existing
+    single-node executor rather than a second apply path
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -139,6 +146,11 @@
   - explicit replica-to-replica and client-to-replica connectivity matrix under test control
   - explicit protocol-message queue plus replayable transcripts for queue, deliver, drop, crash,
     and restart actions
+  - real `prepare`, `prepare_ack`, and `commit` protocol payload delivery on that queue
+  - configured-primary client submit flow with result publication only after majority durable
+    append
+  - backup replicas that durably append prepares but do not apply allocator state until commit
+  - primary-only resource reads guarded by the existing strict-read fence after local commit
   - replica crash as loss of volatile state with restart through real `ReplicaNode::recover`
 - Validation:
   - `cargo test -p allocdb-core wal -- --nocapture`
@@ -155,11 +167,10 @@
 
 ## Current Focus
 
-- `M7-T03`: implement the first quorum write path with one configured primary
-- use the deterministic replicated harness from `M7-T02` as the execution surface for quorum
-  prepare/commit work
-- follow with `M7-T04` through `M7-T06` for view change, rejoin, and executable replicated
-  simulation coverage
+- `M7-T03` is implemented on this branch; the next execution target is `M7-T04`
+- add higher-view takeover and fail-closed read behavior when the old primary loses quorum
+- preserve the committed prefix from `M7-T03` while introducing view change and quorum-loss tests
+- follow with `M7-T05` and `M7-T06` for rejoin and executable replicated simulation coverage
 - use `M8` for the external multi-process, QEMU, and Jepsen layers after the in-process replicated
   prototype is credible
 
