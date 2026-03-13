@@ -151,8 +151,8 @@ alongside the replica workspace. The current persisted fields are:
 
 Replica startup validates identity, vote/view ordering, commit-versus-snapshot consistency, and
 the local applied/snapshot state against this metadata before a replica can join. Decode failure,
-metadata inconsistency, or an explicitly persisted `faulted` role leaves the replica in `faulted`
-state until repaired.
+metadata inconsistency, unreadable or permission-denied sidecars, or an explicitly persisted
+`faulted` role leaves the replica in `faulted` state until repaired.
 
 ## Replicated Log Contents
 

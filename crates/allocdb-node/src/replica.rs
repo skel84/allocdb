@@ -12,6 +12,7 @@ use crate::engine::{EngineConfig, EngineOpenError, RecoverEngineError, SingleNod
 #[path = "replica_tests.rs"]
 mod tests;
 
+const MAX_REPLICA_METADATA_BYTES: u64 = 256;
 const REPLICA_METADATA_MAGIC: [u8; 4] = *b"RPLM";
 const REPLICA_METADATA_VERSION: u8 = 1;
 
@@ -132,12 +133,6 @@ impl ReplicaMetadata {
         }
 
         if let Some(vote) = self.durable_vote {
-            if vote.view < self.current_view {
-                return Err(ReplicaStartupValidationError::DurableVoteBelowCurrentView {
-                    current_view: self.current_view,
-                    voted_view: vote.view,
-                });
-            }
             if let Some(last_normal_view) = self.last_normal_view {
                 if vote.view < last_normal_view {
                     return Err(
@@ -147,6 +142,12 @@ impl ReplicaMetadata {
                         },
                     );
                 }
+            }
+            if vote.view < self.current_view {
+                return Err(ReplicaStartupValidationError::DurableVoteBelowCurrentView {
+                    current_view: self.current_view,
+                    voted_view: vote.view,
+                });
             }
         }
 
@@ -207,6 +208,7 @@ pub enum ReplicaMetadataDecodeError {
 pub enum ReplicaMetadataFileError {
     Io(std::io::Error),
     Decode(ReplicaMetadataDecodeError),
+    TooLarge { file_len: u64, max_bytes: u64 },
 }
 
 impl From<std::io::Error> for ReplicaMetadataFileError {
@@ -264,6 +266,7 @@ pub enum ReplicaStartupValidationError {
 pub enum ReplicaMetadataLoadError {
     Io(std::io::ErrorKind),
     Decode(ReplicaMetadataDecodeError),
+    TooLarge { file_len: u64, max_bytes: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -342,16 +345,33 @@ impl ReplicaMetadataFile {
     ///
     /// # Errors
     ///
-    /// Returns [`ReplicaMetadataFileError`] if the file cannot be read or if decoding fails.
+    /// Returns [`ReplicaMetadataFileError`] if the file cannot be read, exceeds the bounded
+    /// metadata size, or fails to decode.
     pub fn load_metadata(&self) -> Result<Option<ReplicaMetadata>, ReplicaMetadataFileError> {
-        let mut file = match File::open(&self.path) {
+        let file = match File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(ReplicaMetadataFileError::Io(error)),
         };
 
+        let file_len = file.metadata()?.len();
+        if file_len > MAX_REPLICA_METADATA_BYTES {
+            return Err(ReplicaMetadataFileError::TooLarge {
+                file_len,
+                max_bytes: MAX_REPLICA_METADATA_BYTES,
+            });
+        }
+
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        file.take(MAX_REPLICA_METADATA_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        let read_len = bytes.len() as u64;
+        if read_len > MAX_REPLICA_METADATA_BYTES {
+            return Err(ReplicaMetadataFileError::TooLarge {
+                file_len: read_len,
+                max_bytes: MAX_REPLICA_METADATA_BYTES,
+            });
+        }
         Ok(Some(decode_replica_metadata(&bytes)?))
     }
 
@@ -359,7 +379,9 @@ impl ReplicaMetadataFile {
     ///
     /// # Errors
     ///
-    /// Returns [`ReplicaMetadataFileError`] if the write, sync, or rename path fails.
+    /// Returns [`ReplicaMetadataFileError`] if the write, sync, or replace path fails. On
+    /// non-Unix targets this currently returns `Unsupported`, because the durable directory-sync
+    /// replace discipline is only implemented for Unix.
     pub fn write_metadata(
         &self,
         metadata: &ReplicaMetadata,
@@ -374,8 +396,7 @@ impl ReplicaMetadataFile {
         file.sync_data()?;
         drop(file);
 
-        fs::rename(&temp_path, &self.path)?;
-        sync_parent_dir(&self.path)?;
+        replace_file_durably(&temp_path, &self.path)?;
         Ok(())
     }
 
@@ -549,11 +570,6 @@ impl ReplicaNode {
     }
 
     #[must_use]
-    pub fn engine_mut(&mut self) -> Option<&mut SingleNodeEngine> {
-        self.engine.as_mut()
-    }
-
-    #[must_use]
     pub fn metadata_path(&self) -> &Path {
         self.metadata_file.path()
     }
@@ -627,6 +643,13 @@ fn load_or_fault_existing_metadata(
                 ReplicaMetadataFileError::Decode(decode_error) => ReplicaFaultReason::MetadataLoad(
                     ReplicaMetadataLoadError::Decode(*decode_error),
                 ),
+                ReplicaMetadataFileError::TooLarge {
+                    file_len,
+                    max_bytes,
+                } => ReplicaFaultReason::MetadataLoad(ReplicaMetadataLoadError::TooLarge {
+                    file_len: *file_len,
+                    max_bytes: *max_bytes,
+                }),
             };
             error!(
                 "faulting replica before engine start because metadata load failed: replica_id={} \
@@ -813,14 +836,24 @@ impl<'a> MetadataCursor<'a> {
 }
 
 #[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        OpenOptions::new().read(true).open(parent)?.sync_all()?;
-    }
+fn replace_file_durably(temp_path: &Path, path: &Path) -> Result<(), std::io::Error> {
+    fs::rename(temp_path, path)?;
+    sync_parent_dir(path)?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) -> Result<(), std::io::Error> {
+fn replace_file_durably(_temp_path: &Path, _path: &Path) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "replica metadata durable replace currently requires Unix directory-sync semantics",
+    ))
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        OpenOptions::new().read(true).open(parent)?.sync_all()?;
+    }
     Ok(())
 }
