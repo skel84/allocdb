@@ -321,6 +321,16 @@ Current executable replicated coverage already proves:
 - a higher-view takeover can reconstruct the latest committed prefix on a new primary before that
   replica returns to normal mode
 - stale or quorum-lost primaries reject reads after failover instead of serving stale success
+- the primary can keep serving through one isolated-backup partition, then heal and catch that
+  stale backup up to the committed prefix without duplicate execution
+- a full split into non-quorum minorities fails closed until one majority reforms, after which the
+  new primary can accept writes and rejoin the stale replica back onto the committed prefix
+- a primary crash before quorum append preserves indefinite ambiguity until failover, after which a
+  retry with the same `operation_id` commits exactly once on the new primary
+- a primary crash after majority append but before reply lets the next primary reconstruct the
+  committed prefix and resolve the retry from cache instead of executing it again
+- a primary crash after reply preserves strict-primary reads and cached retry results on the next
+  primary
 - a stale replica can rejoin by replicated suffix only when it still holds one recent enough
   committed durable prefix
 - a primary checkpoint can force snapshot transfer for older replicas whose local durable state

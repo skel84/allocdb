@@ -750,6 +750,13 @@ impl ReplicaNode {
     }
 
     #[must_use]
+    pub fn highest_prepared_lsn(&self) -> Option<Lsn> {
+        self.prepared_entries
+            .last_key_value()
+            .map(|(lsn, _)| Lsn(*lsn))
+    }
+
+    #[must_use]
     pub fn prepare_log_path(&self) -> &Path {
         &self.prepare_log_file.path
     }

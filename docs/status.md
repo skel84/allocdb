@@ -49,7 +49,10 @@
     holds a recent enough committed durable prefix, falls back to snapshot transfer when the
     primary has already pruned older history, discards divergent uncommitted prepared suffix
     during rejoin, rejects faulted replicas instead of auto-repairing them, and fails closed if a
-    target already knows a higher durable view than the current primary
+    target already knows a higher durable view than the current primary, plus promoted
+    deterministic partition and primary-crash scenarios that prove minority-partition catch-up,
+    full-split fail-closed behavior, pre-quorum retry replay, majority-appended failover
+    reconstruction, and post-reply retry/read preservation on the new primary
 
 ## What Exists
 
@@ -159,6 +162,8 @@
   - real `prepare`, `prepare_ack`, and `commit` protocol payload delivery on that queue
   - configured-primary client submit flow with result publication only after majority durable
     append
+  - retry-aware client submit helper that returns one cached committed result on the current
+    primary instead of assigning a fresh replicated LSN
   - backup replicas that durably append prepares but do not apply allocator state until commit
   - primary-only resource reads guarded by the existing strict-read fence after local commit
   - automatic quorum-loss detection that demotes a stranded primary out of service
@@ -170,8 +175,10 @@
     snapshot transfer, then restarts through the real recovery path before returning the replica
     to backup mode
   - regression coverage for quorum-loss fail-closed reads and writes, higher-view takeover with
-    stale-primary read rejection, suffix-only rejoin, snapshot-transfer rejoin, and faulted
-    rejoin rejection
+    stale-primary read rejection, isolated-backup partition heal and catch-up, non-quorum split
+    fail-closed behavior with later rejoin convergence, primary crash before quorum append,
+    primary crash after majority append before reply, primary crash after reply, suffix-only
+    rejoin, snapshot-transfer rejoin, and faulted rejoin rejection
 - Validation:
   - `cargo test -p allocdb-core wal -- --nocapture`
   - `cargo test -p allocdb-core snapshot -- --nocapture`
@@ -187,13 +194,11 @@
 
 ## Current Focus
 
-- `M7-T05` is implemented on this branch; the next execution target is `M7-T06`
-- promote the replicated simulation plan into broader executable partition, failover, and rejoin
-  regression coverage on the real three-replica harness
-- keep the rejoin contract narrow: suffix-only catch-up when retained WAL covers the target’s
+- `M7-T06` is implemented on this branch; the next execution target is `M8-T01`
+- keep the replicated prototype stable while moving the next validation layer out to the
+  multi-process local cluster runner and later Jepsen work
+- preserve the narrow rejoin contract: suffix-only catch-up when retained WAL covers the target’s
   durable prefix, snapshot transfer otherwise, and fail-closed handling for faulted replicas
-- follow `M7-T06` with `M8` for the external multi-process, QEMU, and Jepsen layers after the
-  in-process replicated prototype has the planned scenario coverage
 
 ## How To Check Progress
 

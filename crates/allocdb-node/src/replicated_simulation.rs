@@ -3,15 +3,17 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use allocdb_core::command_codec::decode_client_request;
 use allocdb_core::config::Config;
 use allocdb_core::ids::{Lsn, ResourceId, Slot};
+use allocdb_core::result::{CommandOutcome, ResultCode};
 use allocdb_core::snapshot_file::{SnapshotFile, SnapshotFileError};
 use allocdb_core::state_machine::ResourceRecord;
 use allocdb_core::wal::{Frame, RecordType, ScanStopReason};
 use allocdb_core::wal_file::{RecoveredWal, WalFile, WalFileError};
 use log::{debug, info, warn};
 
-use crate::engine::{CheckpointResult, EngineConfig, SubmissionResult};
+use crate::engine::{CheckpointResult, EngineConfig, SubmissionError, SubmissionResult};
 use crate::replica::{
     NotPrimaryReadError, RecoverReplicaError, ReplicaCheckpointError, ReplicaId, ReplicaIdentity,
     ReplicaMetadata, ReplicaMetadataFile, ReplicaMetadataFileError, ReplicaNode, ReplicaNodeStatus,
@@ -53,6 +55,12 @@ pub(crate) struct ReplicaObservation {
 pub(crate) enum ReplicaRejoinMethod {
     SuffixOnly,
     SnapshotTransfer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReplicatedClientRequestOutcome {
+    Prepared(ReplicaPreparedEntry),
+    Published(SubmissionResult),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -648,6 +656,31 @@ impl ReplicatedSimulationHarness {
         Ok(entry)
     }
 
+    pub(crate) fn client_submit_or_retry(
+        &mut self,
+        primary: ReplicaId,
+        request_slot: Slot,
+        payload: &[u8],
+        label_prefix: &str,
+    ) -> Result<ReplicatedClientRequestOutcome, ReplicatedSimulationError> {
+        self.fail_primary_closed_if_quorum_lost()?;
+        if self.configured_primary != Some(primary) {
+            return Err(ReplicatedSimulationError::NotConfiguredPrimary {
+                expected: self.configured_primary,
+                found: primary,
+            });
+        }
+
+        if let Some(result) = self.lookup_retry_result(primary, request_slot, payload)? {
+            self.published_results
+                .insert(result.applied_lsn.get(), result);
+            return Ok(ReplicatedClientRequestOutcome::Published(result));
+        }
+
+        self.client_submit(primary, request_slot, payload, label_prefix)
+            .map(ReplicatedClientRequestOutcome::Prepared)
+    }
+
     pub(crate) fn published_result(&self, lsn: Lsn) -> Option<&SubmissionResult> {
         self.published_results.get(&lsn.get())
     }
@@ -1172,6 +1205,45 @@ impl ReplicatedSimulationHarness {
             .ok_or_else(|| ReplicatedSimulationError::MessageNotFound(message_label.to_owned()))
     }
 
+    fn lookup_retry_result(
+        &self,
+        primary: ReplicaId,
+        request_slot: Slot,
+        payload: &[u8],
+    ) -> Result<Option<SubmissionResult>, ReplicatedSimulationError> {
+        let request = decode_client_request(payload).map_err(|error| {
+            ReplicatedSimulationError::Protocol(ReplicaProtocolError::Submission(
+                SubmissionError::InvalidRequest(error),
+            ))
+        })?;
+        let node = self
+            .replica(primary)?
+            .ok_or(ReplicatedSimulationError::ReplicaAlreadyCrashed(primary))?;
+        let Some(record) = node
+            .engine()
+            .expect("active primary must keep one live engine")
+            .db()
+            .operation(request.operation_id, request_slot)
+        else {
+            return Ok(None);
+        };
+
+        let outcome = if record.command_fingerprint == request.command.fingerprint() {
+            CommandOutcome {
+                result_code: record.result_code,
+                reservation_id: record.result_reservation_id,
+                deadline_slot: record.result_deadline_slot,
+            }
+        } else {
+            CommandOutcome::new(ResultCode::OperationConflict)
+        };
+        Ok(Some(SubmissionResult {
+            applied_lsn: record.applied_lsn,
+            outcome,
+            from_retry_cache: true,
+        }))
+    }
+
     fn endpoint_index(
         &self,
         endpoint: ClusterEndpoint,
@@ -1251,6 +1323,10 @@ impl ReplicatedSimulationHarness {
                 continue;
             };
             target_commit_lsn = target_commit_lsn.max(node.metadata().commit_lsn);
+            // The harness keeps a fixed three-replica majority. If one reachable voter still holds
+            // a prepared suffix, the crashed primary held the same entry locally when it queued
+            // that prepare, which is enough to recover a majority-appended prefix during failover.
+            target_commit_lsn = target_commit_lsn.max(node.highest_prepared_lsn());
         }
         Ok(target_commit_lsn)
     }
