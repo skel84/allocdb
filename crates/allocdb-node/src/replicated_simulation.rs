@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use allocdb_core::config::Config;
 use allocdb_core::ids::{Lsn, Slot};
-use log::debug;
+use log::{debug, warn};
 
 use crate::engine::EngineConfig;
 use crate::replica::{
@@ -635,6 +635,9 @@ fn remove_if_exists(path: &Path) {
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!("failed to remove {}: {error}", path.display()),
+        Err(error) => warn!(
+            "failed to remove replicated simulation artifact {}: {error}",
+            path.display()
+        ),
     }
 }

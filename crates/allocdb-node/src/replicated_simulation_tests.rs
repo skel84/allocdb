@@ -373,6 +373,20 @@ fn connectivity_matrix_controls_delivery_until_partition_heals() {
         }
         other => panic!("expected delivered message observation, got {other:?}"),
     }
+
+    let missing_delivery = harness
+        .deliver_protocol_message("unknown-label")
+        .unwrap_err();
+    assert!(matches!(
+        missing_delivery,
+        ReplicatedSimulationError::MessageNotFound("unknown-label")
+    ));
+
+    let missing_drop = harness.drop_protocol_message("unknown-label").unwrap_err();
+    assert!(matches!(
+        missing_drop,
+        ReplicatedSimulationError::MessageNotFound("unknown-label")
+    ));
 }
 
 #[test]
