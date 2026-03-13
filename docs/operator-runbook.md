@@ -2,21 +2,24 @@
 
 ## Scope
 
-This runbook covers the current single-node alpha implemented by `crates/allocdb-node`.
+This runbook covers the current operator surfaces implemented by `crates/allocdb-node`.
 
-It is intentionally limited to behavior that exists on current `main`:
+It is intentionally limited to behavior that exists on the current branch:
 
-- one process
-- one WAL file
-- one optional snapshot file
-- one in-memory executor
-- one transport-neutral API surface
+- the single-node alpha engine
+- the first local multi-process replicated cluster runner
 
-Current operational constraints:
+Current operational constraints for the local replicated runner:
 
-- there is no standalone node daemon in this repository yet
-- there is no built-in background expiration worker
-- there is no built-in background checkpoint loop
+- the cluster runner binds one loopback `control`, `client`, and `protocol` address per replica
+- only the `control` listener is implemented today
+- `client` and `protocol` listeners are reserved and logged but return `not implemented`
+- there is no built-in network or process fault-control harness yet
+- there is no built-in background expiration worker or checkpoint loop
+
+Current operational constraints for the single-node alpha remain:
+
+- there is no standalone general-purpose node daemon beyond the local runner
 - the host process must choose WAL and snapshot paths, expose the API, set up logging, and drive
   `tick_expirations`
 
@@ -28,7 +31,67 @@ Related docs:
 - [Benchmark Harness](./benchmark-harness.md)
 - [Architecture](./architecture.md)
 
-## Durable Files And Startup Path
+## Local Replicated Cluster Runner
+
+Command surface:
+
+- `cargo run -p allocdb-node --bin allocdb-local-cluster -- start --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-local-cluster -- status --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-local-cluster -- stop --workspace <path>`
+
+What `start` does:
+
+- creates or reuses one stable workspace rooted at `<path>`
+- persists one `cluster-layout.txt` file with the chosen local bounds, replica identities,
+  addresses, and file paths
+- launches `3` external replica processes from one command surface
+- recovers each replica through `ReplicaNode::recover(...)`
+- bootstraps a fresh workspace into view `1` with replica `1` as `primary` and replicas `2` and
+  `3` as `backup`
+
+What restart preserves:
+
+- replica IDs
+- the durable workspace layout under `<path>/replica-{1,2,3}/`
+- the persisted engine and core bounds stored in `cluster-layout.txt`
+- the chosen loopback `control`, `client`, and `protocol` addresses
+
+Current workspace layout:
+
+- `<path>/cluster-layout.txt`
+- `<path>/logs/replica-{1,2,3}.log`
+- `<path>/run/replica-{1,2,3}.pid`
+- `<path>/replica-{1,2,3}/replica.metadata`
+- `<path>/replica-{1,2,3}/replica.metadata.prepare`
+- `<path>/replica-{1,2,3}/state.snapshot`
+- `<path>/replica-{1,2,3}/state.wal`
+
+What `status` shows:
+
+- process ID
+- replica state, role, and current view
+- committed and active-snapshot `lsn`
+- startup recovery kind and write-acceptance flag when the wrapped engine is active
+- control, client, and protocol addresses
+- log, pid, metadata, prepare-log, snapshot, and WAL paths
+
+Current control hooks:
+
+- `status`
+- `stop`
+
+Current limits:
+
+- the runner reserves `client` and `protocol` listeners for follow-on transport and fault-control
+  work, but they intentionally reject traffic today
+- the runner only auto-configures normal-mode roles on a fresh workspace when recovered metadata is
+  still in `recovering`; after that it preserves recovered durable metadata instead of resetting
+  views or roles
+- there is still no background expiration or checkpoint worker inside the replica daemons
+
+## Single-Node Engine
+
+### Durable Files And Startup Path
 
 The single-node alpha persists state in:
 

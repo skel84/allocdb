@@ -16,7 +16,7 @@
   - `M5` single-node alpha surface: implemented
   - `M6` replication design: implemented
   - `M7` replicated core prototype: in progress
-  - `M8` external cluster validation: planned
+  - `M8` external cluster validation: in progress
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -49,7 +49,11 @@
     holds a recent enough committed durable prefix, falls back to snapshot transfer when the
     primary has already pruned older history, discards divergent uncommitted prepared suffix
     during rejoin, rejects faulted replicas instead of auto-repairing them, and fails closed if a
-    target already knows a higher durable view than the current primary
+    target already knows a higher durable view than the current primary, plus the first
+    multi-process local cluster runner with one persisted `cluster-layout.txt`, stable
+    three-replica workspaces, per-replica pid and log files, reserved loopback addresses, and a
+    smoke-tested `start`/`status`/`stop` command surface that preserves replica identity and
+    on-disk layout across restart
 
 ## What Exists
 
@@ -93,8 +97,8 @@
   - bounded `tick_expirations` maintenance request for live TTL enforcement
   - metrics exposure through the same API boundary
 - Operator documentation:
-  - operator-facing runbook for single-node startup, restart, checkpoint, overload, expiration
-    maintenance, and corruption/fail-closed handling
+  - operator-facing runbook for the single-node alpha and local replicated cluster runner,
+    including workspace layout, start/stop/status usage, and current control-hook limits
 - Replication design draft:
   - VSR-style primary/backup replicated log with fixed membership and majority quorums
   - primary-only reads in the first replicated release
@@ -119,6 +123,12 @@
   - durable prepared-entry sidecar for pre-commit replicated client commands
   - prepare append, commit-through, and strict primary-read guards built around the existing
     single-node executor rather than a second apply path
+- Local multi-process cluster runner:
+  - CLI entrypoint at `cargo run -p allocdb-node --bin allocdb-local-cluster -- <start|stop|status> --workspace <path>` with one persisted `cluster-layout.txt`
+  - stable replica identities, local bounds, and three external replica processes from one command surface
+  - per-replica loopback `control`, `client`, and `protocol` listeners with `status` and `stop` hooks on `control`
+  - per-replica pid, log, WAL, snapshot, metadata, and prepared-log paths exposed through `status`
+  - restart through the real `ReplicaNode::recover` path with stable durable workspace reuse
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -173,6 +183,7 @@
     stale-primary read rejection, suffix-only rejoin, snapshot-transfer rejoin, and faulted
     rejoin rejection
 - Validation:
+  - `cargo test -p allocdb-node local_cluster -- --nocapture`
   - `cargo test -p allocdb-core wal -- --nocapture`
   - `cargo test -p allocdb-core snapshot -- --nocapture`
   - `cargo test -p allocdb-core recovery -- --nocapture`
@@ -187,13 +198,10 @@
 
 ## Current Focus
 
-- `M7-T05` is implemented on this branch; the next execution target is `M7-T06`
-- promote the replicated simulation plan into broader executable partition, failover, and rejoin
-  regression coverage on the real three-replica harness
-- keep the rejoin contract narrow: suffix-only catch-up when retained WAL covers the target’s
-  durable prefix, snapshot transfer otherwise, and fail-closed handling for faulted replicas
-- follow `M7-T06` with `M8` for the external multi-process, QEMU, and Jepsen layers after the
-  in-process replicated prototype has the planned scenario coverage
+- `M8-T01` is implemented on this branch; the next execution target is `M8-T02`
+- build the first fault-control harness on top of the new local cluster layout and control sockets
+- keep the local runner narrow: preserve stable identities, addresses, and durable workspaces
+- follow `M8-T02` with the local QEMU testbed and Jepsen gate after process and network faults are scriptable
 
 ## How To Check Progress
 

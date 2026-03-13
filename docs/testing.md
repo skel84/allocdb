@@ -330,6 +330,29 @@ Current executable replicated coverage already proves:
 - rejoin discards one divergent uncommitted suffix and rejects one replica forced into `faulted`
   state by corrupted durable metadata
 
+## Local Multi-Process Runner Smoke Test
+
+`M8-T01` adds the first external-process smoke gate on top of the replicated node library.
+
+The required focused validation command is:
+
+- `cargo test -p allocdb-node local_cluster -- --nocapture`
+
+What this smoke test proves today:
+
+- one operator command surface can start `3` external replica processes
+- the chosen workspace layout, loopback addresses, and per-replica bounds persist across restart
+- each replica answers one live control `status` request with PID, role, view, recovery, address,
+  and path details
+- one operator `stop` command shuts the cluster down cleanly and removes the live pid files
+
+What it does not claim yet:
+
+- there is still no replicated client transport on the external process boundary
+- there is still no process- or network-fault injection harness on that runner
+- Jepsen and QEMU-backed validation remain follow-on gates after the local process surface is in
+  place
+
 ## Jepsen Validation Gate
 
 `M6-T03` defines the external validation required before any replicated release.
