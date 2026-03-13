@@ -6,8 +6,8 @@
 AllocDB.
 
 This document chooses the initial protocol family, states the safety invariants replication must
-preserve, and narrows the first replicated release. The replicated simulation plan now lives in
-[testing.md](./testing.md); the remaining deferred design gate is the Jepsen plan in `M6-T03`.
+preserve, and narrows the first replicated release. The replicated simulation plan and Jepsen gate
+now live in [testing.md](./testing.md).
 
 ## Scope
 
@@ -309,11 +309,9 @@ Those may be revisited only if the simpler majority-primary design proves insuff
 
 ## Follow-On Work
 
-This draft now pairs with the replicated simulation plan in [testing.md](./testing.md) and should
-feed the remaining replication design task:
-
-- `M6-T03`: define the Jepsen workloads, client histories, and invariants that gate any replicated
-  release
+This draft now pairs with the replicated simulation plan and Jepsen gate in
+[testing.md](./testing.md). The `M6` replication design gate is complete; further work should
+reopen as tracked implementation tasks rather than silent protocol drift.
 
 ## Research Anchors
 
