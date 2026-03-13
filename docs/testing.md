@@ -389,6 +389,34 @@ What it still does not claim:
 - the harness does not yet orchestrate VM-level network partitions or reboots
 - Jepsen and QEMU-backed validation remain follow-on gates after this local disruption surface
 
+## Local QEMU Testbed
+
+`M8-T03` adds the first repeatable VM-backed cluster surface on top of the local process and
+fault-control tools.
+
+The focused validation commands are:
+
+- `cargo test -p allocdb-node qemu_testbed -- --nocapture`
+- `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- prepare --workspace <path> --base-image-path <cloudimg.qcow2> --local-cluster-bin <allocdb-local-cluster>`
+
+What this testbed proves today:
+
+- one host-side command surface can generate repeatable QEMU assets for `3` replica guests plus
+  `1` control guest
+- each replica guest uses one copy-on-write overlay, one generated NoCloud seed image, and one
+  static local-cluster layout that runs the existing `allocdb-local-cluster replica-daemon`
+- replica `control` moves onto one management network while replica `client` and `protocol`
+  listeners move onto one separate cluster network
+- one generated control-node script can drive `status`, `isolate`, `heal`, `crash`, `restart`,
+  `reboot`, and `collect-logs` operations against the replica guests
+- the generated workspace keeps overlay images, firmware vars, guest seeds, console logs, and SSH
+  keys in stable paths suitable for scripted follow-on runs
+
+What it still does not claim:
+
+- the first QEMU layer does not yet validate the real replicated client transport
+- Jepsen workloads and release-blocking fault runs remain follow-on work in `M8-T04`
+
 ## Jepsen Validation Gate
 
 `M6-T03` defines the external validation required before any replicated release.

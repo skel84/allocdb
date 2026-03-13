@@ -489,6 +489,12 @@ pub fn timeline_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(CLUSTER_TIMELINE_FILE_NAME)
 }
 
+/// Encodes one local-cluster layout to the text format used on disk.
+#[must_use]
+pub fn encode_layout_text(layout: &LocalClusterLayout) -> String {
+    encode_layout(layout)
+}
+
 /// Loads one persisted local-cluster timeline.
 ///
 /// # Errors

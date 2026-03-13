@@ -57,7 +57,7 @@
     surface that preserves replica identity and on-disk layout across restart, plus the first
     local fault-control harness with per-replica `crash`/`restart`/`isolate`/`heal` commands, one
     persisted `cluster-faults.txt` network-isolation state, one replayable `cluster-timeline.log`,
-    and externally visible isolation rejection on the reserved `client` and `protocol` listeners
+    and externally visible isolation rejection on the reserved `client` and `protocol` listeners, plus one host-side QEMU testbed CLI that materializes per-guest overlays, NoCloud seed images, firmware vars, one static in-guest cluster layout, and one control-node orchestration script around the existing replica daemon and local fault-control commands
 
 ## What Exists
 
@@ -101,8 +101,7 @@
   - bounded `tick_expirations` maintenance request for live TTL enforcement
   - metrics exposure through the same API boundary
 - Operator documentation:
-  - operator-facing runbook for the single-node alpha and local replicated cluster runner,
-    including workspace layout plus start/stop/status usage and current control-hook limits
+  - operator-facing runbook for the single-node alpha, local replicated cluster runner, and local QEMU testbed, including workspace layout plus current control-hook limits
 - Replication design draft:
   - VSR-style primary/backup replicated log with fixed membership and majority quorums
   - primary-only reads in the first replicated release
@@ -196,15 +195,15 @@
   - core durability: `cargo test -p allocdb-core wal -- --nocapture`, `cargo test -p allocdb-core snapshot -- --nocapture`, `cargo test -p allocdb-core recovery -- --nocapture`, `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
   - node runtime: `cargo test -p allocdb-node api_reservation_reports_retired_history`, `cargo test -p allocdb-node engine -- --nocapture`, `cargo test -p allocdb-node replica -- --nocapture`
   - simulation: `cargo test -p allocdb-node simulation -- --nocapture`, `cargo test -p allocdb-node replicated_simulation -- --nocapture`
-  - local cluster and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo run -p allocdb-bench -- --scenario all`
+  - local cluster, qemu assets, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
 
 ## Current Focus
 
-- `M8-T02` is implemented on this branch; the next execution target is `M8-T03`
-- build the local QEMU testbed on top of the new process and fault-control surface
-- keep the local runner narrow: preserve stable identities, addresses, durable workspaces, and reusable disruption/timeline files while the replicated prototype keeps its current fail-closed recovery rules
-- follow `M8-T03` with the Jepsen gate after the QEMU environment makes network and reboot faults scriptable
+- `M8-T03` is implemented on this branch; the next execution target is `M8-T04`
+- use the new control-node and per-guest asset surface as the target environment for Jepsen automation
+- keep the first VM-backed gate narrow: fixed membership, one shard, and fail-closed recovery rules before broader workload expansion
+- follow `M8-T04` with release-blocking Jepsen runs on the documented contention, ambiguity, failover, and expiration workload families
 ## How To Check Progress
 
 - implementation status: [work-breakdown.md](./work-breakdown.md)
