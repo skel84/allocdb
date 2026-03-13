@@ -359,9 +359,35 @@ What this smoke test proves today:
 What it does not claim yet:
 
 - there is still no replicated client transport on the external process boundary
-- there is still no process- or network-fault injection harness on that runner
+- there is still no replicated request routing on the external process boundary
 - Jepsen and QEMU-backed validation remain follow-on gates after the local process surface is in
   place
+
+## Local Fault-Control Harness
+
+`M8-T02` adds the first reusable disruption surface on top of the local multi-process runner.
+
+The required focused validation command remains:
+
+- `cargo test -p allocdb-node local_cluster -- --nocapture`
+
+What this harness proves today:
+
+- one operator command surface can crash and restart one replica process without changing its
+  configured identity, addresses, or durable workspace
+- one operator command surface can isolate one replica from external `client` and `protocol`
+  traffic while preserving `control` reachability for later debug and recovery
+- the reserved `client` and `protocol` listeners now fail with an explicit isolation error when
+  the fault harness marks that replica isolated
+- one persisted `cluster-timeline.log` records cluster start/stop plus replica `crash`,
+  `restart`, `isolate`, and `heal` events in replayable order
+
+What it still does not claim:
+
+- the external process boundary still does not carry the real replicated client or protocol
+  traffic yet
+- the harness does not yet orchestrate VM-level network partitions or reboots
+- Jepsen and QEMU-backed validation remain follow-on gates after this local disruption surface
 
 ## Jepsen Validation Gate
 

@@ -54,7 +54,10 @@
     retry/read preservation on the new primary, and the first multi-process local cluster runner
     with one persisted `cluster-layout.txt`, stable three-replica workspaces, per-replica pid and
     log files, reserved loopback addresses, and a smoke-tested `start`/`status`/`stop` command
-    surface that preserves replica identity and on-disk layout across restart
+    surface that preserves replica identity and on-disk layout across restart, plus the first
+    local fault-control harness with per-replica `crash`/`restart`/`isolate`/`heal` commands, one
+    persisted `cluster-faults.txt` network-isolation state, one replayable `cluster-timeline.log`,
+    and externally visible isolation rejection on the reserved `client` and `protocol` listeners
 
 ## What Exists
 
@@ -125,10 +128,12 @@
   - prepare append, commit-through, and strict primary-read guards built around the existing
     single-node executor rather than a second apply path
 - Local multi-process cluster runner:
-  - CLI entrypoint at `cargo run -p allocdb-node --bin allocdb-local-cluster -- <start|stop|status> --workspace <path>` with one persisted `cluster-layout.txt`
+  - CLI entrypoint at `cargo run -p allocdb-node --bin allocdb-local-cluster -- <start|stop|status|crash|restart|isolate|heal> ...` with one persisted `cluster-layout.txt`
   - stable replica identities, local bounds, and three external replica processes from one command surface
   - per-replica loopback `control`, `client`, and `protocol` listeners with `status` and `stop` hooks on `control`
   - per-replica pid, log, WAL, snapshot, metadata, and prepared-log paths exposed through `status`, with restart through the real `ReplicaNode::recover` path and stable durable workspace reuse
+  - one persisted `cluster-faults.txt` file that marks whole-replica client/protocol isolation without affecting control reachability, plus one append-only `cluster-timeline.log` for later checker/debug reuse
+  - reserved `client` and `protocol` listeners now fail with explicit isolation errors when the local fault harness marks that replica isolated
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -196,19 +201,15 @@
 
 ## Current Focus
 
-- `M8-T01` is implemented on this branch; the next execution target is `M8-T02`
-- build the first fault-control harness on top of the new local cluster layout and control sockets
-- keep the local runner narrow: preserve stable identities, addresses, and durable workspaces
-- keep the replicated prototype stable while extending the external harness, with suffix-only catch-up when retained WAL still covers the target’s durable prefix, snapshot transfer otherwise, and fail-closed handling for faulted replicas
-- follow `M8-T02` with the local QEMU testbed and Jepsen gate after process and network faults become scriptable
-
+- `M8-T02` is implemented on this branch; the next execution target is `M8-T03`
+- build the local QEMU testbed on top of the new process and fault-control surface
+- keep the local runner narrow: preserve stable identities, addresses, durable workspaces, and reusable disruption/timeline files while the replicated prototype keeps its current fail-closed recovery rules
+- follow `M8-T03` with the Jepsen gate after the QEMU environment makes network and reboot faults scriptable
 ## How To Check Progress
 
 - implementation status: [work-breakdown.md](./work-breakdown.md)
 - milestone sequencing: [roadmap.md](./roadmap.md)
-- current snapshot: this file
 - reviewable history: `git log --oneline`
-
 ## Update Rule
 
 Update this file whenever a task or milestone materially changes:

@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use allocdb_core::config::Config;
 use allocdb_core::ids::Lsn;
@@ -17,6 +18,10 @@ const LOCAL_CLUSTER_REPLICA_COUNT: u64 = 3;
 const LOCAL_CLUSTER_INITIAL_VIEW: u64 = 1;
 const CONTROL_PROTOCOL_VERSION: u32 = 1;
 const CLUSTER_LAYOUT_FILE_NAME: &str = "cluster-layout.txt";
+const CLUSTER_FAULT_STATE_VERSION: u32 = 1;
+const CLUSTER_FAULT_STATE_FILE_NAME: &str = "cluster-faults.txt";
+const CLUSTER_TIMELINE_VERSION: u32 = 1;
+const CLUSTER_TIMELINE_FILE_NAME: &str = "cluster-timeline.log";
 const REPLICA_LOG_DIR_NAME: &str = "logs";
 const REPLICA_RUN_DIR_NAME: &str = "run";
 const REPLICA_METADATA_FILE_NAME: &str = "replica.metadata";
@@ -164,6 +169,81 @@ pub struct ReplicaRuntimeStatus {
     pub protocol_addr: SocketAddr,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalClusterFaultState {
+    pub workspace_root: PathBuf,
+    pub isolated_replicas: Vec<ReplicaId>,
+}
+
+#[derive(Debug)]
+pub enum LocalClusterFaultStateError {
+    Io(std::io::Error),
+    Decode(LocalClusterLayoutError),
+    UnknownReplicaId(u64),
+}
+
+impl From<std::io::Error> for LocalClusterFaultStateError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl fmt::Display for LocalClusterFaultStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "i/o error: {error}"),
+            Self::Decode(error) => write!(formatter, "invalid fault-state file: {error}"),
+            Self::UnknownReplicaId(replica_id) => {
+                write!(formatter, "unknown replica id `{replica_id}`")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LocalClusterFaultStateError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalClusterTimelineEventKind {
+    ClusterStart,
+    ClusterStop,
+    ReplicaCrash,
+    ReplicaRestart,
+    ReplicaIsolate,
+    ReplicaHeal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalClusterTimelineEvent {
+    pub sequence: u64,
+    pub timestamp_millis: u128,
+    pub kind: LocalClusterTimelineEventKind,
+    pub replica_id: Option<ReplicaId>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum LocalClusterTimelineError {
+    Io(std::io::Error),
+    Decode(LocalClusterLayoutError),
+}
+
+impl From<std::io::Error> for LocalClusterTimelineError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl fmt::Display for LocalClusterTimelineError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "i/o error: {error}"),
+            Self::Decode(error) => write!(formatter, "invalid cluster timeline: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for LocalClusterTimelineError {}
+
 impl LocalClusterLayout {
     /// Loads one existing local-cluster layout or creates a fresh one in the provided workspace.
     ///
@@ -275,6 +355,102 @@ impl LocalClusterLayout {
     }
 }
 
+impl LocalClusterFaultState {
+    /// Loads one existing fault-state file or creates a fresh healthy state in the provided
+    /// workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalClusterFaultStateError`] if the workspace cannot be prepared, if an existing
+    /// file cannot be decoded, or if a fresh file cannot be persisted.
+    pub fn load_or_create(
+        workspace_root: impl AsRef<Path>,
+    ) -> Result<Self, LocalClusterFaultStateError> {
+        let workspace_root = prepare_workspace_root(workspace_root.as_ref())
+            .map_err(LocalClusterFaultStateError::Decode)?;
+        let path = fault_state_path(&workspace_root);
+        if path.exists() {
+            Self::load(&path)
+        } else {
+            let state = Self::new(workspace_root);
+            state.persist()?;
+            Ok(state)
+        }
+    }
+
+    /// Loads one persisted fault-state file from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalClusterFaultStateError`] if the file cannot be read or decoded.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, LocalClusterFaultStateError> {
+        let path = path.as_ref();
+        let mut bytes = String::new();
+        File::open(path)?.read_to_string(&mut bytes)?;
+        decode_fault_state(&bytes)
+    }
+
+    /// Persists the current fault-state file atomically to its workspace root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalClusterFaultStateError`] if the file cannot be updated.
+    pub fn persist(&self) -> Result<(), LocalClusterFaultStateError> {
+        fs::create_dir_all(&self.workspace_root)?;
+        let bytes = encode_fault_state(self);
+        write_bytes_atomically(&fault_state_path(&self.workspace_root), bytes.as_bytes())?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn is_replica_isolated(&self, replica_id: ReplicaId) -> bool {
+        self.isolated_replicas.contains(&replica_id)
+    }
+
+    /// Marks one replica isolated from external client and protocol traffic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalClusterFaultStateError::UnknownReplicaId`] when the replica is outside the
+    /// fixed local-cluster membership.
+    pub fn isolate_replica(
+        &mut self,
+        replica_id: ReplicaId,
+    ) -> Result<(), LocalClusterFaultStateError> {
+        validate_replica_id(replica_id)
+            .map_err(|_| LocalClusterFaultStateError::UnknownReplicaId(replica_id.get()))?;
+        if !self.is_replica_isolated(replica_id) {
+            self.isolated_replicas.push(replica_id);
+            self.isolated_replicas
+                .sort_by_key(|replica_id| replica_id.get());
+        }
+        Ok(())
+    }
+
+    /// Restores one replica to healthy connectivity in the local fault-state file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalClusterFaultStateError::UnknownReplicaId`] when the replica is outside the
+    /// fixed local-cluster membership.
+    pub fn heal_replica(
+        &mut self,
+        replica_id: ReplicaId,
+    ) -> Result<(), LocalClusterFaultStateError> {
+        validate_replica_id(replica_id)
+            .map_err(|_| LocalClusterFaultStateError::UnknownReplicaId(replica_id.get()))?;
+        self.isolated_replicas.retain(|found| *found != replica_id);
+        Ok(())
+    }
+
+    fn new(workspace_root: PathBuf) -> Self {
+        Self {
+            workspace_root,
+            isolated_replicas: Vec::new(),
+        }
+    }
+}
+
 #[must_use]
 pub fn default_local_cluster_core_config() -> Config {
     Config {
@@ -301,6 +477,67 @@ pub const fn default_local_cluster_engine_config() -> EngineConfig {
 #[must_use]
 pub fn layout_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(CLUSTER_LAYOUT_FILE_NAME)
+}
+
+#[must_use]
+pub fn fault_state_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(CLUSTER_FAULT_STATE_FILE_NAME)
+}
+
+#[must_use]
+pub fn timeline_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(CLUSTER_TIMELINE_FILE_NAME)
+}
+
+/// Loads one persisted local-cluster timeline.
+///
+/// # Errors
+///
+/// Returns [`LocalClusterTimelineError`] if the file cannot be read or if its contents are
+/// malformed. A missing file yields an empty timeline.
+pub fn load_local_cluster_timeline(
+    workspace_root: impl AsRef<Path>,
+) -> Result<Vec<LocalClusterTimelineEvent>, LocalClusterTimelineError> {
+    let path = timeline_path(workspace_root.as_ref());
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut bytes = String::new();
+    File::open(path)?.read_to_string(&mut bytes)?;
+    decode_timeline(&bytes)
+}
+
+/// Appends one timeline event to the local-cluster timeline log.
+///
+/// # Errors
+///
+/// Returns [`LocalClusterTimelineError`] if the workspace cannot be created, if an existing
+/// timeline cannot be decoded, or if the new event cannot be persisted.
+pub fn append_local_cluster_timeline_event(
+    workspace_root: impl AsRef<Path>,
+    kind: LocalClusterTimelineEventKind,
+    replica_id: Option<ReplicaId>,
+    detail: Option<&str>,
+) -> Result<LocalClusterTimelineEvent, LocalClusterTimelineError> {
+    let workspace_root = prepare_workspace_root(workspace_root.as_ref())
+        .map_err(LocalClusterTimelineError::Decode)?;
+    let mut events = load_local_cluster_timeline(&workspace_root)?;
+    let event = LocalClusterTimelineEvent {
+        sequence: events
+            .last()
+            .map_or(1, |event| event.sequence.saturating_add(1)),
+        timestamp_millis: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        kind,
+        replica_id,
+        detail: detail.map(ToOwned::to_owned),
+    };
+    events.push(event.clone());
+    persist_local_cluster_timeline(&workspace_root, &events)?;
+    Ok(event)
 }
 
 /// Sends one `status` request to a running replica control socket.
@@ -496,6 +733,193 @@ fn decode_status_response(response: &str) -> Result<ReplicaRuntimeStatus, Contro
         protocol_addr: parse_required_socket_addr(&fields, "protocol_addr")
             .map_err(ControlProtocolError::from)?,
     })
+}
+
+fn encode_fault_state(state: &LocalClusterFaultState) -> String {
+    let mut lines = vec![
+        format!("version={CLUSTER_FAULT_STATE_VERSION}"),
+        format!("workspace_root={}", state.workspace_root.display()),
+    ];
+    for replica_id in 1_u64..=LOCAL_CLUSTER_REPLICA_COUNT {
+        let replica_id = ReplicaId(replica_id);
+        lines.push(format!(
+            "replica.{}.network={}",
+            replica_id.get(),
+            if state.is_replica_isolated(replica_id) {
+                "isolated"
+            } else {
+                "healthy"
+            }
+        ));
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn decode_fault_state(bytes: &str) -> Result<LocalClusterFaultState, LocalClusterFaultStateError> {
+    let fields = parse_key_value_lines(bytes).map_err(LocalClusterFaultStateError::Decode)?;
+    let version =
+        parse_required_u32(&fields, "version").map_err(LocalClusterFaultStateError::Decode)?;
+    if version != CLUSTER_FAULT_STATE_VERSION {
+        return Err(LocalClusterFaultStateError::Decode(
+            LocalClusterLayoutError::UnsupportedVersion(version),
+        ));
+    }
+
+    let workspace_root = PathBuf::from(
+        required_field(&fields, "workspace_root").map_err(LocalClusterFaultStateError::Decode)?,
+    );
+    let mut isolated_replicas = Vec::new();
+    for replica_id in 1_u64..=LOCAL_CLUSTER_REPLICA_COUNT {
+        let field = format!("replica.{replica_id}.network");
+        match required_field(&fields, &field).map_err(LocalClusterFaultStateError::Decode)? {
+            "healthy" => {}
+            "isolated" => {
+                isolated_replicas.push(ReplicaId(replica_id));
+            }
+            value => {
+                return Err(LocalClusterFaultStateError::Decode(
+                    LocalClusterLayoutError::InvalidField {
+                        field,
+                        value: value.to_owned(),
+                    },
+                ));
+            }
+        }
+    }
+
+    Ok(LocalClusterFaultState {
+        workspace_root,
+        isolated_replicas,
+    })
+}
+
+fn persist_local_cluster_timeline(
+    workspace_root: &Path,
+    events: &[LocalClusterTimelineEvent],
+) -> Result<(), LocalClusterTimelineError> {
+    fs::create_dir_all(workspace_root)?;
+    let bytes = encode_timeline(events);
+    write_bytes_atomically(&timeline_path(workspace_root), bytes.as_bytes())?;
+    Ok(())
+}
+
+fn encode_timeline(events: &[LocalClusterTimelineEvent]) -> String {
+    let mut lines = vec![format!("version={CLUSTER_TIMELINE_VERSION}"), String::new()];
+    for event in events {
+        lines.push(format!("sequence={}", event.sequence));
+        lines.push(format!("timestamp_millis={}", event.timestamp_millis));
+        lines.push(format!("kind={}", encode_timeline_kind(event.kind)));
+        lines.push(format!(
+            "replica_id={}",
+            event.replica_id.map_or_else(
+                || String::from("none"),
+                |replica_id| replica_id.get().to_string()
+            )
+        ));
+        lines.push(format!(
+            "detail={}",
+            event.detail.as_deref().unwrap_or("none")
+        ));
+        lines.push(String::new());
+    }
+    lines.join("\n")
+}
+
+fn decode_timeline(
+    bytes: &str,
+) -> Result<Vec<LocalClusterTimelineEvent>, LocalClusterTimelineError> {
+    let mut lines = bytes.lines().peekable();
+    let Some(version_line) = lines.next() else {
+        return Ok(Vec::new());
+    };
+    let Some((version_key, version_value)) = version_line.split_once('=') else {
+        return Err(LocalClusterTimelineError::Decode(
+            LocalClusterLayoutError::InvalidLine(version_line.to_owned()),
+        ));
+    };
+    if version_key != "version" {
+        return Err(LocalClusterTimelineError::Decode(
+            LocalClusterLayoutError::InvalidLine(version_line.to_owned()),
+        ));
+    }
+    let version = version_value.parse::<u32>().map_err(|_| {
+        LocalClusterTimelineError::Decode(LocalClusterLayoutError::InvalidField {
+            field: String::from("version"),
+            value: version_value.to_owned(),
+        })
+    })?;
+    if version != CLUSTER_TIMELINE_VERSION {
+        return Err(LocalClusterTimelineError::Decode(
+            LocalClusterLayoutError::UnsupportedVersion(version),
+        ));
+    }
+    if lines.peek().is_some_and(|line| line.is_empty()) {
+        lines.next();
+    }
+
+    let mut blocks = Vec::new();
+    let mut current_block = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            if !current_block.is_empty() {
+                blocks.push(current_block.join("\n"));
+                current_block.clear();
+            }
+            continue;
+        }
+        current_block.push(line.to_owned());
+    }
+    if !current_block.is_empty() {
+        blocks.push(current_block.join("\n"));
+    }
+
+    blocks
+        .into_iter()
+        .map(|block| {
+            let fields =
+                parse_key_value_lines(&block).map_err(LocalClusterTimelineError::Decode)?;
+            let sequence = parse_required_u64(&fields, "sequence")
+                .map_err(LocalClusterTimelineError::Decode)?;
+            let timestamp_millis = required_field(&fields, "timestamp_millis")
+                .map_err(LocalClusterTimelineError::Decode)?
+                .parse::<u128>()
+                .map_err(|_| {
+                    LocalClusterTimelineError::Decode(LocalClusterLayoutError::InvalidField {
+                        field: String::from("timestamp_millis"),
+                        value: fields["timestamp_millis"].clone(),
+                    })
+                })?;
+            let kind = parse_timeline_kind(
+                required_field(&fields, "kind").map_err(LocalClusterTimelineError::Decode)?,
+            )
+            .map_err(|value| {
+                LocalClusterTimelineError::Decode(LocalClusterLayoutError::InvalidField {
+                    field: String::from("kind"),
+                    value,
+                })
+            })?;
+            let replica_id = match required_field(&fields, "replica_id")
+                .map_err(LocalClusterTimelineError::Decode)?
+            {
+                "none" => None,
+                value => Some(ReplicaId(value.parse::<u64>().map_err(|_| {
+                    LocalClusterTimelineError::Decode(LocalClusterLayoutError::InvalidField {
+                        field: String::from("replica_id"),
+                        value: value.to_owned(),
+                    })
+                })?)),
+            };
+            let detail = parse_optional_string(&fields, "detail").filter(|value| !value.is_empty());
+            Ok(LocalClusterTimelineEvent {
+                sequence,
+                timestamp_millis,
+                kind,
+                replica_id,
+                detail,
+            })
+        })
+        .collect()
 }
 
 fn reserve_loopback_addr(
@@ -810,6 +1234,37 @@ fn parse_runtime_state(value: &str) -> Result<ReplicaRuntimeState, String> {
     }
 }
 
+fn encode_timeline_kind(kind: LocalClusterTimelineEventKind) -> &'static str {
+    match kind {
+        LocalClusterTimelineEventKind::ClusterStart => "cluster_start",
+        LocalClusterTimelineEventKind::ClusterStop => "cluster_stop",
+        LocalClusterTimelineEventKind::ReplicaCrash => "replica_crash",
+        LocalClusterTimelineEventKind::ReplicaRestart => "replica_restart",
+        LocalClusterTimelineEventKind::ReplicaIsolate => "replica_isolate",
+        LocalClusterTimelineEventKind::ReplicaHeal => "replica_heal",
+    }
+}
+
+fn parse_timeline_kind(value: &str) -> Result<LocalClusterTimelineEventKind, String> {
+    match value {
+        "cluster_start" => Ok(LocalClusterTimelineEventKind::ClusterStart),
+        "cluster_stop" => Ok(LocalClusterTimelineEventKind::ClusterStop),
+        "replica_crash" => Ok(LocalClusterTimelineEventKind::ReplicaCrash),
+        "replica_restart" => Ok(LocalClusterTimelineEventKind::ReplicaRestart),
+        "replica_isolate" => Ok(LocalClusterTimelineEventKind::ReplicaIsolate),
+        "replica_heal" => Ok(LocalClusterTimelineEventKind::ReplicaHeal),
+        _ => Err(value.to_owned()),
+    }
+}
+
+fn validate_replica_id(replica_id: ReplicaId) -> Result<(), LocalClusterLayoutError> {
+    if (1..=LOCAL_CLUSTER_REPLICA_COUNT).contains(&replica_id.get()) {
+        Ok(())
+    } else {
+        Err(LocalClusterLayoutError::UnknownReplicaId(replica_id.get()))
+    }
+}
+
 fn encode_optional_lsn(lsn: Option<Lsn>) -> String {
     lsn.map_or_else(|| String::from("none"), |value| value.get().to_string())
 }
@@ -1048,6 +1503,44 @@ mod tests {
         let encoded = encode_status_response(&status);
         let decoded = decode_status_response(&encoded).unwrap();
         assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn fault_state_round_trips_through_text_encoding() {
+        let state = LocalClusterFaultState {
+            workspace_root: PathBuf::from("/tmp/allocdb-local-cluster"),
+            isolated_replicas: vec![ReplicaId(1), ReplicaId(3)],
+        };
+
+        let encoded = encode_fault_state(&state);
+        let decoded = decode_fault_state(&encoded).unwrap();
+        assert_eq!(decoded, state);
+        assert!(decoded.is_replica_isolated(ReplicaId(1)));
+        assert!(!decoded.is_replica_isolated(ReplicaId(2)));
+    }
+
+    #[test]
+    fn timeline_round_trips_through_text_encoding() {
+        let timeline = vec![
+            LocalClusterTimelineEvent {
+                sequence: 1,
+                timestamp_millis: 11,
+                kind: LocalClusterTimelineEventKind::ClusterStart,
+                replica_id: None,
+                detail: Some(String::from("cluster_started")),
+            },
+            LocalClusterTimelineEvent {
+                sequence: 2,
+                timestamp_millis: 12,
+                kind: LocalClusterTimelineEventKind::ReplicaIsolate,
+                replica_id: Some(ReplicaId(1)),
+                detail: Some(String::from("scope=client+protocol")),
+            },
+        ];
+
+        let encoded = encode_timeline(&timeline);
+        let decoded = decode_timeline(&encoded).unwrap();
+        assert_eq!(decoded, timeline);
     }
 
     #[test]

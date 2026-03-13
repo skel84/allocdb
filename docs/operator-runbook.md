@@ -38,6 +38,10 @@ Command surface:
 - `cargo run -p allocdb-node --bin allocdb-local-cluster -- start --workspace <path>`
 - `cargo run -p allocdb-node --bin allocdb-local-cluster -- status --workspace <path>`
 - `cargo run -p allocdb-node --bin allocdb-local-cluster -- stop --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-local-cluster -- crash --workspace <path> --replica-id <id>`
+- `cargo run -p allocdb-node --bin allocdb-local-cluster -- restart --workspace <path> --replica-id <id>`
+- `cargo run -p allocdb-node --bin allocdb-local-cluster -- isolate --workspace <path> --replica-id <id>`
+- `cargo run -p allocdb-node --bin allocdb-local-cluster -- heal --workspace <path> --replica-id <id>`
 
 What `start` does:
 
@@ -59,6 +63,8 @@ What restart preserves:
 Current workspace layout:
 
 - `<path>/cluster-layout.txt`
+- `<path>/cluster-faults.txt`
+- `<path>/cluster-timeline.log`
 - `<path>/logs/replica-{1,2,3}.log`
 - `<path>/run/replica-{1,2,3}.pid`
 - `<path>/replica-{1,2,3}/replica.metadata`
@@ -70,10 +76,21 @@ What `status` shows:
 
 - process ID
 - replica state, role, and current view
+- local network fault state for each replica
 - committed and active-snapshot `lsn`
 - startup recovery kind and write-acceptance flag when the wrapped engine is active
 - control, client, and protocol addresses
 - log, pid, metadata, prepare-log, snapshot, and WAL paths
+- fault-state and timeline file paths
+
+What the fault-control commands do:
+
+- `crash` sends an abrupt local process kill to one replica and waits for the process to exit
+- `restart` spawns one replica back through the normal `ReplicaNode::recover(...)` path
+- `isolate` marks one replica isolated from external `client` and `protocol` traffic while leaving
+  `control` reachable
+- `heal` restores that replica's external `client` and `protocol` connectivity
+- every command appends one ordered event to `cluster-timeline.log`
 
 Current control hooks:
 
@@ -82,8 +99,8 @@ Current control hooks:
 
 Current limits:
 
-- the runner reserves `client` and `protocol` listeners for follow-on transport and fault-control
-  work, but they intentionally reject traffic today
+- the runner still reserves `client` and `protocol` listeners for follow-on replicated transport
+  work; they now reject traffic either as `not implemented` or `network isolated by local harness`
 - the runner only auto-configures normal-mode roles on a fresh workspace when recovered metadata is
   still in `recovering`; after that it preserves recovered durable metadata instead of resetting
   views or roles
