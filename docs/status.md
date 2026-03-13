@@ -34,9 +34,11 @@
     `u64::MAX`, deterministic storage-fault injection for append failures, sync-failure
     ambiguity, checksum-mismatch fail-closed recovery, and torn-tail truncation over the real WAL
     restart path, plus replayable seeded schedule exploration over ingress contention,
-    due-expiration selection with earliest-deadline priority, retry timing, and a replicated-node
+    due-expiration selection with earliest-deadline priority, retry timing, a replicated-node
     wrapper with durable replica metadata bootstrap, restart validation, and explicit faulted-state
-    entry on invalid local protocol metadata
+    entry on invalid local protocol metadata, and a deterministic three-replica harness with one
+    explicit message queue, one connectivity matrix, and replayable transcripts for queued,
+    delivered, dropped, crashed, and restarted replica actions
 
 ## What Exists
 
@@ -132,6 +134,12 @@
     checksum-corruption fail-closed restart, torn-tail truncation retry, ingress contention winner
     order, same-deadline expiration order, mixed-deadline earliest-first expiration priority, and
     retry timing across the dedupe window
+  - reusable replicated cluster harness in `crates/allocdb-node/src/replicated_simulation.rs`
+  - three real `ReplicaNode`s with independent WAL, snapshot, and metadata workspaces
+  - explicit replica-to-replica and client-to-replica connectivity matrix under test control
+  - explicit protocol-message queue plus replayable transcripts for queue, deliver, drop, crash,
+    and restart actions
+  - replica crash as loss of volatile state with restart through real `ReplicaNode::recover`
 - Validation:
   - `cargo test -p allocdb-core wal -- --nocapture`
   - `cargo test -p allocdb-core snapshot -- --nocapture`
@@ -141,14 +149,15 @@
   - `cargo test -p allocdb-node engine -- --nocapture`
   - `cargo test -p allocdb-node replica -- --nocapture`
   - `cargo test -p allocdb-node simulation -- --nocapture`
+  - `cargo test -p allocdb-node replicated_simulation -- --nocapture`
   - `cargo run -p allocdb-bench -- --scenario all`
   - `scripts/preflight.sh`
 
 ## Current Focus
 
-- `M7-T02`: build the deterministic 3-replica cluster harness
 - `M7-T03`: implement the first quorum write path with one configured primary
-- finish `M7-T01` review and merge, then use the new replica wrapper as the base for `M7-T02`
+- use the deterministic replicated harness from `M7-T02` as the execution surface for quorum
+  prepare/commit work
 - follow with `M7-T04` through `M7-T06` for view change, rejoin, and executable replicated
   simulation coverage
 - use `M8` for the external multi-process, QEMU, and Jepsen layers after the in-process replicated

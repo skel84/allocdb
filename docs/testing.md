@@ -200,6 +200,22 @@ As with the current single-node schedule exploration, the harness should resolve
 into one recorded transcript step. The recorded step should include enough metadata to replay the
 same cluster schedule exactly.
 
+The initial `M7-T02` implementation keeps that surface intentionally narrow around the current
+codebase:
+
+- `queue_protocol_message`
+- `deliver_protocol_message`
+- `drop_protocol_message`
+- `set_connectivity`
+- `crash_replica`
+- `restart_replica`
+- `explore_schedule`
+
+The harness already hosts three real `ReplicaNode`s with independent durable workspaces and one
+shared seeded slot driver. Protocol payloads remain opaque labels in this milestone; `M7-T03`
+layers real primary/backup message semantics onto the same deterministic queue and transcript
+surface.
+
 ### Network And Failure Model In Simulation
 
 The deterministic cluster driver should model:

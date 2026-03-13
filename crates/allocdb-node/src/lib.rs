@@ -3,6 +3,8 @@ mod bounded_queue;
 pub mod engine;
 pub mod replica;
 #[cfg(test)]
+pub(crate) mod replicated_simulation;
+#[cfg(test)]
 pub(crate) mod simulation;
 
 pub use api::{
