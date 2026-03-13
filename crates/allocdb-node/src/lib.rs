@@ -1,6 +1,7 @@
 pub mod api;
 mod bounded_queue;
 pub mod engine;
+pub mod replica;
 #[cfg(test)]
 pub(crate) mod simulation;
 
@@ -14,4 +15,10 @@ pub use engine::{
     EngineConfig, EngineConfigError, EngineMetrics, EngineOpenError, EnqueueResult, ReadError,
     RecoverEngineError, RecoveryStartupKind, RecoveryStatus, SingleNodeEngine, SubmissionError,
     SubmissionErrorCategory, SubmissionResult,
+};
+pub use replica::{
+    DurableVote, RecoverReplicaError, ReplicaFault, ReplicaFaultReason, ReplicaId, ReplicaIdentity,
+    ReplicaMetadata, ReplicaMetadataDecodeError, ReplicaMetadataFile, ReplicaMetadataFileError,
+    ReplicaMetadataLoadError, ReplicaNode, ReplicaNodeStatus, ReplicaOpenError, ReplicaPaths,
+    ReplicaRole, ReplicaStartupValidationError,
 };

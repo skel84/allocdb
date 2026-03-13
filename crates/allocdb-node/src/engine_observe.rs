@@ -40,6 +40,11 @@ pub enum ReadError {
 
 impl SingleNodeEngine {
     #[must_use]
+    pub fn active_snapshot_lsn(&self) -> Option<Lsn> {
+        self.active_snapshot_lsn
+    }
+
+    #[must_use]
     /// Returns the current engine-level health snapshot including queue pressure, recovery
     /// metadata, and core metrics.
     ///
