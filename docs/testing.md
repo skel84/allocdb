@@ -399,6 +399,14 @@ The focused validation commands are:
 - `cargo test -p allocdb-node qemu_testbed -- --nocapture`
 - `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- prepare --workspace <path> --base-image-path <cloudimg.qcow2> --local-cluster-bin <allocdb-local-cluster>`
 
+The host-side prerequisites for that command are:
+
+- `hdiutil` on macOS, or `mkisofs` / `genisoimage` on Linux-class hosts, for NoCloud seed image
+  creation
+- QEMU firmware templates reachable either through the default search paths or `QEMU_SHARE_DIR`
+- the default accelerator is `hvf` on macOS and `kvm` on Linux, with `QEMU_ACCEL` available as an
+  explicit override
+
 What this testbed proves today:
 
 - one host-side command surface can generate repeatable QEMU assets for `3` replica guests plus

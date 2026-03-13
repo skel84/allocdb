@@ -28,6 +28,8 @@ const REPLICA_METADATA_FILE_NAME: &str = "replica.metadata";
 const REPLICA_SNAPSHOT_FILE_NAME: &str = "state.snapshot";
 const REPLICA_WAL_FILE_NAME: &str = "state.wal";
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_millis(250);
+const CONTROL_STATUS_RETRY_DELAY: Duration = Duration::from_millis(10);
+const CONTROL_STATUS_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalClusterReplicaConfig {
@@ -555,8 +557,27 @@ pub fn append_local_cluster_timeline_event(
 pub fn request_control_status(
     addr: SocketAddr,
 ) -> Result<ReplicaRuntimeStatus, ControlProtocolError> {
-    let response = send_control_request(addr, ControlRequest::Status)?;
-    decode_status_response(&response)
+    let mut last_error = None;
+    for attempt in 0..CONTROL_STATUS_MAX_ATTEMPTS {
+        match send_control_request(addr, ControlRequest::Status)
+            .and_then(|response| decode_status_response(&response))
+        {
+            Ok(status) => return Ok(status),
+            Err(error)
+                if control_status_error_is_transient(&error)
+                    && attempt + 1 < CONTROL_STATUS_MAX_ATTEMPTS =>
+            {
+                last_error = Some(error);
+                std::thread::sleep(CONTROL_STATUS_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        ControlProtocolError::Remote(String::from(
+            "control status retry loop ended without error",
+        ))
+    }))
 }
 
 /// Sends one `stop` request to a running replica control socket.
@@ -739,6 +760,15 @@ fn decode_status_response(response: &str) -> Result<ReplicaRuntimeStatus, Contro
         protocol_addr: parse_required_socket_addr(&fields, "protocol_addr")
             .map_err(ControlProtocolError::from)?,
     })
+}
+
+fn control_status_error_is_transient(error: &ControlProtocolError) -> bool {
+    matches!(
+        error,
+        ControlProtocolError::Io(_)
+            | ControlProtocolError::MissingField(_)
+            | ControlProtocolError::InvalidLine(_)
+    )
 }
 
 fn encode_fault_state(state: &LocalClusterFaultState) -> String {

@@ -129,6 +129,15 @@ What `prepare` does:
 - embeds the existing `allocdb-local-cluster` binary and one static local-cluster layout into the
   guest seed data
 
+Host overrides and prerequisites:
+
+- `QEMU_SHARE_DIR` can point at a non-default QEMU firmware directory when the host does not keep
+  firmware templates under the standard search paths
+- `QEMU_ACCEL` can override the accelerator embedded into the rendered QEMU command; the default is
+  `hvf` on macOS and `kvm` on Linux
+- `prepare` uses `hdiutil` on macOS and `mkisofs` or `genisoimage` on Linux-class hosts when it
+  builds NoCloud seed images
+
 What `start` does:
 
 - boots `3` replica guests and `1` control guest under QEMU

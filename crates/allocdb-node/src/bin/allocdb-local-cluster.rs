@@ -1121,12 +1121,12 @@ fn usage() -> String {
          commands:\n\
          \x20\x20start --workspace <path>\n\
          \x20\x20stop --workspace <path>\n\
-        \x20\x20status --workspace <path>\n\
-        \x20\x20crash --workspace <path> --replica-id <id>\n\
-        \x20\x20restart --workspace <path> --replica-id <id>\n\
-        \x20\x20isolate --workspace <path> --replica-id <id>\n\
-        \x20\x20heal --workspace <path> --replica-id <id>\n\
-        \x20\x20control-status --addr <host:port>\n",
+         \x20\x20status --workspace <path>\n\
+         \x20\x20crash --workspace <path> --replica-id <id>\n\
+         \x20\x20restart --workspace <path> --replica-id <id>\n\
+         \x20\x20isolate --workspace <path> --replica-id <id>\n\
+         \x20\x20heal --workspace <path> --replica-id <id>\n\
+         \x20\x20control-status --addr <host:port>\n",
     )
 }
 

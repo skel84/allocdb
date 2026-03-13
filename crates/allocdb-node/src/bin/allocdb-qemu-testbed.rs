@@ -1,12 +1,13 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use allocdb_node::qemu_testbed::{
     QemuGuestArch, QemuGuestConfig, QemuGuestKind, QemuTestbedConfig, QemuTestbedLayout,
+    qemu_firmware_code_path, qemu_firmware_vars_template_path,
 };
 use base64::Engine as _;
 
@@ -14,7 +15,12 @@ const SSH_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const SSH_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 const PID_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const QEMU_SHARE_DIR: &str = "/opt/homebrew/share/qemu";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SeedIsoTool {
+    Hdiutil,
+    Mkisofs(&'static str),
+}
 
 enum ParsedCommand {
     Help,
@@ -341,7 +347,7 @@ fn control_testbed(workspace_root: &Path, args: &[String]) -> Result<(), String>
 fn prepare_runtime_assets(layout: &QemuTestbedLayout) -> Result<(), String> {
     ensure_command_on_path(layout.config.arch.qemu_binary())?;
     ensure_command_on_path("qemu-img")?;
-    ensure_command_on_path("hdiutil")?;
+    detect_seed_iso_tool()?;
     ensure_command_on_path("ssh")?;
     ensure_command_on_path("ssh-keygen")?;
 
@@ -357,15 +363,35 @@ fn prepare_runtime_assets(layout: &QemuTestbedLayout) -> Result<(), String> {
 }
 
 fn ensure_command_on_path(command: &str) -> Result<(), String> {
+    if command_on_path(command)? {
+        Ok(())
+    } else {
+        Err(format!("required command `{command}` is not on PATH"))
+    }
+}
+
+fn command_on_path(command: &str) -> Result<bool, String> {
     let status = Command::new("sh")
         .arg("-lc")
         .arg(format!("command -v {command} >/dev/null 2>&1"))
         .status()
         .map_err(|error| format!("failed to check command `{command}`: {error}"))?;
-    if status.success() {
-        Ok(())
+    Ok(status.success())
+}
+
+fn detect_seed_iso_tool() -> Result<SeedIsoTool, String> {
+    if cfg!(target_os = "macos") {
+        ensure_command_on_path("hdiutil")?;
+        Ok(SeedIsoTool::Hdiutil)
     } else {
-        Err(format!("required command `{command}` is not on PATH"))
+        for command in ["mkisofs", "genisoimage"] {
+            if command_on_path(command)? {
+                return Ok(SeedIsoTool::Mkisofs(command));
+            }
+        }
+        Err(String::from(
+            "required seed ISO builder is not on PATH; install `mkisofs` or `genisoimage`",
+        ))
     }
 }
 
@@ -486,6 +512,7 @@ fn ensure_guest_firmware_vars(layout: &QemuTestbedLayout) -> Result<(), String> 
 }
 
 fn ensure_overlay_images(layout: &QemuTestbedLayout) -> Result<(), String> {
+    let base_image_format = detect_qemu_image_format(&layout.config.base_image_path)?;
     for guest in std::iter::once(&layout.control_guest).chain(layout.replica_guests.iter()) {
         if guest.overlay_path.exists() {
             continue;
@@ -498,7 +525,7 @@ fn ensure_overlay_images(layout: &QemuTestbedLayout) -> Result<(), String> {
                 "-b",
                 &layout.config.base_image_path.display().to_string(),
                 "-F",
-                "qcow2",
+                &base_image_format,
                 &guest.overlay_path.display().to_string(),
             ])
             .status()
@@ -511,6 +538,32 @@ fn ensure_overlay_images(layout: &QemuTestbedLayout) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn detect_qemu_image_format(path: &Path) -> Result<String, String> {
+    let output = Command::new("qemu-img")
+        .args(["info", &path.display().to_string()])
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to run `qemu-img info` for {}: {error}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format_command_failure(
+            "qemu-img info",
+            path,
+            &output,
+            "failed to inspect base image format",
+        ));
+    }
+    parse_qemu_image_format(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+        format!(
+            "failed to determine base image format from `qemu-img info {}` output",
+            path.display()
+        )
+    })
 }
 
 fn write_seed_assets(layout: &QemuTestbedLayout) -> Result<(), String> {
@@ -596,7 +649,30 @@ fn create_seed_iso(seed_dir: &Path, seed_iso_path: &Path) -> Result<(), String> 
     }
     let temp_output = seed_iso_path.with_extension("seedtmp");
     let _ = fs::remove_file(&temp_output);
-    let status = Command::new("hdiutil")
+    let produced_path = match detect_seed_iso_tool()? {
+        SeedIsoTool::Hdiutil => {
+            create_seed_iso_with_hdiutil(seed_dir, seed_iso_path, &temp_output)?
+        }
+        SeedIsoTool::Mkisofs(command) => {
+            create_seed_iso_with_mkisofs(command, seed_dir, seed_iso_path, &temp_output)?
+        }
+    };
+    fs::rename(&produced_path, seed_iso_path).map_err(|error| {
+        format!(
+            "failed to move {} to {}: {error}",
+            produced_path.display(),
+            seed_iso_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn create_seed_iso_with_hdiutil(
+    seed_dir: &Path,
+    seed_iso_path: &Path,
+    temp_output: &Path,
+) -> Result<PathBuf, String> {
+    let output = Command::new("hdiutil")
         .args([
             "makehybrid",
             "-o",
@@ -607,28 +683,51 @@ fn create_seed_iso(seed_dir: &Path, seed_iso_path: &Path) -> Result<(), String> 
             "-default-volume-name",
             "cidata",
         ])
-        .status()
+        .output()
         .map_err(|error| format!("failed to run hdiutil: {error}"))?;
-    if !status.success() {
-        return Err(format!(
-            "hdiutil failed while building {}",
-            seed_iso_path.display()
+    if !output.status.success() {
+        return Err(format_command_failure(
+            "hdiutil makehybrid",
+            seed_iso_path,
+            &output,
+            "hdiutil failed while building seed image",
         ));
     }
-    let produced_path = find_hdiutil_output(&temp_output)?.ok_or_else(|| {
+    find_hdiutil_output(temp_output)?.ok_or_else(|| {
         format!(
             "hdiutil did not produce a seed image for {}",
             seed_iso_path.display()
         )
-    })?;
-    fs::rename(&produced_path, seed_iso_path).map_err(|error| {
-        format!(
-            "failed to move {} to {}: {error}",
-            produced_path.display(),
-            seed_iso_path.display()
-        )
-    })?;
-    Ok(())
+    })
+}
+
+fn create_seed_iso_with_mkisofs(
+    command: &str,
+    seed_dir: &Path,
+    seed_iso_path: &Path,
+    temp_output: &Path,
+) -> Result<PathBuf, String> {
+    let output = Command::new(command)
+        .args([
+            "-output",
+            &temp_output.display().to_string(),
+            "-volid",
+            "cidata",
+            "-joliet",
+            "-rock",
+            &seed_dir.display().to_string(),
+        ])
+        .output()
+        .map_err(|error| format!("failed to run {command}: {error}"))?;
+    if !output.status.success() {
+        return Err(format_command_failure(
+            command,
+            seed_iso_path,
+            &output,
+            "seed image build failed",
+        ));
+    }
+    Ok(temp_output.to_path_buf())
 }
 
 fn find_hdiutil_output(temp_output: &Path) -> Result<Option<PathBuf>, String> {
@@ -655,6 +754,26 @@ fn find_hdiutil_output(temp_output: &Path) -> Result<Option<PathBuf>, String> {
         .collect::<Vec<_>>();
     matches.sort();
     Ok(matches.into_iter().next())
+}
+
+fn format_command_failure(command: &str, path: &Path, output: &Output, context: &str) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!("{context} for {} via `{command}`", path.display())
+    } else {
+        format!("{context} for {} via `{command}`: {stderr}", path.display())
+    }
+}
+
+fn parse_qemu_image_format(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("file format:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from)
+    })
 }
 
 fn ensure_testbed_not_running(layout: &QemuTestbedLayout) -> Result<(), String> {
@@ -877,9 +996,20 @@ fn image_file_name(url: &str) -> String {
 }
 
 fn firmware_code_template_path(layout: &QemuTestbedLayout) -> PathBuf {
-    PathBuf::from(QEMU_SHARE_DIR).join(layout.config.arch.firmware_code_file_name())
+    qemu_firmware_code_path(layout.config.arch, Some(&layout.config.base_image_path))
 }
 
 fn firmware_vars_template_path(layout: &QemuTestbedLayout) -> PathBuf {
-    PathBuf::from(QEMU_SHARE_DIR).join(layout.config.arch.firmware_vars_template_file_name())
+    qemu_firmware_vars_template_path(layout.config.arch, Some(&layout.config.base_image_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_qemu_image_format;
+
+    #[test]
+    fn parse_qemu_image_format_extracts_format_line() {
+        let output = "image: base.img\nfile format: raw\nvirtual size: 64 MiB (67108864 bytes)\n";
+        assert_eq!(parse_qemu_image_format(output).as_deref(), Some("raw"));
+    }
 }

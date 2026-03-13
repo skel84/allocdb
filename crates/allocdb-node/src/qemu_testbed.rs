@@ -44,6 +44,8 @@ const DEFAULT_X86_64_IMAGE_URL: &str =
     "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img";
 const DEFAULT_QEMU_MEMORY_MIB: u32 = 2_048;
 const DEFAULT_QEMU_VCPUS: u8 = 2;
+const QEMU_SHARE_DIR_ENV_VAR: &str = "QEMU_SHARE_DIR";
+const QEMU_ACCEL_ENV_VAR: &str = "QEMU_ACCEL";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QemuGuestArch {
@@ -85,26 +87,27 @@ impl QemuGuestArch {
     }
 
     #[must_use]
-    pub const fn firmware_code_file_name(self) -> &'static str {
+    pub const fn firmware_code_file_names(self) -> &'static [&'static str] {
         match self {
-            Self::Aarch64 => "edk2-aarch64-code.fd",
-            Self::X86_64 => "edk2-x86_64-code.fd",
+            Self::Aarch64 => &["edk2-aarch64-code.fd", "QEMU_EFI.fd", "AAVMF_CODE.fd"],
+            Self::X86_64 => &["edk2-x86_64-code.fd", "OVMF_CODE.fd", "OVMF_CODE_4M.fd"],
         }
     }
 
     #[must_use]
-    pub const fn firmware_vars_template_file_name(self) -> &'static str {
+    pub const fn firmware_vars_template_file_names(self) -> &'static [&'static str] {
         match self {
-            Self::Aarch64 => "edk2-arm-vars.fd",
-            Self::X86_64 => "edk2-i386-vars.fd",
+            Self::Aarch64 => &["edk2-arm-vars.fd", "AAVMF_VARS.fd"],
+            Self::X86_64 => &["edk2-i386-vars.fd", "OVMF_VARS.fd", "OVMF_VARS_4M.fd"],
         }
     }
 
     #[must_use]
-    pub const fn machine_arg(self) -> &'static str {
+    pub fn machine_arg(self) -> String {
+        let accel = qemu_accel();
         match self {
-            Self::Aarch64 => "virt,accel=hvf",
-            Self::X86_64 => "q35,accel=hvf",
+            Self::Aarch64 => format!("virt,accel={accel}"),
+            Self::X86_64 => format!("q35,accel={accel}"),
         }
     }
 
@@ -269,9 +272,19 @@ impl QemuTestbedLayout {
             .zip(REPLICA_CLUSTER_IPS.iter())
             .enumerate()
             .map(|(index, (management_addr, cluster_addr))| {
-                let replica_id = ReplicaId(u64::try_from(index).unwrap_or(0).saturating_add(1));
-                let suffix = u8::try_from(index).unwrap_or(0).saturating_add(0x11);
-                QemuGuestConfig {
+                let replica_index =
+                    u64::try_from(index).map_err(|_| QemuTestbedLayoutError::InvalidField {
+                        field: String::from("replica_index"),
+                        value: index.to_string(),
+                    })?;
+                let mac_suffix_index =
+                    u8::try_from(index).map_err(|_| QemuTestbedLayoutError::InvalidField {
+                        field: String::from("replica_mac_suffix_index"),
+                        value: index.to_string(),
+                    })?;
+                let replica_id = ReplicaId(replica_index.saturating_add(1));
+                let suffix = mac_suffix_index.saturating_add(0x11);
+                Ok(QemuGuestConfig {
                     name: format!("allocdb-replica-{}", replica_id.get()),
                     kind: QemuGuestKind::Replica,
                     replica_id: Some(replica_id),
@@ -293,9 +306,9 @@ impl QemuTestbedLayout {
                         .join(format!("replica-{}-console.log", replica_id.get())),
                     firmware_vars_path: qemu_firmware_dir(&qemu_root)
                         .join(format!("replica-{}-vars.fd", replica_id.get())),
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, QemuTestbedLayoutError>>()?;
 
         Ok(Self {
             replica_layout: build_guest_local_cluster_layout(&replica_guests),
@@ -476,21 +489,14 @@ impl QemuTestbedLayout {
 
     #[must_use]
     pub fn qemu_command(&self, guest: &QemuGuestConfig) -> Vec<String> {
-        let firmware_code = self
-            .config
-            .base_image_path
-            .parent()
-            .map_or_else(
-                || PathBuf::from("/opt/homebrew/share/qemu"),
-                |_| PathBuf::from("/opt/homebrew/share/qemu"),
-            )
-            .join(self.config.arch.firmware_code_file_name());
+        let firmware_code =
+            qemu_firmware_code_path(self.config.arch, Some(&self.config.base_image_path));
         let mut command = vec![
             String::from(self.config.arch.qemu_binary()),
             String::from("-machine"),
-            String::from(self.config.arch.machine_arg()),
+            self.config.arch.machine_arg(),
             String::from("-cpu"),
-            String::from("host"),
+            String::from(qemu_cpu_model()),
             String::from("-smp"),
             DEFAULT_QEMU_VCPUS.to_string(),
             String::from("-m"),
@@ -555,8 +561,105 @@ pub fn qemu_testbed_layout_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(QEMU_TESTBED_LAYOUT_FILE_NAME)
 }
 
+#[must_use]
+pub fn qemu_firmware_code_path(arch: QemuGuestArch, base_image_path: Option<&Path>) -> PathBuf {
+    resolve_qemu_firmware_path(arch.firmware_code_file_names(), base_image_path)
+}
+
+#[must_use]
+pub fn qemu_firmware_vars_template_path(
+    arch: QemuGuestArch,
+    base_image_path: Option<&Path>,
+) -> PathBuf {
+    resolve_qemu_firmware_path(arch.firmware_vars_template_file_names(), base_image_path)
+}
+
+#[must_use]
+pub fn qemu_accel() -> String {
+    std::env::var(QEMU_ACCEL_ENV_VAR)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(default_qemu_accel)
+}
+
+#[must_use]
+pub fn qemu_cpu_model() -> &'static str {
+    if qemu_accel() == "tcg" { "max" } else { "host" }
+}
+
 fn qemu_root(workspace_root: &Path) -> PathBuf {
     workspace_root.join(QEMU_TESTBED_DIR_NAME)
+}
+
+fn default_qemu_accel() -> String {
+    if cfg!(target_os = "macos") {
+        String::from("hvf")
+    } else if cfg!(target_os = "linux") {
+        String::from("kvm")
+    } else {
+        String::from("tcg")
+    }
+}
+
+fn resolve_qemu_firmware_path(file_names: &[&str], base_image_path: Option<&Path>) -> PathBuf {
+    find_existing_qemu_firmware_path(file_names, base_image_path)
+        .unwrap_or_else(|| qemu_share_dirs(base_image_path)[0].join(file_names[0]))
+}
+
+fn find_existing_qemu_firmware_path(
+    file_names: &[&str],
+    base_image_path: Option<&Path>,
+) -> Option<PathBuf> {
+    for directory in qemu_share_dirs(base_image_path) {
+        for file_name in file_names {
+            let candidate = directory.join(file_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn qemu_share_dirs(base_image_path: Option<&Path>) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(base_image_dir) = base_image_path.and_then(Path::parent) {
+        directories.push(base_image_dir.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os(QEMU_SHARE_DIR_ENV_VAR)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        if !directories.contains(&path) {
+            directories.push(path);
+        }
+    }
+    for candidate in default_qemu_share_dir_candidates() {
+        let candidate = PathBuf::from(candidate);
+        if !directories.contains(&candidate) {
+            directories.push(candidate);
+        }
+    }
+    directories
+}
+
+fn default_qemu_share_dir_candidates() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &[
+            "/opt/homebrew/share/qemu",
+            "/usr/local/share/qemu",
+            "/usr/share/qemu",
+        ]
+    } else {
+        &[
+            "/usr/share/qemu",
+            "/usr/share/OVMF",
+            "/usr/share/AAVMF",
+            "/usr/local/share/qemu",
+            "/opt/homebrew/share/qemu",
+        ]
+    }
 }
 
 fn qemu_images_dir(qemu_root: &Path) -> PathBuf {
