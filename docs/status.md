@@ -28,8 +28,9 @@
     recovery boundaries plus checked slot and LSN arithmetic across trusted-core and single-node
     sequencing paths, including deterministic pre-commit overflow rejection for request slots,
     fail-closed replay rejection for overflowed WAL commands, restart coverage for post-sync
-    submit replay and replay-interrupted recovery, and explicit `next_lsn` exhaustion handling
-    after `u64::MAX`
+    submit replay and replay-interrupted recovery, explicit `next_lsn` exhaustion handling after
+    `u64::MAX`, and replayable seeded schedule exploration over ingress contention, due-expiration
+    selection, and retry timing
 
 ## What Exists
 
@@ -93,11 +94,16 @@
   - explicit simulated slot advancement under test control, with no wall-clock reads in the
     exercised engine path
   - seeded same-slot ready-set scheduling with reproducible transcripts
+  - seeded labeled schedule actions that resolve candidate slot windows into replayable
+    submit/tick transcripts
+  - seeded due-expiration selection over the real internal-expire path, bounded by the production
+    per-tick expiration limit
   - seeded one-shot crash plans over named client-submit, internal-apply, checkpoint, and
     recovery boundaries
   - checkpoint, restart, and injected persist-failure helpers over the real `SingleNodeEngine`
   - regression coverage for crash-selected post-sync submit replay, crash-after-snapshot-write
-    checkpoint recovery, and replay-interrupted recovery restart
+    checkpoint recovery, replay-interrupted recovery restart, ingress contention winner order,
+    same-deadline expiration order, and retry timing across the dedupe window
 - Validation:
   - `cargo test -p allocdb-core snapshot -- --nocapture`
   - `cargo test -p allocdb-core recovery -- --nocapture`
@@ -110,10 +116,10 @@
 
 ## Current Focus
 
-- `M4-T03`: extend the same seeded simulation driver with storage-fault coverage for torn writes,
-  checksum mismatch, and sync failures
-- keep the operator runbook aligned as new simulation and storage-fault evidence lands
-- keep `M4-T02` regression coverage green while broadening the fault matrix
+- `M4-T04`: keep the seeded schedule-exploration harness aligned while capturing new replayable
+  regression seeds for ingress, expiration, and retry interleavings
+- keep the simulation/testing docs aligned as new transcript assertions land
+- keep `M4-T02` and `M4-T03` regression coverage green while broadening schedule exploration
 
 ## How To Check Progress
 
