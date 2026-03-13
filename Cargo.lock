@@ -23,6 +23,7 @@ name = "allocdb-node"
 version = "0.1.0"
 dependencies = [
  "allocdb-core",
+ "libc",
  "log",
 ]
 
@@ -34,6 +35,12 @@ checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
 dependencies = [
  "rustc_version",
 ]
+
+[[package]]
+name = "libc"
+version = "0.2.183"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "log"

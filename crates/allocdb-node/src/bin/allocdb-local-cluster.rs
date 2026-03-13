@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 
 use allocdb_core::ids::Slot;
 use allocdb_node::local_cluster::{
-    ControlRequest, LocalClusterLayout, LocalClusterReplicaConfig, ReplicaRuntimeState,
-    ReplicaRuntimeStatus, encode_control_ack, encode_control_error, encode_role,
-    encode_status_response, layout_path, parse_control_request, request_control_status,
-    request_control_stop,
+    ControlRequest, LocalClusterFaultState, LocalClusterLayout, LocalClusterReplicaConfig,
+    LocalClusterTimelineEventKind, ReplicaRuntimeState, ReplicaRuntimeStatus,
+    append_local_cluster_timeline_event, encode_control_ack, encode_control_error, encode_role,
+    encode_status_response, fault_state_path, layout_path, load_local_cluster_timeline,
+    parse_control_request, request_control_status, request_control_stop, timeline_path,
 };
 use allocdb_node::replica::{
     ReplicaId, ReplicaIdentity, ReplicaNode, ReplicaNodeStatus, ReplicaRole,
@@ -31,6 +32,22 @@ enum ParsedCommand {
     },
     Status {
         workspace_root: PathBuf,
+    },
+    Crash {
+        workspace_root: PathBuf,
+        replica_id: ReplicaId,
+    },
+    Restart {
+        workspace_root: PathBuf,
+        replica_id: ReplicaId,
+    },
+    Isolate {
+        workspace_root: PathBuf,
+        replica_id: ReplicaId,
+    },
+    Heal {
+        workspace_root: PathBuf,
+        replica_id: ReplicaId,
     },
     ReplicaDaemon {
         layout_file: PathBuf,
@@ -57,6 +74,22 @@ fn run() -> Result<(), String> {
         ParsedCommand::Start { workspace_root } => start_cluster(&workspace_root),
         ParsedCommand::Stop { workspace_root } => stop_cluster(&workspace_root),
         ParsedCommand::Status { workspace_root } => status_cluster(&workspace_root),
+        ParsedCommand::Crash {
+            workspace_root,
+            replica_id,
+        } => crash_replica(&workspace_root, replica_id),
+        ParsedCommand::Restart {
+            workspace_root,
+            replica_id,
+        } => restart_replica(&workspace_root, replica_id),
+        ParsedCommand::Isolate {
+            workspace_root,
+            replica_id,
+        } => isolate_replica(&workspace_root, replica_id),
+        ParsedCommand::Heal {
+            workspace_root,
+            replica_id,
+        } => heal_replica(&workspace_root, replica_id),
         ParsedCommand::ReplicaDaemon {
             layout_file,
             replica_id,
@@ -81,6 +114,34 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ParsedCommand, S
         "status" => Ok(ParsedCommand::Status {
             workspace_root: parse_workspace_flag(args)?,
         }),
+        "crash" => {
+            let (workspace_root, replica_id) = parse_workspace_and_replica_flags(args)?;
+            Ok(ParsedCommand::Crash {
+                workspace_root,
+                replica_id,
+            })
+        }
+        "restart" => {
+            let (workspace_root, replica_id) = parse_workspace_and_replica_flags(args)?;
+            Ok(ParsedCommand::Restart {
+                workspace_root,
+                replica_id,
+            })
+        }
+        "isolate" => {
+            let (workspace_root, replica_id) = parse_workspace_and_replica_flags(args)?;
+            Ok(ParsedCommand::Isolate {
+                workspace_root,
+                replica_id,
+            })
+        }
+        "heal" => {
+            let (workspace_root, replica_id) = parse_workspace_and_replica_flags(args)?;
+            Ok(ParsedCommand::Heal {
+                workspace_root,
+                replica_id,
+            })
+        }
         "replica-daemon" => parse_replica_daemon_args(args),
         other => Err(format!("unknown subcommand `{other}`\n\n{}", usage())),
     }
@@ -101,6 +162,36 @@ fn parse_workspace_flag(args: impl IntoIterator<Item = String>) -> Result<PathBu
     }
 
     workspace_root.ok_or_else(usage)
+}
+
+fn parse_workspace_and_replica_flags(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(PathBuf, ReplicaId), String> {
+    let mut args = args.into_iter();
+    let mut workspace_root = None;
+    let mut replica_id = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--workspace" => {
+                let value = args.next().ok_or_else(usage)?;
+                workspace_root = Some(PathBuf::from(value));
+            }
+            "--replica-id" => {
+                let value = args.next().ok_or_else(usage)?;
+                let parsed = value.parse::<u64>().map_err(|_| {
+                    format!("invalid value for `--replica-id`: `{value}`\n\n{}", usage())
+                })?;
+                replica_id = Some(ReplicaId(parsed));
+            }
+            "--help" | "-h" => return Err(usage()),
+            other => return Err(format!("unknown argument `{other}`\n\n{}", usage())),
+        }
+    }
+
+    Ok((
+        workspace_root.ok_or_else(usage)?,
+        replica_id.ok_or_else(usage)?,
+    ))
 }
 
 fn parse_replica_daemon_args(
@@ -135,6 +226,8 @@ fn parse_replica_daemon_args(
 fn start_cluster(workspace_root: &Path) -> Result<(), String> {
     let layout = LocalClusterLayout::load_or_create(workspace_root)
         .map_err(|error| format!("failed to prepare local cluster layout: {error}"))?;
+    let fault_state = LocalClusterFaultState::load_or_create(&layout.workspace_root)
+        .map_err(|error| format!("failed to prepare local cluster fault state: {error}"))?;
     ensure_cluster_not_running(&layout)?;
     clear_stale_pid_files(&layout)?;
 
@@ -162,11 +255,19 @@ fn start_cluster(workspace_root: &Path) -> Result<(), String> {
         }
     }
 
+    append_local_cluster_timeline_event(
+        &layout.workspace_root,
+        LocalClusterTimelineEventKind::ClusterStart,
+        None,
+        Some("cluster_started"),
+    )
+    .map_err(|error| format!("failed to record cluster start: {error}"))?;
+
     println!("cluster started");
     println!("workspace={}", layout.workspace_root.display());
     println!("layout={}", layout.layout_path().display());
     for status in &statuses {
-        print_live_status(status);
+        print_live_status(status, fault_state.is_replica_isolated(status.replica_id));
     }
     Ok(())
 }
@@ -204,6 +305,13 @@ fn stop_cluster(workspace_root: &Path) -> Result<(), String> {
 
     wait_for_cluster_shutdown(&layout)?;
     if saw_running_replica {
+        append_local_cluster_timeline_event(
+            &layout.workspace_root,
+            LocalClusterTimelineEventKind::ClusterStop,
+            None,
+            Some("cluster_stopped"),
+        )
+        .map_err(|error| format!("failed to record cluster stop: {error}"))?;
         println!("cluster stopped");
     }
     Ok(())
@@ -211,26 +319,154 @@ fn stop_cluster(workspace_root: &Path) -> Result<(), String> {
 
 fn status_cluster(workspace_root: &Path) -> Result<(), String> {
     let layout = load_existing_layout(workspace_root)?;
+    let fault_state = LocalClusterFaultState::load_or_create(&layout.workspace_root)
+        .map_err(|error| format!("failed to load local cluster fault state: {error}"))?;
+    let timeline = load_local_cluster_timeline(&layout.workspace_root)
+        .map_err(|error| format!("failed to load local cluster timeline: {error}"))?;
     println!("workspace={}", layout.workspace_root.display());
     println!("layout={}", layout.layout_path().display());
+    println!(
+        "fault_state={}",
+        fault_state_path(&layout.workspace_root).display()
+    );
+    println!(
+        "timeline={}",
+        timeline_path(&layout.workspace_root).display()
+    );
+    println!("timeline_events={}", timeline.len());
     for replica in &layout.replicas {
         match request_control_status(replica.control_addr) {
-            Ok(status) => print_live_status(&status),
+            Ok(status) => {
+                print_live_status(&status, fault_state.is_replica_isolated(replica.replica_id));
+            }
             Err(_) if replica.pid_path.exists() => println!(
-                "replica={} state=unreachable control={} pid_path={} log={}",
+                "replica={} state=unreachable network={} control={} pid_path={} log={}",
                 replica.replica_id.get(),
+                if fault_state.is_replica_isolated(replica.replica_id) {
+                    "isolated"
+                } else {
+                    "healthy"
+                },
                 replica.control_addr,
                 replica.pid_path.display(),
                 replica.log_path.display()
             ),
             Err(_) => println!(
-                "replica={} state=stopped control={} log={}",
+                "replica={} state=stopped network={} control={} log={}",
                 replica.replica_id.get(),
+                if fault_state.is_replica_isolated(replica.replica_id) {
+                    "isolated"
+                } else {
+                    "healthy"
+                },
                 replica.control_addr,
                 replica.log_path.display()
             ),
         }
     }
+    Ok(())
+}
+
+fn crash_replica(workspace_root: &Path, replica_id: ReplicaId) -> Result<(), String> {
+    let layout = load_existing_layout(workspace_root)?;
+    let replica = replica_config(&layout, replica_id)?;
+    let process_id = resolve_live_replica_process_id(replica)?;
+    kill_process(process_id)?;
+    wait_for_process_exit(process_id)?;
+    remove_stale_pid_file(&replica.pid_path)?;
+    append_local_cluster_timeline_event(
+        &layout.workspace_root,
+        LocalClusterTimelineEventKind::ReplicaCrash,
+        Some(replica_id),
+        Some("signal=kill"),
+    )
+    .map_err(|error| format!("failed to record replica crash: {error}"))?;
+    println!(
+        "replica={} crashed pid={} control={}",
+        replica_id.get(),
+        process_id,
+        replica.control_addr
+    );
+    Ok(())
+}
+
+fn restart_replica(workspace_root: &Path, replica_id: ReplicaId) -> Result<(), String> {
+    let layout = load_existing_layout(workspace_root)?;
+    let replica = replica_config(&layout, replica_id)?;
+    ensure_replica_stopped(replica)?;
+    remove_stale_pid_file(&replica.pid_path)?;
+    let current_exe = std::env::current_exe()
+        .map_err(|error| format!("failed to locate current executable: {error}"))?;
+    let layout_file = layout.layout_path();
+    let mut child = spawn_replica_daemon(&current_exe, &layout_file, replica)?;
+    let status = wait_for_replica_ready(replica, &mut child)?;
+    append_local_cluster_timeline_event(
+        &layout.workspace_root,
+        LocalClusterTimelineEventKind::ReplicaRestart,
+        Some(replica_id),
+        Some("replica_ready"),
+    )
+    .map_err(|error| format!("failed to record replica restart: {error}"))?;
+    print_live_status(
+        &status,
+        LocalClusterFaultState::load_or_create(&layout.workspace_root)
+            .map_err(|error| format!("failed to load local cluster fault state: {error}"))?
+            .is_replica_isolated(replica_id),
+    );
+    Ok(())
+}
+
+fn isolate_replica(workspace_root: &Path, replica_id: ReplicaId) -> Result<(), String> {
+    let layout = load_existing_layout(workspace_root)?;
+    let replica = replica_config(&layout, replica_id)?;
+    let mut fault_state = LocalClusterFaultState::load_or_create(&layout.workspace_root)
+        .map_err(|error| format!("failed to load local cluster fault state: {error}"))?;
+    fault_state
+        .isolate_replica(replica_id)
+        .map_err(|error| format!("failed to isolate replica {}: {error}", replica_id.get()))?;
+    fault_state
+        .persist()
+        .map_err(|error| format!("failed to persist local cluster fault state: {error}"))?;
+    append_local_cluster_timeline_event(
+        &layout.workspace_root,
+        LocalClusterTimelineEventKind::ReplicaIsolate,
+        Some(replica_id),
+        Some("scope=client+protocol"),
+    )
+    .map_err(|error| format!("failed to record replica isolation: {error}"))?;
+    println!(
+        "replica={} network=isolated client={} protocol={}",
+        replica_id.get(),
+        replica.client_addr,
+        replica.protocol_addr
+    );
+    Ok(())
+}
+
+fn heal_replica(workspace_root: &Path, replica_id: ReplicaId) -> Result<(), String> {
+    let layout = load_existing_layout(workspace_root)?;
+    let replica = replica_config(&layout, replica_id)?;
+    let mut fault_state = LocalClusterFaultState::load_or_create(&layout.workspace_root)
+        .map_err(|error| format!("failed to load local cluster fault state: {error}"))?;
+    fault_state
+        .heal_replica(replica_id)
+        .map_err(|error| format!("failed to heal replica {}: {error}", replica_id.get()))?;
+    fault_state
+        .persist()
+        .map_err(|error| format!("failed to persist local cluster fault state: {error}"))?;
+    append_local_cluster_timeline_event(
+        &layout.workspace_root,
+        LocalClusterTimelineEventKind::ReplicaHeal,
+        Some(replica_id),
+        Some("scope=client+protocol"),
+    )
+    .map_err(|error| format!("failed to record replica heal: {error}"))?;
+    println!(
+        "replica={} network=healthy client={} protocol={}",
+        replica_id.get(),
+        replica.client_addr,
+        replica.protocol_addr
+    );
     Ok(())
 }
 
@@ -297,6 +533,7 @@ fn run_replica_daemon(layout_file: &Path, replica_id: ReplicaId) -> Result<(), S
 
     let loop_result = replica_event_loop(
         &mut node,
+        &layout.workspace_root,
         replica,
         &control_listener,
         &client_listener,
@@ -317,6 +554,7 @@ fn run_replica_daemon(layout_file: &Path, replica_id: ReplicaId) -> Result<(), S
 
 fn replica_event_loop(
     node: &mut ReplicaNode,
+    workspace_root: &Path,
     replica: &LocalClusterReplicaConfig,
     control_listener: &TcpListener,
     client_listener: &TcpListener,
@@ -332,12 +570,20 @@ fn replica_event_loop(
         }
         if let Some(stream) = accept_nonblocking(client_listener)? {
             handled_work = true;
-            let response = encode_control_error("client transport not implemented");
+            let response = if replica_isolated(workspace_root, replica.replica_id)? {
+                encode_control_error("network isolated by local harness")
+            } else {
+                encode_control_error("client transport not implemented")
+            };
             write_response(stream, &response)?;
         }
         if let Some(stream) = accept_nonblocking(protocol_listener)? {
             handled_work = true;
-            let response = encode_control_error("protocol transport not implemented");
+            let response = if replica_isolated(workspace_root, replica.replica_id)? {
+                encode_control_error("network isolated by local harness")
+            } else {
+                encode_control_error("protocol transport not implemented")
+            };
             write_response(stream, &response)?;
         }
         if !handled_work {
@@ -447,6 +693,25 @@ fn load_existing_layout(workspace_root: &Path) -> Result<LocalClusterLayout, Str
         .map_err(|error| format!("failed to load local cluster layout: {error}"))
 }
 
+fn replica_config(
+    layout: &LocalClusterLayout,
+    replica_id: ReplicaId,
+) -> Result<&LocalClusterReplicaConfig, String> {
+    layout.replica(replica_id).ok_or_else(|| {
+        format!(
+            "replica {} is not present in {}",
+            replica_id.get(),
+            layout.layout_path().display()
+        )
+    })
+}
+
+fn replica_isolated(workspace_root: &Path, replica_id: ReplicaId) -> Result<bool, String> {
+    LocalClusterFaultState::load_or_create(workspace_root)
+        .map(|state| state.is_replica_isolated(replica_id))
+        .map_err(|error| format!("failed to load local cluster fault state: {error}"))
+}
+
 fn ensure_cluster_not_running(layout: &LocalClusterLayout) -> Result<(), String> {
     for replica in &layout.replicas {
         if request_control_status(replica.control_addr).is_ok() {
@@ -472,6 +737,51 @@ fn clear_stale_pid_files(layout: &LocalClusterLayout) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn ensure_replica_stopped(replica: &LocalClusterReplicaConfig) -> Result<(), String> {
+    if let Ok(status) = request_control_status(replica.control_addr) {
+        return Err(format!(
+            "replica {} is already running on {} with pid {}",
+            replica.replica_id.get(),
+            replica.control_addr,
+            status.process_id
+        ));
+    }
+    if replica.pid_path.exists() {
+        let process_id = read_pid_file(&replica.pid_path)?;
+        if process_exists(process_id)? {
+            return Err(format!(
+                "replica {} still has a live pid {} at {}",
+                replica.replica_id.get(),
+                process_id,
+                replica.pid_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_live_replica_process_id(replica: &LocalClusterReplicaConfig) -> Result<u32, String> {
+    if let Ok(status) = request_control_status(replica.control_addr) {
+        return Ok(status.process_id);
+    }
+    if !replica.pid_path.exists() {
+        return Err(format!(
+            "replica {} is already stopped",
+            replica.replica_id.get()
+        ));
+    }
+    let process_id = read_pid_file(&replica.pid_path)?;
+    if process_exists(process_id)? {
+        Ok(process_id)
+    } else {
+        remove_stale_pid_file(&replica.pid_path)?;
+        Err(format!(
+            "replica {} is already stopped",
+            replica.replica_id.get()
+        ))
+    }
 }
 
 fn spawn_replica_daemon(
@@ -565,6 +875,95 @@ fn wait_for_cluster_shutdown(layout: &LocalClusterLayout) -> Result<(), String> 
     }
 }
 
+fn read_pid_file(path: &Path) -> Result<u32, String> {
+    let bytes = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read pid file {}: {error}", path.display()))?;
+    bytes.trim().parse::<u32>().map_err(|_| {
+        format!(
+            "invalid pid file {} contents `{}`",
+            path.display(),
+            bytes.trim()
+        )
+    })
+}
+
+fn remove_stale_pid_file(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to remove stale pid file {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn wait_for_process_exit(process_id: u32) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        if !process_exists(process_id)? {
+            return Ok(());
+        }
+        if started.elapsed() >= SHUTDOWN_TIMEOUT {
+            return Err(format!(
+                "process {process_id} did not exit within {SHUTDOWN_TIMEOUT:?}"
+            ));
+        }
+        thread::sleep(LISTENER_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn process_exists(process_id: u32) -> Result<bool, String> {
+    // The local fault harness runs as a separate operator process, so it needs one direct
+    // Unix PID probe instead of a `Child` handle.
+    let process_id = i32::try_from(process_id)
+        .map_err(|_| format!("process id {process_id} exceeds the local unix pid range"))?;
+    let result = unsafe { libc::kill(process_id, 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        _ => Err(format!("failed to inspect process {process_id}: {error}")),
+    }
+}
+
+#[cfg(not(unix))]
+fn process_exists(_process_id: u32) -> Result<bool, String> {
+    Err(String::from(
+        "process inspection is only supported for the local fault harness on unix hosts",
+    ))
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn kill_process(process_id: u32) -> Result<(), String> {
+    // Crash injection is intentionally abrupt here: the fault harness must be able to stop one
+    // replica without going through the replica control protocol.
+    let process_id = i32::try_from(process_id)
+        .map_err(|_| format!("process id {process_id} exceeds the local unix pid range"))?;
+    let result = unsafe { libc::kill(process_id, libc::SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to signal process {}: {}",
+            process_id,
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process(_process_id: u32) -> Result<(), String> {
+    Err(String::from(
+        "replica crash injection is only supported for the local fault harness on unix hosts",
+    ))
+}
+
 fn stop_spawned_children(layout: &LocalClusterLayout, children: &mut [(ReplicaId, Child)]) {
     for replica in &layout.replicas {
         let _ = request_control_stop(replica.control_addr);
@@ -612,13 +1011,18 @@ fn describe_node_status(status: ReplicaNodeStatus) -> &'static str {
     }
 }
 
-fn print_live_status(status: &ReplicaRuntimeStatus) {
+fn print_live_status(status: &ReplicaRuntimeStatus, network_isolated: bool) {
     println!(
-        "replica={} state={} pid={} role={} view={} control={} client={} protocol={}",
+        "replica={} state={} network={} pid={} role={} view={} control={} client={} protocol={}",
         status.replica_id.get(),
         match status.state {
             ReplicaRuntimeState::Active => "active",
             ReplicaRuntimeState::Faulted => "faulted",
+        },
+        if network_isolated {
+            "isolated"
+        } else {
+            "healthy"
         },
         status.process_id,
         encode_role(status.role),
@@ -679,12 +1083,16 @@ fn display_optional_startup_kind(
 
 fn usage() -> String {
     String::from(
-        "usage: cargo run -p allocdb-node --bin allocdb-local-cluster -- <start|stop|status> --workspace <path>\n\
+        "usage: cargo run -p allocdb-node --bin allocdb-local-cluster -- <start|stop|status|crash|restart|isolate|heal> ...\n\
          \n\
          commands:\n\
          \x20\x20start --workspace <path>\n\
          \x20\x20stop --workspace <path>\n\
-         \x20\x20status --workspace <path>\n",
+         \x20\x20status --workspace <path>\n\
+         \x20\x20crash --workspace <path> --replica-id <id>\n\
+         \x20\x20restart --workspace <path> --replica-id <id>\n\
+         \x20\x20isolate --workspace <path> --replica-id <id>\n\
+         \x20\x20heal --workspace <path> --replica-id <id>\n",
     )
 }
 

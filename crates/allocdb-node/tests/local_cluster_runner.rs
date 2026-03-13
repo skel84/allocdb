@@ -1,9 +1,14 @@
 use std::fs;
+use std::io::Read;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use allocdb_node::local_cluster::{LocalClusterLayout, request_control_status};
+use allocdb_node::local_cluster::{
+    LocalClusterFaultState, LocalClusterLayout, LocalClusterTimelineEventKind,
+    load_local_cluster_timeline, request_control_status,
+};
 use allocdb_node::{ReplicaId, ReplicaMetadataFile, ReplicaRole};
 
 fn temp_workspace(name: &str) -> PathBuf {
@@ -22,6 +27,16 @@ fn run_cluster_command(workspace_root: &Path, command: &str) -> Output {
     Command::new(cluster_binary())
         .args([command, "--workspace"])
         .arg(workspace_root)
+        .output()
+        .expect("cluster command should run")
+}
+
+fn run_cluster_command_with_args(workspace_root: &Path, command: &str, args: &[&str]) -> Output {
+    Command::new(cluster_binary())
+        .arg(command)
+        .args(["--workspace"])
+        .arg(workspace_root)
+        .args(args)
         .output()
         .expect("cluster command should run")
 }
@@ -51,6 +66,15 @@ impl Drop for ClusterGuard {
         let _ = run_cluster_command(&self.workspace_root, "stop");
         let _ = fs::remove_dir_all(&self.workspace_root);
     }
+}
+
+fn read_listener_response(addr: SocketAddr) -> String {
+    let mut stream = TcpStream::connect(addr).expect("listener should accept connection");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("listener response should be readable");
+    response
 }
 
 #[test]
@@ -115,4 +139,77 @@ fn local_cluster_runner_starts_stops_and_reuses_stable_layout() {
 
     let final_stop_output = run_cluster_command(&workspace_root, "stop");
     assert_success(&final_stop_output, "final cluster stop");
+}
+
+#[test]
+fn local_cluster_fault_harness_crashes_restarts_and_records_isolation() {
+    let workspace_root = temp_workspace("fault-harness");
+    let _guard = ClusterGuard::new(workspace_root.clone());
+
+    let start_output = run_cluster_command(&workspace_root, "start");
+    assert_success(&start_output, "initial cluster start");
+
+    let layout_path = allocdb_node::local_cluster::layout_path(&workspace_root);
+    let layout = LocalClusterLayout::load(&layout_path).unwrap();
+    let replica_one = layout.replica(ReplicaId(1)).unwrap();
+    let replica_two = layout.replica(ReplicaId(2)).unwrap();
+
+    let healthy_client_response = read_listener_response(replica_one.client_addr);
+    assert!(healthy_client_response.contains("client transport not implemented"));
+
+    let isolate_output =
+        run_cluster_command_with_args(&workspace_root, "isolate", &["--replica-id", "1"]);
+    assert_success(&isolate_output, "replica isolate");
+    let fault_state = LocalClusterFaultState::load_or_create(&workspace_root).unwrap();
+    assert!(fault_state.is_replica_isolated(ReplicaId(1)));
+    assert!(!fault_state.is_replica_isolated(ReplicaId(2)));
+    let isolated_client_response = read_listener_response(replica_one.client_addr);
+    assert!(isolated_client_response.contains("network isolated by local harness"));
+
+    let status_output = run_cluster_command(&workspace_root, "status");
+    assert_success(&status_output, "cluster status after isolate");
+    let rendered_status = String::from_utf8_lossy(&status_output.stdout);
+    assert!(rendered_status.contains("replica=1 state=active network=isolated"));
+
+    let heal_output =
+        run_cluster_command_with_args(&workspace_root, "heal", &["--replica-id", "1"]);
+    assert_success(&heal_output, "replica heal");
+    let healed_state = LocalClusterFaultState::load_or_create(&workspace_root).unwrap();
+    assert!(!healed_state.is_replica_isolated(ReplicaId(1)));
+    let healed_client_response = read_listener_response(replica_one.client_addr);
+    assert!(healed_client_response.contains("client transport not implemented"));
+
+    let crash_output =
+        run_cluster_command_with_args(&workspace_root, "crash", &["--replica-id", "1"]);
+    assert_success(&crash_output, "replica crash");
+    assert!(request_control_status(replica_one.control_addr).is_err());
+    assert!(request_control_status(replica_two.control_addr).is_ok());
+    assert!(!replica_one.pid_path.exists());
+
+    let restart_output =
+        run_cluster_command_with_args(&workspace_root, "restart", &["--replica-id", "1"]);
+    assert_success(&restart_output, "replica restart");
+    let restarted_status = request_control_status(replica_one.control_addr).unwrap();
+    assert_eq!(restarted_status.replica_id, ReplicaId(1));
+    assert_eq!(restarted_status.control_addr, replica_one.control_addr);
+    assert!(replica_one.pid_path.exists());
+
+    let stop_output = run_cluster_command(&workspace_root, "stop");
+    assert_success(&stop_output, "cluster stop");
+
+    let timeline = load_local_cluster_timeline(&workspace_root).unwrap();
+    let kinds = timeline.iter().map(|event| event.kind).collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            LocalClusterTimelineEventKind::ClusterStart,
+            LocalClusterTimelineEventKind::ReplicaIsolate,
+            LocalClusterTimelineEventKind::ReplicaHeal,
+            LocalClusterTimelineEventKind::ReplicaCrash,
+            LocalClusterTimelineEventKind::ReplicaRestart,
+            LocalClusterTimelineEventKind::ClusterStop,
+        ]
+    );
+    assert_eq!(timeline[1].replica_id, Some(ReplicaId(1)));
+    assert_eq!(timeline[3].replica_id, Some(ReplicaId(1)));
 }
