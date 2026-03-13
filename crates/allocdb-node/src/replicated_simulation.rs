@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use allocdb_core::config::Config;
 use allocdb_core::ids::{Lsn, Slot};
-use log::{debug, warn};
+use log::{debug, info, warn};
 
 use crate::engine::EngineConfig;
 use crate::replica::{
@@ -425,14 +425,22 @@ impl ReplicatedSimulationHarness {
         replica_id: ReplicaId,
     ) -> Result<ReplicatedScheduleObservationKind, ReplicatedSimulationError> {
         let before = self.replica_observation(replica_id)?;
-        {
-            let replica = self.replica_entry_mut(replica_id)?;
-            if replica.node.is_none() {
-                return Err(ReplicatedSimulationError::ReplicaAlreadyCrashed(replica_id));
-            }
-            drop(replica.node.take());
+        if before.runtime_status == ReplicaRuntimeStatus::Crashed {
+            info!(
+                "ReplicaCrashRejected: replica_id={} runtime_status={:?} role={:?} current_view={:?} commit_lsn={:?} active_snapshot_lsn={:?}",
+                before.replica_id.get(),
+                before.runtime_status,
+                before.role,
+                before.current_view,
+                before.commit_lsn,
+                before.active_snapshot_lsn
+            );
+            return Err(ReplicatedSimulationError::ReplicaAlreadyCrashed(replica_id));
         }
+        log_replica_lifecycle_event("ReplicaCrashStarting", &before);
+        drop(self.replica_entry_mut(replica_id)?.node.take());
         let after = self.replica_observation(replica_id)?;
+        log_replica_lifecycle_event("ReplicaCrashed", &after);
         Ok(ReplicatedScheduleObservationKind::ReplicaCrashed { before, after })
     }
 
@@ -446,14 +454,37 @@ impl ReplicatedSimulationHarness {
         let (identity, paths) = {
             let replica = self.replica_entry_mut(replica_id)?;
             if replica.node.is_some() {
+                info!(
+                    "ReplicaRestartRejected: replica_id={} runtime_status={:?} role={:?} current_view={:?} commit_lsn={:?} active_snapshot_lsn={:?}",
+                    before.replica_id.get(),
+                    before.runtime_status,
+                    before.role,
+                    before.current_view,
+                    before.commit_lsn,
+                    before.active_snapshot_lsn
+                );
                 return Err(ReplicatedSimulationError::ReplicaAlreadyRunning(replica_id));
             }
             (replica.identity, replica.paths.clone())
         };
+        info!(
+            "ReplicaRecoveryStarting: replica_id={} shard_id={} metadata_path={} snapshot_path={} wal_path={} runtime_status={:?} role={:?} current_view={:?} commit_lsn={:?} active_snapshot_lsn={:?}",
+            identity.replica_id.get(),
+            identity.shard_id,
+            paths.metadata_path.display(),
+            paths.snapshot_path.display(),
+            paths.wal_path.display(),
+            before.runtime_status,
+            before.role,
+            before.current_view,
+            before.commit_lsn,
+            before.active_snapshot_lsn
+        );
         let recovered = ReplicaNode::recover(core_config, engine_config, identity, paths)
             .map_err(ReplicatedSimulationError::RecoverReplica)?;
         self.replica_entry_mut(replica_id)?.node = Some(recovered);
         let after = self.replica_observation(replica_id)?;
+        log_replica_lifecycle_event("ReplicaRestarted", &after);
         Ok(ReplicatedScheduleObservationKind::ReplicaRestarted { before, after })
     }
 
@@ -628,6 +659,18 @@ fn log_protocol_message_event(
         message.to.get(),
         pending_messages,
         next_message_id
+    );
+}
+
+fn log_replica_lifecycle_event(event: &str, observation: &ReplicaObservation) {
+    info!(
+        "{event}: replica_id={} runtime_status={:?} role={:?} current_view={:?} commit_lsn={:?} active_snapshot_lsn={:?}",
+        observation.replica_id.get(),
+        observation.runtime_status,
+        observation.role,
+        observation.current_view,
+        observation.commit_lsn,
+        observation.active_snapshot_lsn
     );
 }
 
