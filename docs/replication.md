@@ -150,9 +150,10 @@ alongside the replica workspace. The current persisted fields are:
 - optional durable vote record `(view, voted_for)`
 
 Replica startup validates identity, vote/view ordering, commit-versus-snapshot consistency, and
-the local applied/snapshot state against this metadata before a replica can join. Decode failure,
-metadata inconsistency, unreadable or permission-denied sidecars, or an explicitly persisted
-`faulted` role leaves the replica in `faulted` state until repaired.
+that the local applied LSN plus snapshot anchor exactly match this metadata before a replica can
+join. Decode failure, metadata inconsistency, unreadable or permission-denied sidecars, applied
+state that is ahead of or behind the persisted `commit_lsn`, or an explicitly persisted `faulted`
+role leaves the replica in `faulted` state until repaired.
 
 ## Replicated Log Contents
 

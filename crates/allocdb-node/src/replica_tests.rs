@@ -519,6 +519,67 @@ fn replica_recover_faults_when_local_apply_exceeds_commit_lsn() {
 }
 
 #[test]
+fn replica_open_faults_when_commit_lsn_is_ahead_of_local_state() {
+    let paths = ReplicaPaths::new(
+        metadata_path("commit-ahead-of-open-state"),
+        snapshot_path("commit-ahead-of-open-state"),
+        wal_path("commit-ahead-of-open-state"),
+    );
+    let mut metadata = base_metadata();
+    metadata.commit_lsn = Some(Lsn(1));
+    ReplicaMetadataFile::new(&paths.metadata_path)
+        .write_metadata(&metadata)
+        .unwrap();
+
+    let node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+
+    assert_faulted(
+        &node,
+        ReplicaFaultReason::Validation(ReplicaStartupValidationError::AppliedLsnBehindCommitLsn {
+            last_applied_lsn: None,
+            commit_lsn: Lsn(1),
+        }),
+    );
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_recover_faults_when_local_apply_lags_commit_lsn() {
+    let paths = ReplicaPaths::new(
+        metadata_path("commit-ahead-of-recover-state"),
+        snapshot_path("commit-ahead-of-recover-state"),
+        wal_path("commit-ahead-of-recover-state"),
+    );
+    let mut engine =
+        SingleNodeEngine::open(core_config(), engine_config(), &paths.wal_path).unwrap();
+    engine.submit(Slot(1), create(11, 1)).unwrap();
+    drop(engine);
+
+    let mut metadata = base_metadata();
+    metadata.current_view = 2;
+    metadata.commit_lsn = Some(Lsn(2));
+    metadata.last_normal_view = Some(2);
+    ReplicaMetadataFile::new(&paths.metadata_path)
+        .write_metadata(&metadata)
+        .unwrap();
+
+    let node =
+        ReplicaNode::recover(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+
+    assert_faulted(
+        &node,
+        ReplicaFaultReason::Validation(ReplicaStartupValidationError::AppliedLsnBehindCommitLsn {
+            last_applied_lsn: Some(Lsn(1)),
+            commit_lsn: Lsn(2),
+        }),
+    );
+
+    cleanup(&paths);
+}
+
+#[test]
 fn replica_metadata_file_rejects_oversized_sidecar() {
     let path = metadata_path("oversized");
     let file = ReplicaMetadataFile::new(&path);

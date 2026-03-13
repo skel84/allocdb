@@ -8,9 +8,13 @@ use log::{error, info, warn};
 
 use crate::engine::{EngineConfig, EngineOpenError, RecoverEngineError, SingleNodeEngine};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "replica_tests.rs"]
 mod tests;
+
+#[cfg(all(test, not(unix)))]
+#[path = "non_unix_tests.rs"]
+mod non_unix_tests;
 
 const MAX_REPLICA_METADATA_BYTES: u64 = 256;
 const REPLICA_METADATA_MAGIC: [u8; 4] = *b"RPLM";
@@ -151,21 +155,36 @@ impl ReplicaMetadata {
             }
         }
 
-        let committed = self.commit_lsn.map_or(0, Lsn::get);
-        if let Some(last_applied_lsn) = local_last_applied_lsn {
-            if last_applied_lsn.get() > committed {
-                return Err(ReplicaStartupValidationError::AppliedLsnExceedsCommitLsn {
-                    last_applied_lsn,
-                    commit_lsn: self.commit_lsn,
-                });
-            }
-        }
-
         if self.active_snapshot_lsn != local_active_snapshot_lsn {
             return Err(ReplicaStartupValidationError::ActiveSnapshotMismatch {
                 metadata_snapshot_lsn: self.active_snapshot_lsn,
                 local_snapshot_lsn: local_active_snapshot_lsn,
             });
+        }
+
+        match (self.commit_lsn, local_last_applied_lsn) {
+            (None, None) => {}
+            (None, Some(last_applied_lsn)) => {
+                return Err(ReplicaStartupValidationError::AppliedLsnExceedsCommitLsn {
+                    last_applied_lsn,
+                    commit_lsn: None,
+                });
+            }
+            (Some(commit_lsn), Some(last_applied_lsn)) if last_applied_lsn == commit_lsn => {}
+            (Some(commit_lsn), Some(last_applied_lsn))
+                if last_applied_lsn.get() > commit_lsn.get() =>
+            {
+                return Err(ReplicaStartupValidationError::AppliedLsnExceedsCommitLsn {
+                    last_applied_lsn,
+                    commit_lsn: Some(commit_lsn),
+                });
+            }
+            (Some(commit_lsn), last_applied_lsn) => {
+                return Err(ReplicaStartupValidationError::AppliedLsnBehindCommitLsn {
+                    last_applied_lsn,
+                    commit_lsn,
+                });
+            }
         }
 
         Ok(())
@@ -255,6 +274,10 @@ pub enum ReplicaStartupValidationError {
     AppliedLsnExceedsCommitLsn {
         last_applied_lsn: Lsn,
         commit_lsn: Option<Lsn>,
+    },
+    AppliedLsnBehindCommitLsn {
+        last_applied_lsn: Option<Lsn>,
+        commit_lsn: Lsn,
     },
     ActiveSnapshotMismatch {
         metadata_snapshot_lsn: Option<Lsn>,
