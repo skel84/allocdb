@@ -184,11 +184,15 @@ pub(crate) enum ReplicatedSimulationError {
         lsn: Lsn,
     },
     ReplicaFaulted(ReplicaId),
-    MissingReplicaMetadata(ReplicaId),
     RejoinPrimary(ReplicaId),
     ReplicaWalNotClean {
         replica_id: ReplicaId,
         stop_reason: ScanStopReason,
+    },
+    ReplicaViewAheadOfPrimary {
+        replica_id: ReplicaId,
+        highest_known_view: u64,
+        primary_view: u64,
     },
     ReplicaCommitAheadOfPrimary {
         replica_id: ReplicaId,
@@ -300,11 +304,6 @@ impl ReplicatedSimulationError {
             Self::ReplicaFaulted(replica_id) => {
                 write!(formatter, "replica {} is faulted", replica_id.get())
             }
-            Self::MissingReplicaMetadata(replica_id) => write!(
-                formatter,
-                "replica {} is missing durable metadata",
-                replica_id.get()
-            ),
             Self::RejoinPrimary(replica_id) => {
                 write!(
                     formatter,
@@ -319,6 +318,17 @@ impl ReplicatedSimulationError {
                 formatter,
                 "replica {} WAL is not clean enough for rejoin: {stop_reason:?}",
                 replica_id.get()
+            ),
+            Self::ReplicaViewAheadOfPrimary {
+                replica_id,
+                highest_known_view,
+                primary_view,
+            } => write!(
+                formatter,
+                "replica {} knows higher view {} than primary view {} during rejoin",
+                replica_id.get(),
+                highest_known_view,
+                primary_view
             ),
             Self::ReplicaCommitAheadOfPrimary {
                 replica_id,
@@ -1470,8 +1480,13 @@ impl ReplicatedSimulationHarness {
 
         let source = self.capture_primary_catch_up_state(primary)?;
         let target_metadata = self.load_replica_metadata(replica_id)?;
-        if target_metadata.role == ReplicaRole::Faulted {
-            return Err(ReplicatedSimulationError::ReplicaFaulted(replica_id));
+        let highest_known_view = metadata_highest_known_view(target_metadata);
+        if highest_known_view > source.current_view {
+            return Err(ReplicatedSimulationError::ReplicaViewAheadOfPrimary {
+                replica_id,
+                highest_known_view,
+                primary_view: source.current_view,
+            });
         }
         if target_metadata.commit_lsn.is_some_and(|commit_lsn| {
             source
@@ -1605,14 +1620,14 @@ impl ReplicatedSimulationHarness {
         &self,
         replica_id: ReplicaId,
     ) -> Result<ReplicaMetadata, ReplicatedSimulationError> {
-        let replica = self.replica_entry(replica_id)?;
-        match replica.node.as_ref() {
-            Some(node) => Ok(*node.metadata()),
-            None => ReplicaMetadataFile::new(&replica.paths.metadata_path)
-                .load_metadata()?
-                .ok_or(ReplicatedSimulationError::MissingReplicaMetadata(
-                    replica_id,
-                )),
+        match self.replica(replica_id)? {
+            Some(node)
+                if node.status() == ReplicaNodeStatus::Active
+                    && node.metadata().role != ReplicaRole::Faulted =>
+            {
+                Ok(*node.metadata())
+            }
+            Some(_) | None => Err(ReplicatedSimulationError::ReplicaFaulted(replica_id)),
         }
     }
 
@@ -1790,6 +1805,12 @@ fn copy_snapshot(
     )?;
     SnapshotFile::new(target_path).write_snapshot(&snapshot)?;
     Ok(())
+}
+
+fn metadata_highest_known_view(metadata: ReplicaMetadata) -> u64 {
+    metadata.durable_vote.map_or(metadata.current_view, |vote| {
+        metadata.current_view.max(vote.view)
+    })
 }
 
 fn remove_if_exists(path: &Path) {

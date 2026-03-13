@@ -1036,4 +1036,55 @@ fn faulted_replica_rejoin_is_rejected() {
             ),
         })
     );
+
+    harness.crash_replica(replica(3)).unwrap();
+    let crashed_error = harness.rejoin_replica(replica(3), replica(1)).unwrap_err();
+    assert!(matches!(
+        crashed_error,
+        ReplicatedSimulationError::ReplicaFaulted(replica_id) if replica_id == replica(3)
+    ));
+}
+
+#[test]
+fn rejoin_rejects_replica_that_knows_a_higher_view_than_the_primary() {
+    let mut harness = primary_harness("replicated-rejoin-higher-view", 0x5a8);
+
+    harness
+        .replica_entry_mut(replica(3))
+        .unwrap()
+        .node
+        .as_mut()
+        .unwrap()
+        .record_durable_vote(3, replica(2))
+        .unwrap();
+    harness
+        .replica_entry_mut(replica(3))
+        .unwrap()
+        .node
+        .as_mut()
+        .unwrap()
+        .enter_view_uncertain()
+        .unwrap();
+
+    let error = harness.rejoin_replica(replica(3), replica(1)).unwrap_err();
+    assert!(matches!(
+        error,
+        ReplicatedSimulationError::ReplicaViewAheadOfPrimary {
+            replica_id,
+            highest_known_view: 3,
+            primary_view: 1,
+        } if replica_id == replica(3)
+    ));
+    assert_eq!(
+        harness
+            .replica(replica(3))
+            .unwrap()
+            .unwrap()
+            .metadata()
+            .durable_vote,
+        Some(crate::replica::DurableVote {
+            view: 3,
+            voted_for: replica(2),
+        })
+    );
 }

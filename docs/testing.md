@@ -282,6 +282,7 @@ Key checks:
 
 - rejoined replicas recover the committed prefix already accepted by the healthy quorum
 - committed history is never rewritten during catch-up
+- rejoin never regresses one replica's durable view knowledge behind the current primary
 - corrupted replicas fail closed until repaired
 
 ### Required Invariants In Simulation
@@ -324,6 +325,8 @@ Current executable replicated coverage already proves:
   committed durable prefix
 - a primary checkpoint can force snapshot transfer for older replicas whose local durable state
   falls behind the retained WAL floor
+- rejoin now fails closed if the target has already observed a higher durable view than the current
+  primary
 - rejoin discards one divergent uncommitted suffix and rejects one replica forced into `faulted`
   state by corrupted durable metadata
 

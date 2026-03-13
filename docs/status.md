@@ -48,7 +48,8 @@
     checkpoint-aware stale-replica rejoin that chooses suffix-only catch-up when the target still
     holds a recent enough committed durable prefix, falls back to snapshot transfer when the
     primary has already pruned older history, discards divergent uncommitted prepared suffix
-    during rejoin, and rejects faulted replicas instead of auto-repairing them
+    during rejoin, rejects faulted replicas instead of auto-repairing them, and fails closed if a
+    target already knows a higher durable view than the current primary
 
 ## What Exists
 

@@ -287,6 +287,9 @@ Protocol-aware recovery rule:
   snapshot plus its retained WAL suffix instead of assuming the missing prefix still exists locally
 - rejoin clears any prepared-but-uncommitted suffix before the replica returns to backup mode, and
   it also drops stale protocol messages that still reference the rejoined replica's old state
+- rejoin must not move one replica backward in durable view knowledge; a target that has already
+  observed or voted in a higher view than the current primary stays out of service until a
+  compatible higher-view recovery path is available
 - a replica already in `faulted` state is not auto-repaired by rejoin; it stays out of service
   until an operator repairs or replaces it
 - recovery must preserve the same committed prefix seen by healthy replicas
