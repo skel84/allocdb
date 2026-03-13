@@ -1059,6 +1059,223 @@ Test evidence:
 
 - design review only
 
+## M7: Replicated Core Prototype
+
+### M7-T01: Add replicated node state and durable protocol metadata
+
+Goal:
+
+- build the replica wrapper state and durable protocol metadata required by the first replicated
+  prototype
+
+Blocked by:
+
+- M6-T03
+
+Acceptance criteria:
+
+- replicated node startup has explicit durable protocol metadata
+- local validation and faulted-state entry are defined in code and tests
+- no simulator-only replica execution path is introduced
+- docs stay aligned if the persisted metadata contract changes
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M7-T02: Build deterministic 3-replica cluster harness
+
+Goal:
+
+- build the deterministic in-process cluster harness for the replicated prototype
+
+Blocked by:
+
+- M7-T01
+
+Acceptance criteria:
+
+- the harness runs three real replicas without mock state-machine semantics
+- message delivery, partitioning, crash, and restart are explicit driver actions
+- the same seed and starting state reproduce the same transcript
+- docs and harness APIs stay aligned with [testing.md](./testing.md)
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M7-T03: Implement quorum write path with one configured primary
+
+Goal:
+
+- implement the first majority-backed write path with one configured primary and primary-only reads
+
+Blocked by:
+
+- M7-T01
+- M7-T02
+
+Acceptance criteria:
+
+- committed write results are published only after majority durable append
+- backups do not apply entries before they are committed
+- the existing allocator executor remains the only apply path
+- tests cover normal quorum write and primary-only read behavior
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M7-T04: Add view change and fail-closed reads on quorum loss
+
+Goal:
+
+- implement higher-view takeover plus fail-closed read behavior under quorum ambiguity
+
+Blocked by:
+
+- M7-T03
+
+Acceptance criteria:
+
+- a quorum-lost primary fails closed for reads and writes
+- a new primary reconstructs the latest safe committed prefix before normal mode
+- committed entries survive failover unchanged
+- tests cover primary loss, higher-view takeover, and stale-node read rejection
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M7-T05: Add suffix catch-up, snapshot transfer, and rejoin
+
+Goal:
+
+- implement stale-replica catch-up and safe rejoin
+
+Blocked by:
+
+- M7-T04
+
+Acceptance criteria:
+
+- stale replicas can rejoin without rewriting committed history
+- divergent uncommitted suffix is discarded safely during catch-up
+- corrupted replicas do not vote, lead, or serve before repair
+- tests cover suffix-only catch-up, snapshot transfer, and faulted rejoin rejection
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M7-T06: Promote replicated simulation scenarios into executable tests
+
+Goal:
+
+- turn the replicated simulation plan into executable regression coverage
+
+Blocked by:
+
+- M7-T05
+
+Acceptance criteria:
+
+- partition, primary-crash, and rejoin scenarios execute in the real replicated harness
+- the same seed and starting state reproduce the same replicated transcript
+- promoted tests check the invariants documented in [testing.md](./testing.md)
+- failing schedules can be replayed directly from recorded transcript data
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+## M8: External Cluster Validation
+
+### M8-T01: Build multi-process local replicated cluster runner
+
+Goal:
+
+- build the first multi-process local cluster runner for replicated AllocDB
+
+Blocked by:
+
+- M7-T05
+
+Acceptance criteria:
+
+- a local operator can start and stop a three-replica cluster from one command surface
+- node identities and durable workspaces remain stable across restart
+- logs and control hooks are sufficient for follow-on fault injection
+- docs stay aligned with the local cluster runner usage
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M8-T02: Add local fault-control harness for process and network disruption
+
+Goal:
+
+- add a local fault-control harness for process crash, restart, and network isolation
+
+Blocked by:
+
+- M8-T01
+
+Acceptance criteria:
+
+- process and network disruption are controllable through one local harness
+- the harness can isolate stale primaries and later heal the cluster
+- cluster timelines are recorded well enough for later checker and debug use
+- follow-on validation work can reuse the same fault-control surface
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M8-T03: Build local QEMU replicated testbed
+
+Goal:
+
+- build the local QEMU-backed replicated cluster testbed
+
+Blocked by:
+
+- M8-T02
+
+Acceptance criteria:
+
+- the QEMU environment boots a three-replica cluster plus one control node locally
+- control hooks can isolate networks, reboot guests, and collect logs
+- the environment is repeatable enough for scripted validation runs
+- docs describe how the QEMU testbed maps to the first Jepsen gate
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M8-T04: Implement Jepsen harness against QEMU-backed cluster
+
+Goal:
+
+- implement the Jepsen harness and release-blocking validation runs against the QEMU-backed cluster
+
+Blocked by:
+
+- M7-T06
+- M8-T03
+
+Acceptance criteria:
+
+- the Jepsen harness runs the documented workload families against the QEMU-backed cluster
+- ambiguous outcomes are retried and interpreted with stable `operation_id` semantics
+- the documented release blockers are enforced automatically by the analysis step
+- the external validation docs stay aligned with the implemented harness
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
 ## Suggested First Slice
 
 If implementation starts immediately, the highest-value first slice is:
