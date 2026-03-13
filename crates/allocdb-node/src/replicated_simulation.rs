@@ -756,9 +756,10 @@ impl ReplicatedSimulationHarness {
         new_primary: ReplicaId,
         new_view: u64,
     ) -> Result<(), ReplicatedSimulationError> {
+        let old_primary = self.configured_primary;
         self.fail_primary_closed_if_quorum_lost()?;
         let voters = self.require_view_change_quorum(new_primary)?;
-        let target_commit_lsn = self.view_change_target_commit_lsn(&voters)?;
+        let target_commit_lsn = self.view_change_target_commit_lsn(&voters, old_primary)?;
         self.record_view_change_votes(&voters, new_primary, new_view)?;
         self.reconstruct_view_change_prefix(new_primary, &voters, target_commit_lsn)?;
         self.install_view_change_roles(&voters, new_primary, new_view)?;
@@ -1314,6 +1315,7 @@ impl ReplicatedSimulationHarness {
     fn view_change_target_commit_lsn(
         &self,
         voters: &[ReplicaId],
+        old_primary: Option<ReplicaId>,
     ) -> Result<Option<Lsn>, ReplicatedSimulationError> {
         let mut target_commit_lsn = None;
         for replica_id in voters {
@@ -1321,10 +1323,15 @@ impl ReplicatedSimulationHarness {
                 continue;
             };
             target_commit_lsn = target_commit_lsn.max(node.metadata().commit_lsn);
-            // The harness keeps a fixed three-replica majority. If one reachable voter still holds
-            // a prepared suffix, the crashed primary held the same entry locally when it queued
-            // that prepare, which is enough to recover a majority-appended prefix during failover.
-            target_commit_lsn = target_commit_lsn.max(node.highest_prepared_lsn());
+            // In the fixed three-replica harness, only a backup-held prepared suffix proves that a
+            // second voter durably appended the entry before failover. The old primary's local
+            // prepared suffix alone is not enough to promote an uncommitted entry.
+            let backup_prepared_lsn = if old_primary == Some(*replica_id) {
+                None
+            } else {
+                node.highest_prepared_lsn()
+            };
+            target_commit_lsn = target_commit_lsn.max(backup_prepared_lsn);
         }
         Ok(target_commit_lsn)
     }

@@ -946,6 +946,70 @@ fn higher_view_takeover_reconstructs_prefix_and_rejects_stale_primary_reads() {
 }
 
 #[test]
+fn higher_view_takeover_does_not_promote_primary_only_prepared_suffix() {
+    let mut harness = primary_harness("replicated-view-change-primary-only-prepared", 0x5a3f);
+    let payload = create_payload(400, 59);
+
+    let entry = harness
+        .client_submit(replica(1), Slot(1), &payload, "primary-only")
+        .unwrap();
+
+    assert_eq!(harness.configured_primary(), Some(replica(1)));
+    assert_eq!(replica_commit_lsn(&harness, 1), None);
+    assert_eq!(replica_commit_lsn(&harness, 2), None);
+    assert_eq!(replica_commit_lsn(&harness, 3), None);
+    assert!(
+        harness
+            .replica(replica(1))
+            .unwrap()
+            .unwrap()
+            .prepared_entry(entry.lsn)
+            .is_some()
+    );
+    assert!(
+        harness
+            .replica(replica(2))
+            .unwrap()
+            .unwrap()
+            .prepared_entry(entry.lsn)
+            .is_none()
+    );
+    assert!(
+        harness
+            .replica(replica(3))
+            .unwrap()
+            .unwrap()
+            .prepared_entry(entry.lsn)
+            .is_none()
+    );
+
+    harness.complete_view_change(replica(2), 2).unwrap();
+
+    assert_eq!(harness.configured_primary(), Some(replica(2)));
+    assert_eq!(replica_commit_lsn(&harness, 2), None);
+    assert_eq!(replica_last_applied_lsn(&harness, 2), None);
+    assert_eq!(replica_prepared_len(&harness, 1), 0);
+    assert_eq!(replica_prepared_len(&harness, 2), 0);
+    assert_eq!(replica_prepared_len(&harness, 3), 0);
+    assert!(!replica_has_resource(&harness, 1, 400));
+    assert!(!replica_has_resource(&harness, 2, 400));
+    assert!(!replica_has_resource(&harness, 3, 400));
+    assert!(pending_labels(&harness).is_empty());
+
+    let retry = harness
+        .client_submit_or_retry(replica(2), Slot(2), &payload, "primary-only-retry")
+        .unwrap();
+    let retry_entry = match retry {
+        ReplicatedClientRequestOutcome::Prepared(entry) => entry,
+        other @ ReplicatedClientRequestOutcome::Published(_) => {
+            panic!("expected a fresh prepare after view change, got {other:?}")
+        }
+    };
+    assert_eq!(retry_entry.view, 2);
+    assert_eq!(retry_entry.lsn, Lsn(1));
+}
+
+#[test]
 fn higher_view_takeover_recovers_missing_prepared_suffix_from_another_voter() {
     let mut harness = primary_harness("replicated-view-change-copy-prepared", 0x5a40);
 
