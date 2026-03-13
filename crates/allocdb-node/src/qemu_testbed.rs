@@ -471,7 +471,7 @@ impl QemuTestbedLayout {
                 .expect("writing to a string cannot fail");
             writeln!(
                 status_commands,
-                "  {GUEST_LOCAL_CLUSTER_BIN_PATH} control-status --addr {control_addr}"
+                "  {GUEST_LOCAL_CLUSTER_BIN_PATH} control-status --addr {control_addr} || true"
             )
             .expect("writing to a string cannot fail");
         }
@@ -916,6 +916,7 @@ mod tests {
         assert!(user_data.contains(GUEST_QEMU_CONTROL_SCRIPT_PATH));
         assert!(user_data.contains("collect_logs()"));
         assert!(user_data.contains("collect-logs"));
+        assert!(user_data.contains("control-status --addr 172.31.0.11:17000 || true"));
         assert!(user_data.contains("cHJpdmF0ZS1rZXk="));
     }
 

@@ -557,9 +557,21 @@ pub fn append_local_cluster_timeline_event(
 pub fn request_control_status(
     addr: SocketAddr,
 ) -> Result<ReplicaRuntimeStatus, ControlProtocolError> {
+    request_control_status_with(addr, send_control_request, std::thread::sleep)
+}
+
+fn request_control_status_with<F, S>(
+    addr: SocketAddr,
+    mut send_request: F,
+    mut sleep: S,
+) -> Result<ReplicaRuntimeStatus, ControlProtocolError>
+where
+    F: FnMut(SocketAddr, ControlRequest) -> Result<String, ControlProtocolError>,
+    S: FnMut(Duration),
+{
     let mut last_error = None;
     for attempt in 0..CONTROL_STATUS_MAX_ATTEMPTS {
-        match send_control_request(addr, ControlRequest::Status)
+        match send_request(addr, ControlRequest::Status)
             .and_then(|response| decode_status_response(&response))
         {
             Ok(status) => return Ok(status),
@@ -568,7 +580,7 @@ pub fn request_control_status(
                     && attempt + 1 < CONTROL_STATUS_MAX_ATTEMPTS =>
             {
                 last_error = Some(error);
-                std::thread::sleep(CONTROL_STATUS_RETRY_DELAY);
+                sleep(CONTROL_STATUS_RETRY_DELAY);
             }
             Err(error) => return Err(error),
         }
@@ -1441,6 +1453,7 @@ impl From<LocalClusterLayoutError> for ControlProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
 
     fn fixture_layout() -> LocalClusterLayout {
         LocalClusterLayout {
@@ -1498,17 +1511,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn layout_round_trips_through_text_encoding() {
-        let layout = fixture_layout();
-        let encoded = encode_layout(&layout);
-        let decoded = decode_layout(&encoded).unwrap();
-        assert_eq!(decoded, layout);
-    }
-
-    #[test]
-    fn status_response_round_trips_through_text_encoding() {
-        let status = ReplicaRuntimeStatus {
+    fn fixture_status() -> ReplicaRuntimeStatus {
+        ReplicaRuntimeStatus {
             process_id: 42,
             replica_id: ReplicaId(1),
             state: ReplicaRuntimeState::Active,
@@ -1534,7 +1538,20 @@ mod tests {
             control_addr: "127.0.0.1:18001".parse().unwrap(),
             client_addr: "127.0.0.1:19001".parse().unwrap(),
             protocol_addr: "127.0.0.1:20001".parse().unwrap(),
-        };
+        }
+    }
+
+    #[test]
+    fn layout_round_trips_through_text_encoding() {
+        let layout = fixture_layout();
+        let encoded = encode_layout(&layout);
+        let decoded = decode_layout(&encoded).unwrap();
+        assert_eq!(decoded, layout);
+    }
+
+    #[test]
+    fn status_response_round_trips_through_text_encoding() {
+        let status = fixture_status();
 
         let encoded = encode_status_response(&status);
         let decoded = decode_status_response(&encoded).unwrap();
@@ -1585,5 +1602,64 @@ mod tests {
         assert!(
             matches!(error, ControlProtocolError::Remote(message) if message.contains("restart"))
         );
+    }
+
+    #[test]
+    fn request_control_status_retries_transient_decode_error_then_succeeds() {
+        let addr = fixture_status().control_addr;
+        let status = fixture_status();
+        let encoded = encode_status_response(&status);
+        let attempts = Cell::new(0_usize);
+        let delays = RefCell::new(Vec::new());
+
+        let result = request_control_status_with(
+            addr,
+            |request_addr, request| {
+                assert_eq!(request_addr, addr);
+                assert_eq!(request, ControlRequest::Status);
+                let attempt = attempts.get();
+                attempts.set(attempt.saturating_add(1));
+                if attempt == 0 {
+                    Ok(String::from("status=ok\nprocess_id=42\n"))
+                } else {
+                    Ok(encoded.clone())
+                }
+            },
+            |delay| delays.borrow_mut().push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(result, status);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(delays.borrow().as_slice(), &[CONTROL_STATUS_RETRY_DELAY]);
+        assert!(attempts.get() < CONTROL_STATUS_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn request_control_status_returns_non_transient_error_without_retry() {
+        let addr = fixture_status().control_addr;
+        let attempts = Cell::new(0_usize);
+        let delays = RefCell::new(Vec::new());
+
+        let error = request_control_status_with(
+            addr,
+            |request_addr, request| {
+                assert_eq!(request_addr, addr);
+                assert_eq!(request, ControlRequest::Status);
+                attempts.set(attempts.get().saturating_add(1));
+                Err(ControlProtocolError::Remote(String::from(
+                    "replica refused status",
+                )))
+            },
+            |delay| delays.borrow_mut().push(delay),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlProtocolError::Remote(message) if message == "replica refused status"
+        ));
+        assert_eq!(attempts.get(), 1);
+        assert!(delays.borrow().is_empty());
     }
 }

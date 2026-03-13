@@ -259,9 +259,9 @@ fn prepare_testbed(
 
 fn start_testbed(workspace_root: &Path) -> Result<(), String> {
     let layout = load_existing_layout(workspace_root)?;
-    prepare_runtime_assets(&layout)?;
     ensure_testbed_not_running(&layout)?;
     clear_stale_pid_files(&layout)?;
+    prepare_runtime_assets(&layout)?;
 
     for guest in std::iter::once(&layout.control_guest).chain(layout.replica_guests.iter()) {
         spawn_guest(&layout, guest)?;
@@ -442,24 +442,43 @@ fn ensure_base_image(layout: &QemuTestbedLayout) -> Result<(), String> {
     })?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("failed to create base image directory: {error}"))?;
+    let temp_path = base_image_download_path(&layout.config.base_image_path);
+    let _ = fs::remove_file(&temp_path);
     let status = Command::new("curl")
         .args([
             "-L",
             "--fail",
             "--output",
-            &layout.config.base_image_path.display().to_string(),
+            &temp_path.display().to_string(),
             &layout.config.base_image_url,
         ])
         .status()
-        .map_err(|error| format!("failed to start curl: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
+        .map_err(|error| {
+            let _ = fs::remove_file(&temp_path);
+            format!("failed to start curl: {error}")
+        })?;
+    if !status.success() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
             "curl failed while downloading base image from {}",
             layout.config.base_image_url
-        ))
+        ));
     }
+    fs::rename(&temp_path, &layout.config.base_image_path).map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
+        format!(
+            "failed to move downloaded base image into place at {}: {error}",
+            layout.config.base_image_path.display()
+        )
+    })
+}
+
+fn base_image_download_path(base_image_path: &Path) -> PathBuf {
+    let file_name = base_image_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("base-image");
+    base_image_path.with_file_name(format!("{file_name}.download-{}", std::process::id()))
 }
 
 fn ensure_local_cluster_binary(layout: &QemuTestbedLayout) -> Result<(), String> {

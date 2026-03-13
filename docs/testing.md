@@ -401,11 +401,20 @@ The focused validation commands are:
 
 The host-side prerequisites for that command are:
 
-- `hdiutil` on macOS, or `mkisofs` / `genisoimage` on Linux-class hosts, for NoCloud seed image
-  creation
-- QEMU firmware templates reachable either through the default search paths or `QEMU_SHARE_DIR`
-- the default accelerator is `hvf` on macOS and `kvm` on Linux, with `QEMU_ACCEL` available as an
-  explicit override
+- `QEMU_SHARE_DIR` can point at a non-default QEMU firmware directory when the host does not keep
+  firmware templates under the standard search paths
+- `QEMU_ACCEL` can override the accelerator embedded into the rendered QEMU command; the default is
+  `hvf` on macOS and `kvm` on Linux
+- `prepare` hard-fails unless the host has the arch-specific `qemu-system-*` binary, `qemu-img`,
+  `ssh`, and `ssh-keygen` on `PATH`
+- `prepare` uses `hdiutil` on macOS and `mkisofs` or `genisoimage` on Linux-class hosts when it
+  builds NoCloud seed images, and it hard-fails if the platform-appropriate ISO builder is absent
+- `prepare` hard-fails unless the configured `allocdb-local-cluster` binary already exists on the
+  host
+- if `--base-image-path` does not already exist, `prepare` hard-fails unless `curl` is on `PATH`
+  and the base-image download succeeds
+- `prepare` hard-fails if the QEMU firmware templates are not reachable either through the default
+  search paths or `QEMU_SHARE_DIR`
 
 What this testbed proves today:
 
