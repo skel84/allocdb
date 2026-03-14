@@ -437,15 +437,21 @@ What it still does not claim:
 
 ## Jepsen Harness Slice
 
-`M8-T04` now adds the first host-side Jepsen harness tooling around that QEMU surface:
+`M8-T04` now adds the first host-side Jepsen harness tooling around that external replicated
+surface:
 
 - `cargo test -p allocdb-node jepsen -- --nocapture`
 - `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- analyze --history-file <history.txt>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- capture-kubevirt-layout --workspace <path> --kubeconfig <path> --namespace <name> --ssh-private-key <path>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-qemu-surface --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-kubevirt-surface --workspace <path>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- run-qemu --workspace <path> --run-id <run-id> --output-root <artifacts>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- run-kubevirt --workspace <path> --run-id <run-id> --output-root <artifacts>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- watch-kubevirt --workspace <path> --output-root <artifacts> [--run-id <run-id>]`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-qemu --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-kubevirt --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
 
 What this harness slice proves today:
 
@@ -455,27 +461,42 @@ What this harness slice proves today:
 - the analyzer automatically blocks on the current release-blocking outcomes the repo already
   documents: duplicate committed execution, double allocation, stale successful reads,
   early expiration release, unresolved ambiguity, and writes that are missing `operation_id`
-- one archive command can bundle the analyzed history with one fetched QEMU log archive and one
-  manifest rooted on the host
+- one archive command can bundle the analyzed history with one fetched external-cluster log archive
+  and one manifest rooted on the host
 - one surface-probe command can issue one real `get_metrics` request to every replica, then drive
   one real `create_resource` submit plus one fenced `get_resource` read through the configured
-  primary against the QEMU cluster
-- one `run-qemu` command can execute the full documented release-gate matrix against the live QEMU
-  cluster and persist one analyzed history plus one artifact bundle for each run
+  primary against either the QEMU or KubeVirt cluster
+- one `capture-kubevirt-layout` command can persist the live control/replica VM IPs, helper-pod
+  settings, SSH key path, and per-replica network addresses needed to drive the Jepsen matrix
+  against a running KubeVirt deployment
+- one per-run request namespace now keeps client IDs and request slots distinct across separate
+  `allocdb-jepsen` invocations, so operators can execute multiple Jepsen runs against one
+  persistent external cluster without tripping monotonic-slot invariants from earlier runs
+- one `run-qemu` and one `run-kubevirt` command can execute the full documented release-gate
+  matrix against the live external cluster and persist one analyzed history plus one artifact
+  bundle for each run
+- one `watch-kubevirt` terminal command can follow the currently active or named KubeVirt run by
+  reading one per-run status file, one per-run event log, and live replica control/metrics state
+  while the run is in progress
 - those runs now exercise one real hot-resource contention sequence, one real stable
   `operation_id` retry-cache replay, one real primary-versus-backup read-role check, one real
   replicated `tick_expirations` path through the external runtime, and one host-side
   crash/partition/mixed-failover cutover path built from replica workspace export/import plus the
   existing `ReplicaNode::recover(...)` logic on staged copies
+- the KubeVirt path now has live proof for one captured layout, one successful
+  `verify-kubevirt-surface` run, and one successful `reservation_contention-control`
+  `run-kubevirt` history plus artifact bundle against the real `allocdb-{control,replica-*}` VMs
 
 What it still does not claim:
 
-- the first QEMU Jepsen executor still drives one scripted gate scenario at a time, not one
+- the first Jepsen executor still drives one scripted gate scenario at a time, not one
   free-running `30`-minute nemesis soak with independent background clients
 - partition control still uses the existing whole-replica client/protocol isolation surface, not
   arbitrary packet loss or per-link delay injection
-- the release gate still depends on operators running the full QEMU matrix end to end; the unit
-  and integration suite only proves the harness and orchestration code paths
+- the release gate still depends on operators running the full external-cluster matrix end to end;
+  the unit and integration suite only proves the harness and orchestration code paths
+- the faulted KubeVirt runs still need one sustained `30`-minute execution loop before the full
+  release-gate matrix can honestly pass its documented minimum fault-window requirement
 
 ## Jepsen Validation Gate
 

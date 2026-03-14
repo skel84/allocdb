@@ -114,8 +114,9 @@
   - retry-aware history interpretation and release-blocking invariants for duplicate execution,
     stale successful reads, double allocation, and early reuse
 - Host-side Jepsen harness slice:
-  - one release-gate matrix planner, one retry-aware history codec/analyzer, one host-side artifact bundler for duplicate-execution, double-allocation, stale-read, early-expiration, unresolved-ambiguity, and fetched QEMU-log checks, plus one explicit `verify-qemu-surface` probe that exercises one real QEMU metrics round trip on every replica and one real primary submit/read round trip through the live replicated protocol surface
-  - one real `run-qemu` executor for the full documented release-gate matrix, with persisted histories and artifact bundles for control, crash-restart, partition-heal, and mixed-failover runs, plus host-side failover/rejoin orchestration built from QEMU replica workspace export/import and staged `ReplicaNode::recover(...)` rewrites
+  - one release-gate matrix planner, one retry-aware history codec/analyzer, one host-side artifact bundler for duplicate-execution, double-allocation, stale-read, early-expiration, unresolved-ambiguity, and fetched external-cluster log checks, plus explicit `verify-qemu-surface` and `verify-kubevirt-surface` probes that exercise one real metrics round trip on every replica and one real primary submit/read round trip through the live replicated protocol surface
+  - one real `run-qemu` and one real `run-kubevirt` executor for the full documented release-gate matrix, with persisted histories and artifact bundles for control, crash-restart, partition-heal, and mixed-failover runs, plus host-side failover/rejoin orchestration built from replica workspace export/import and staged `ReplicaNode::recover(...)` rewrites
+  - one `capture-kubevirt-layout` helper that records the live KubeVirt VM IPs, namespace, helper-pod settings, and SSH key path needed to drive the matrix from the host
 - Replicated node scaffolding:
   - dedicated replica metadata file with temp-write, rename, and directory-sync durability
   - persisted replica identity, role, view, commit point, snapshot anchor, last-normal view, and
@@ -202,8 +203,9 @@
   - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
 ## Current Focus
-- `M8-T04` now has one real external Jepsen executor for the documented release-gate matrix: the live runtime surface covers replicated `submit`, strict reads, and `tick_expirations`, while `allocdb-jepsen run-qemu` can drive control, crash-restart, partition-heal, and mixed-failover runs with archived histories and host-side failover/rejoin cutovers
-- the next honest step is operational, not architectural: run the full QEMU matrix end to end, capture artifacts, and decide whether the roadmap should open a post-M8 hardening milestone or declare the current queue complete
+- `M8-T04` now has one real external Jepsen executor for the documented release-gate matrix across both QEMU and KubeVirt: the live runtime surface covers replicated `submit`, strict reads, and `tick_expirations`, while `allocdb-jepsen` can now capture one KubeVirt layout, verify the KubeVirt surface, execute real KubeVirt control runs with archived histories and host-side failover/rejoin cutovers, and expose one terminal watcher for live phase/replica progress during the run
+- Jepsen run isolation is now stronger on persistent clusters: each `allocdb-jepsen` invocation uses one distinct client/slot namespace instead of reusing the same request identity across separate runs
+- the next honest step is still operational, not architectural: start `watch-kubevirt` in one terminal, run the full KubeVirt matrix in another, capture artifacts for every run, and then decide whether the roadmap should open a post-M8 hardening milestone or declare the current queue complete
 ## How To Check Progress
 - implementation status: [work-breakdown.md](./work-breakdown.md)
 - milestone sequencing: [roadmap.md](./roadmap.md)

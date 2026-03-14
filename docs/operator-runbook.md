@@ -121,9 +121,13 @@ Command surface:
 - `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- control --workspace <path> -- <status|isolate|heal|crash|restart|reboot|export-replica|import-replica|collect-logs> ...`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- analyze --history-file <history.txt>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- capture-kubevirt-layout --workspace <path> --kubeconfig <path> --namespace <name> --ssh-private-key <path>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-qemu-surface --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-kubevirt-surface --workspace <path>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- run-qemu --workspace <path> --run-id <run-id> --output-root <artifacts>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- run-kubevirt --workspace <path> --run-id <run-id> --output-root <artifacts>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-qemu --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-kubevirt --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
 
 What `prepare` does:
 
@@ -192,10 +196,22 @@ Current limits:
   downloadable on the host
 - `verify-qemu-surface` proves one metrics probe on every replica, one protocol reachability probe
   on every replica, and one primary submit/read round trip
+- `capture-kubevirt-layout` depends on one reachable kubeconfig plus one staged SSH key from the
+  KubeVirt bootstrap path, and `verify-kubevirt-surface` and `run-kubevirt` auto-create one
+  temporary helper pod when needed to bridge host orchestration into the KubeVirt guest network
 - `run-qemu` now executes the documented Jepsen control and nemesis runs, but it still drives one
   scripted gate scenario at a time rather than one long-running soak with independent clients
+- `run-kubevirt` currently uses the same scripted gate model and the same control-node
+  `allocdb-qemu-control` surface as the QEMU path; it does not yet add one separate KubeVirt
+  packet-level nemesis layer
+- `run-kubevirt` now writes one `<run-id>-status.txt` file, one `<run-id>-events.log` file, and
+  one `allocdb-jepsen-latest-status.txt` pointer file under the chosen artifact root
+- `watch-kubevirt --workspace <path> --output-root <artifacts> [--run-id <run-id>]` can stay open
+  in another terminal and show the current phase, elapsed time, recent Jepsen events, and live
+  replica health/metrics while the run is active
 - failover and rejoin now use host-side staged workspace rewrites, so the operator still needs one
-  prepared QEMU testbed and enough local disk for fetched/pushed replica archives during those runs
+  prepared external cluster and enough local disk for fetched/pushed replica archives during those
+  runs
 
 ## Single-Node Engine
 
