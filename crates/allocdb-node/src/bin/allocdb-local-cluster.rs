@@ -30,6 +30,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const REPLICA_RPC_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_STREAM_BYTES: usize = 1 << 20;
 const PROTOCOL_REQUEST_PREPARE: u8 = 1;
 const PROTOCOL_REQUEST_COMMIT: u8 = 2;
 const PROTOCOL_RESPONSE_PREPARE_ACK: u8 = 1;
@@ -706,7 +707,10 @@ fn handle_client_stream(
         );
     }
 
-    let request_bytes = read_stream_bytes(&mut stream, "client request")?;
+    let request_bytes = match read_stream_bytes(&mut stream, "client request") {
+        Ok(bytes) => bytes,
+        Err(error) => return write_response(stream, &encode_control_error(&error)),
+    };
     if request_bytes.is_empty() {
         return write_response(stream, &encode_control_error("invalid client request"));
     }
@@ -748,7 +752,10 @@ fn handle_protocol_stream(
         );
     }
 
-    let request_bytes = read_stream_bytes(&mut stream, "protocol request")?;
+    let request_bytes = match read_stream_bytes(&mut stream, "protocol request") {
+        Ok(bytes) => bytes,
+        Err(error) => return write_response(stream, &encode_control_error(&error)),
+    };
     if request_bytes.is_empty() {
         return write_response(stream, &encode_control_error("invalid protocol request"));
     }
@@ -824,7 +831,7 @@ fn handle_replicated_submit(
         ));
     }
 
-    if let Some(result) = lookup_retry_result(node, request.request_slot, &request.payload)? {
+    if let Some(result) = lookup_retry_result(node, request.request_slot, &request.payload) {
         return Ok(encode_response(&ApiResponse::Submit(
             SubmitResponse::Committed(result.into()),
         )));
@@ -963,9 +970,7 @@ fn collect_prepare_quorum(
             payload: entry.payload.clone(),
         };
         match send_protocol_request(peer.protocol_addr, &request) {
-            Ok(ReplicaProtocolResponse::PrepareAck { view, lsn, .. })
-                if view == entry.view && lsn == entry.lsn.get() =>
-            {
+            Ok(response) if is_expected_prepare_ack(&response, peer.replica_id, entry) => {
                 acked_replicas += 1;
             }
             Ok(other) => log_prepare_ack_rejected(replica, peer, entry, &other),
@@ -1169,17 +1174,15 @@ fn lookup_retry_result(
     node: &ReplicaNode,
     request_slot: Slot,
     payload: &[u8],
-) -> Result<Option<allocdb_node::SubmissionResult>, String> {
-    let request = decode_client_request(payload)
-        .map_err(|error| format!("invalid client request payload: {error:?}"))?;
-    let Some(record) = node
+) -> Option<allocdb_node::SubmissionResult> {
+    let Ok(request) = decode_client_request(payload) else {
+        return None;
+    };
+    let record = node
         .engine()
         .expect("active primary must keep one live engine")
         .db()
-        .operation(request.operation_id, request_slot)
-    else {
-        return Ok(None);
-    };
+        .operation(request.operation_id, request_slot)?;
 
     let outcome = if record.command_fingerprint == request.command.fingerprint() {
         CommandOutcome {
@@ -1190,11 +1193,11 @@ fn lookup_retry_result(
     } else {
         CommandOutcome::new(ResultCode::OperationConflict)
     };
-    Ok(Some(allocdb_node::SubmissionResult {
+    Some(allocdb_node::SubmissionResult {
         applied_lsn: record.applied_lsn,
         outcome,
         from_retry_cache: true,
-    }))
+    })
 }
 
 fn majority_quorum(layout: &LocalClusterLayout) -> usize {
@@ -1205,11 +1208,37 @@ fn protocol_error_message(error: &allocdb_node::ReplicaProtocolError) -> String 
     format!("replica protocol error: {error:?}")
 }
 
+fn is_expected_prepare_ack(
+    response: &ReplicaProtocolResponse,
+    expected_replica_id: ReplicaId,
+    entry: &allocdb_node::ReplicaPreparedEntry,
+) -> bool {
+    matches!(
+        response,
+        ReplicaProtocolResponse::PrepareAck {
+            view,
+            lsn,
+            replica_id,
+        } if *view == entry.view
+            && *lsn == entry.lsn.get()
+            && *replica_id == expected_replica_id
+    )
+}
+
 fn read_stream_bytes(stream: &mut TcpStream, kind: &str) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
     stream
+        .set_read_timeout(Some(REPLICA_RPC_TIMEOUT))
+        .map_err(|error| format!("failed to set {kind} read timeout: {error}"))?;
+    let mut bytes = Vec::new();
+    let max_stream_bytes =
+        u64::try_from(MAX_STREAM_BYTES).expect("max stream bytes should fit in u64");
+    stream
+        .take(max_stream_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("failed to read {kind}: {error}"))?;
+    if bytes.len() > MAX_STREAM_BYTES {
+        return Err(format!("{kind} exceeds max size {MAX_STREAM_BYTES} bytes"));
+    }
     Ok(bytes)
 }
 
@@ -1911,5 +1940,75 @@ impl Drop for PidFileGuard {
                 eprintln!("failed to remove pid file {}: {error}", self.path.display());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Shutdown, TcpListener, TcpStream};
+
+    fn test_prepared_entry(lsn: u64) -> allocdb_node::ReplicaPreparedEntry {
+        allocdb_node::ReplicaPreparedEntry {
+            kind: ReplicaPreparedKind::Client,
+            view: 7,
+            lsn: Lsn(lsn),
+            request_slot: Slot(11),
+            payload: vec![0xAA],
+        }
+    }
+
+    #[test]
+    fn prepare_ack_requires_expected_replica_identity() {
+        let entry = test_prepared_entry(9);
+        let matching = ReplicaProtocolResponse::PrepareAck {
+            view: 7,
+            lsn: 9,
+            replica_id: ReplicaId(2),
+        };
+        let wrong_replica = ReplicaProtocolResponse::PrepareAck {
+            view: 7,
+            lsn: 9,
+            replica_id: ReplicaId(3),
+        };
+        let wrong_lsn = ReplicaProtocolResponse::PrepareAck {
+            view: 7,
+            lsn: 10,
+            replica_id: ReplicaId(2),
+        };
+
+        assert!(is_expected_prepare_ack(&matching, ReplicaId(2), &entry));
+        assert!(!is_expected_prepare_ack(
+            &wrong_replica,
+            ReplicaId(2),
+            &entry
+        ));
+        assert!(!is_expected_prepare_ack(&wrong_lsn, ReplicaId(2), &entry));
+        assert!(!is_expected_prepare_ack(
+            &ReplicaProtocolResponse::CommitAck {
+                view: 7,
+                commit_lsn: 9,
+                replica_id: ReplicaId(2),
+            },
+            ReplicaId(2),
+            &entry,
+        ));
+    }
+
+    #[test]
+    fn read_stream_bytes_rejects_oversized_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.write_all(&vec![0xAB; MAX_STREAM_BYTES + 1]).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+        });
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let error = read_stream_bytes(&mut stream, "test request").unwrap_err();
+        assert!(error.contains("exceeds max size"));
+
+        writer.join().unwrap();
     }
 }

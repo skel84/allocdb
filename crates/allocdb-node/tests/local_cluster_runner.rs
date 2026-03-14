@@ -58,13 +58,16 @@ fn run_cluster_command_with_args(workspace_root: &Path, command: &str, args: &[&
 }
 
 fn start_cluster_with_retry(workspace_root: &Path) -> Output {
+    let workspace_existed = workspace_root.exists();
     let first = run_cluster_command(workspace_root, "start");
     if first.status.success() {
         return first;
     }
 
     let _ = run_cluster_command(workspace_root, "stop");
-    let _ = fs::remove_dir_all(workspace_root);
+    if !workspace_existed {
+        let _ = fs::remove_dir_all(workspace_root);
+    }
     run_cluster_command(workspace_root, "start")
 }
 
@@ -396,6 +399,43 @@ fn local_cluster_client_transport_commits_reads_and_retries() {
     );
     let backup_read = String::from_utf8_lossy(&backup_read);
     assert!(backup_read.contains("not primary"));
+}
+
+#[test]
+fn local_cluster_submit_malformed_payload_returns_invalid_request_response() {
+    let _serial_guard = local_cluster_test_guard();
+    let workspace_root = temp_workspace("malformed-submit");
+    let _guard = ClusterGuard::new(workspace_root.clone());
+
+    let start_output = start_cluster_with_retry(&workspace_root);
+    assert_success(&start_output, "initial cluster start");
+
+    let layout_path = allocdb_node::local_cluster::layout_path(&workspace_root);
+    let layout = LocalClusterLayout::load(&layout_path).unwrap();
+    let primary = layout.replica(ReplicaId(1)).unwrap();
+
+    let response = send_api_request(
+        primary.client_addr,
+        &ApiRequest::Submit(SubmitRequest {
+            request_slot: Slot(1),
+            payload: vec![0xFF],
+        }),
+    );
+    match response {
+        ApiResponse::Submit(SubmitResponse::Rejected(response)) => {
+            assert_eq!(
+                response.category,
+                allocdb_node::SubmissionErrorCategory::DefiniteFailure
+            );
+            assert_eq!(
+                response.code,
+                allocdb_node::SubmissionFailureCode::InvalidRequest(
+                    allocdb_node::InvalidRequestReason::BufferTooShort,
+                )
+            );
+        }
+        other => panic!("expected invalid-request rejection, got {other:?}"),
+    }
 }
 
 #[test]

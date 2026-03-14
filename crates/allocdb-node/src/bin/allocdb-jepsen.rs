@@ -259,6 +259,28 @@ fn verify_qemu_surface(workspace_root: &Path) -> Result<(), String> {
                 guest.replica_id.map_or(0, allocdb_node::ReplicaId::get)
             ));
         }
+
+        let protocol_addr = guest.protocol_addr().ok_or_else(|| {
+            format!(
+                "replica guest {} is missing one cluster protocol address",
+                guest.name
+            )
+        })?;
+        let protocol_response = run_remote_tcp_request(
+            &layout,
+            &protocol_addr.ip().to_string(),
+            protocol_addr.port(),
+            &[],
+        )?;
+        let protocol_text = String::from_utf8_lossy(&protocol_response);
+        if protocol_text.contains("protocol transport not implemented")
+            || protocol_text.contains("network isolated by local harness")
+        {
+            return Err(format!(
+                "QEMU protocol surface is not ready for Jepsen: replica {} returned `{protocol_text}`",
+                guest.replica_id.map_or(0, allocdb_node::ReplicaId::get)
+            ));
+        }
     }
 
     let primary = primary_replica(&layout)?;
@@ -2492,9 +2514,10 @@ fn run_remote_tcp_request(
     request_bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
     let request_hex = encode_hex(request_bytes);
-    let script = "python3 - <<'PY'\nimport socket, sys\nhost = sys.argv[1]\nport = int(sys.argv[2])\npayload = bytes.fromhex(sys.argv[3])\nwith socket.create_connection((host, port), timeout=2) as stream:\n    if payload:\n        stream.sendall(payload)\n    stream.shutdown(socket.SHUT_WR)\n    chunks = []\n    while True:\n        chunk = stream.recv(4096)\n        if not chunk:\n            break\n        chunks.append(chunk)\n    sys.stdout.buffer.write(b''.join(chunks))\nPY";
     let mut args = ssh_args(layout);
-    args.push(format!("{script} {host} {port} {request_hex}"));
+    args.push(format!(
+        "python3 - {host} {port} {request_hex} <<'PY'\nimport socket, sys\nhost = sys.argv[1]\nport = int(sys.argv[2])\npayload = bytes.fromhex(sys.argv[3])\nwith socket.create_connection((host, port), timeout=2) as stream:\n    if payload:\n        stream.sendall(payload)\n    stream.shutdown(socket.SHUT_WR)\n    chunks = []\n    while True:\n        chunk = stream.recv(4096)\n        if not chunk:\n            break\n        chunks.append(chunk)\n    sys.stdout.buffer.write(b''.join(chunks))\nPY"
+    ));
     let output = Command::new("ssh")
         .args(args)
         .output()

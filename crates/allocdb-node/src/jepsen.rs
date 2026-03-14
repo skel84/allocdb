@@ -581,7 +581,7 @@ pub struct JepsenAnalysisReport {
 
 impl JepsenAnalysisReport {
     #[must_use]
-    pub const fn release_gate_passed(&self) -> bool {
+    pub fn release_gate_passed(&self) -> bool {
         self.blockers.is_empty()
     }
 }
@@ -983,23 +983,26 @@ fn decode_write_result(
     fields: &BTreeMap<String, String>,
     operation: &JepsenOperation,
 ) -> Result<JepsenWriteResult, JepsenCodecError> {
-    let resource_id = operation
-        .resource_id
-        .ok_or_else(|| JepsenCodecError::MissingField(String::from("resource_id")))?;
     match required_field(fields, "write_result")? {
         "reserved" => Ok(JepsenWriteResult::Reserved {
-            resource_id,
+            resource_id: operation
+                .resource_id
+                .ok_or_else(|| JepsenCodecError::MissingField(String::from("resource_id")))?,
             holder_id: parse_required_u128(fields, "committed_holder_id")?,
             reservation_id: parse_required_u128(fields, "committed_reservation_id")?,
             expires_at_slot: parse_required_slot(fields, "expires_at_slot")?,
         }),
         "confirmed" => Ok(JepsenWriteResult::Confirmed {
-            resource_id,
+            resource_id: operation
+                .resource_id
+                .ok_or_else(|| JepsenCodecError::MissingField(String::from("resource_id")))?,
             holder_id: parse_required_u128(fields, "committed_holder_id")?,
             reservation_id: parse_required_u128(fields, "committed_reservation_id")?,
         }),
         "released" => Ok(JepsenWriteResult::Released {
-            resource_id,
+            resource_id: operation
+                .resource_id
+                .ok_or_else(|| JepsenCodecError::MissingField(String::from("resource_id")))?,
             holder_id: parse_required_u128(fields, "committed_holder_id")?,
             reservation_id: parse_required_u128(fields, "committed_reservation_id")?,
             released_lsn: optional_lsn_field(fields, "released_lsn")?,
@@ -1141,6 +1144,7 @@ fn optional_lsn_field(
         .get(field)
         .map(|value| parse_optional_lsn(field, value))
         .transpose()
+        .map(Option::flatten)
 }
 
 fn optional_slot_field(
@@ -1171,10 +1175,15 @@ fn optional_resource_id_field(
         .transpose()
 }
 
-fn parse_optional_lsn(field: &str, value: &str) -> Result<Lsn, JepsenCodecError> {
+fn parse_optional_lsn(field: &str, value: &str) -> Result<Option<Lsn>, JepsenCodecError> {
+    if value == "none" {
+        return Ok(None);
+    }
+
     value
         .parse::<u64>()
         .map(Lsn)
+        .map(Some)
         .map_err(|_| JepsenCodecError::InvalidField {
             field: String::from(field),
             value: String::from(value),

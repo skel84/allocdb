@@ -358,8 +358,8 @@ What this smoke test proves today:
 
 What it does not claim yet:
 
-- there is still no replicated client transport on the external process boundary
-- there is still no replicated request routing on the external process boundary
+- it does not prove external failover, rejoin, or stale-primary rejection yet
+- it does not prove background expiration or checkpoint workers inside the replica daemons
 - Jepsen and QEMU-backed validation remain follow-on gates after the local process surface is in
   place
 
@@ -600,8 +600,8 @@ Rules:
 
 The Jepsen analysis should include at least:
 
-- a linearizability checker over successful writes and successful reads once the VM-backed runtime
-  exposes the real replicated client surface
+- a linearizability checker over successful writes and successful reads captured from the
+  QEMU-backed runtime histories
 - an `operation_id` uniqueness checker that rejects duplicate committed execution
 - a resource-safety checker that rejects double allocation
 - a strict-read fence checker for successful `required_lsn` reads

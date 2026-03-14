@@ -283,6 +283,93 @@ fn replica_prepare_and_commit_keep_apply_gated_by_commit() {
 }
 
 #[test]
+fn replica_first_uncommitted_prepared_entry_is_none_when_empty() {
+    let paths = ReplicaPaths::new(
+        metadata_path("first-prepared-empty"),
+        snapshot_path("first-prepared-empty"),
+        wal_path("first-prepared-empty"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Backup).unwrap();
+
+    assert_eq!(node.first_uncommitted_prepared_entry(), None);
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_first_uncommitted_prepared_entry_returns_lowest_lsn() {
+    let paths = ReplicaPaths::new(
+        metadata_path("first-prepared-lowest"),
+        snapshot_path("first-prepared-lowest"),
+        wal_path("first-prepared-lowest"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Backup).unwrap();
+
+    let first_entry = ReplicaPreparedEntry {
+        kind: crate::replica::ReplicaPreparedKind::Client,
+        view: 1,
+        lsn: Lsn(1),
+        request_slot: Slot(1),
+        payload: encode_client_request(create(11, 1)),
+    };
+    let second_entry = ReplicaPreparedEntry {
+        kind: crate::replica::ReplicaPreparedKind::Client,
+        view: 1,
+        lsn: Lsn(2),
+        request_slot: Slot(2),
+        payload: encode_client_request(create(12, 2)),
+    };
+    node.append_prepared_entry(first_entry.clone()).unwrap();
+    node.append_prepared_entry(second_entry).unwrap();
+
+    assert_eq!(node.first_uncommitted_prepared_entry(), Some(first_entry));
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_first_uncommitted_prepared_entry_is_stable_after_mutation() {
+    let paths = ReplicaPaths::new(
+        metadata_path("first-prepared-stable"),
+        snapshot_path("first-prepared-stable"),
+        wal_path("first-prepared-stable"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Backup).unwrap();
+
+    let first_entry = ReplicaPreparedEntry {
+        kind: crate::replica::ReplicaPreparedKind::Client,
+        view: 1,
+        lsn: Lsn(1),
+        request_slot: Slot(3),
+        payload: encode_client_request(create(21, 3)),
+    };
+    node.append_prepared_entry(first_entry.clone()).unwrap();
+
+    let returned = node.first_uncommitted_prepared_entry().unwrap();
+
+    node.append_prepared_entry(ReplicaPreparedEntry {
+        kind: crate::replica::ReplicaPreparedKind::Client,
+        view: 1,
+        lsn: Lsn(2),
+        request_slot: Slot(4),
+        payload: encode_client_request(create(22, 4)),
+    })
+    .unwrap();
+    assert_eq!(returned, first_entry);
+
+    node.discard_uncommitted_suffix().unwrap();
+    assert_eq!(returned, first_entry);
+
+    cleanup(&paths);
+}
+
+#[test]
 fn replica_recover_restores_prepared_suffix_from_prepare_log() {
     let paths = ReplicaPaths::new(
         metadata_path("recover-prepare-log"),

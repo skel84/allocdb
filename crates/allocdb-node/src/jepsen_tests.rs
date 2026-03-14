@@ -278,6 +278,64 @@ fn analysis_flags_early_expiration_release() {
 }
 
 #[test]
+fn history_codec_round_trips_none_lsn_and_tick_expired_without_resource_id() {
+    let history = vec![
+        JepsenHistoryEvent {
+            sequence: 1,
+            process: String::from("reader"),
+            time_millis: 1,
+            operation: JepsenOperation {
+                kind: JepsenOperationKind::GetResource,
+                operation_id: None,
+                resource_id: Some(ResourceId(91)),
+                reservation_id: None,
+                holder_id: None,
+                required_lsn: None,
+                request_slot: None,
+                ttl_slots: None,
+            },
+            outcome: JepsenEventOutcome::SuccessfulRead(JepsenSuccessfulRead {
+                target: JepsenReadTarget::Resource,
+                served_by: ReplicaId(2),
+                served_role: ReplicaRole::Primary,
+                observed_lsn: None,
+                state: JepsenReadState::Resource(JepsenResourceState::Available),
+            }),
+        },
+        JepsenHistoryEvent {
+            sequence: 2,
+            process: String::from("ticker"),
+            time_millis: 2,
+            operation: JepsenOperation {
+                kind: JepsenOperationKind::TickExpirations,
+                operation_id: Some(501),
+                resource_id: None,
+                reservation_id: None,
+                holder_id: None,
+                required_lsn: None,
+                request_slot: Some(Slot(17)),
+                ttl_slots: None,
+            },
+            outcome: JepsenEventOutcome::CommittedWrite(JepsenCommittedWrite {
+                applied_lsn: Lsn(7),
+                result: JepsenWriteResult::TickExpired {
+                    expired: vec![JepsenExpiredReservation {
+                        resource_id: ResourceId(91),
+                        holder_id: 77,
+                        reservation_id: 301,
+                        released_lsn: None,
+                    }],
+                },
+            }),
+        },
+    ];
+
+    let encoded = encode_history(&history);
+    let decoded = decode_history(&encoded).unwrap();
+    assert_eq!(decoded, history);
+}
+
+#[test]
 fn history_codec_round_trips_and_artifact_bundle_is_written() {
     let history = vec![
         reserve_event(ReserveEventSpec {
