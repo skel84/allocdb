@@ -685,10 +685,6 @@ impl ReplicaPrepareLogFile {
             });
         }
 
-        if bytes.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-
         decode_prepare_log(&bytes, max_entries, max_command_bytes)
             .map_err(ReplicaPrepareLogFileError::from)
     }

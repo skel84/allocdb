@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use allocdb_core::command::{ClientRequest, Command};
-use allocdb_core::command_codec::encode_client_request;
+use allocdb_core::command_codec::{decode_internal_command, encode_client_request};
 use allocdb_core::config::Config;
 use allocdb_core::ids::{ClientId, HolderId, Lsn, OperationId, ResourceId, Slot};
+use allocdb_core::{ReservationState, ResourceState};
 
 use crate::engine::{EngineConfig, SingleNodeEngine};
 use crate::replica::{
@@ -428,6 +429,35 @@ fn replica_open_faults_on_corrupt_prepare_log_bytes() {
 }
 
 #[test]
+fn replica_open_faults_on_empty_prepare_log_file() {
+    let paths = ReplicaPaths::new(
+        metadata_path("empty-prepare-log"),
+        snapshot_path("empty-prepare-log"),
+        wal_path("empty-prepare-log"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+    let payload = encode_client_request(create(91, 1));
+    node.prepare_client_request(Slot(5), &payload).unwrap();
+    drop(node);
+
+    fs::write(prepare_log_path(&paths.metadata_path), []).unwrap();
+
+    let faulted =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+
+    assert_faulted(
+        &faulted,
+        ReplicaFaultReason::PrepareLogLoad(ReplicaPrepareLogLoadError::Decode(
+            ReplicaPrepareLogDecodeError::BufferTooShort,
+        )),
+    );
+
+    cleanup(&paths);
+}
+
+#[test]
 fn replica_recover_faults_when_prepare_log_lsn_skips_commit_boundary() {
     let paths = ReplicaPaths::new(
         metadata_path("prepare-log-gap"),
@@ -458,6 +488,159 @@ fn replica_recover_faults_when_prepare_log_lsn_skips_commit_boundary() {
         }),
     );
     assert!(faulted.prepared_entry(entry.lsn).is_none());
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_prepare_expiration_tick_rejects_pending_prepared_suffix() {
+    let paths = ReplicaPaths::new(
+        metadata_path("tick-pending-suffix"),
+        snapshot_path("tick-pending-suffix"),
+        wal_path("tick-pending-suffix"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+
+    let payload = encode_client_request(create(301, 1));
+    node.prepare_client_request(Slot(1), &payload).unwrap();
+
+    let error = node.prepare_expiration_tick(Slot(12)).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::replica::ReplicaProtocolError::PendingPreparedEntries { count: 1 }
+    ));
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_prepare_expiration_tick_emits_internal_entries() {
+    let paths = ReplicaPaths::new(
+        metadata_path("tick-internal-kind"),
+        snapshot_path("tick-internal-kind"),
+        wal_path("tick-internal-kind"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+
+    let create_entry = node
+        .prepare_client_request(Slot(1), &encode_client_request(create(401, 1)))
+        .unwrap();
+    node.commit_prepared_through(create_entry.lsn).unwrap();
+
+    let reserve_entry = node
+        .prepare_client_request(Slot(10), &encode_client_request(reserve(401, 2, 77, 2)))
+        .unwrap();
+    let reserve_result = node
+        .commit_prepared_through(reserve_entry.lsn)
+        .unwrap()
+        .unwrap();
+    let reservation_id = reserve_result
+        .outcome
+        .reservation_id
+        .expect("reserve should assign one reservation id");
+
+    let entries = node.prepare_expiration_tick(Slot(12)).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.kind == crate::replica::ReplicaPreparedKind::Internal)
+    );
+    assert_eq!(
+        decode_internal_command(&entries[0].payload).unwrap(),
+        Command::Expire {
+            reservation_id,
+            deadline_slot: Slot(12),
+        }
+    );
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_commit_expiration_tick_persists_and_recovers_expired_state() {
+    let paths = ReplicaPaths::new(
+        metadata_path("tick-recover"),
+        snapshot_path("tick-recover"),
+        wal_path("tick-recover"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+
+    let create_entry = node
+        .prepare_client_request(Slot(1), &encode_client_request(create(501, 1)))
+        .unwrap();
+    node.commit_prepared_through(create_entry.lsn).unwrap();
+
+    let reserve_entry = node
+        .prepare_client_request(Slot(10), &encode_client_request(reserve(501, 2, 88, 2)))
+        .unwrap();
+    let reserve_result = node
+        .commit_prepared_through(reserve_entry.lsn)
+        .unwrap()
+        .unwrap();
+    let reservation_id = reserve_result
+        .outcome
+        .reservation_id
+        .expect("reserve should assign one reservation id");
+
+    let entries = node.prepare_expiration_tick(Slot(12)).unwrap();
+    let commit_lsn = entries.last().expect("tick should plan one entry").lsn;
+    let committed = node
+        .commit_prepared_through(commit_lsn)
+        .unwrap()
+        .expect("tick commit should apply one internal entry");
+    assert_eq!(committed.applied_lsn, commit_lsn);
+    assert_eq!(node.prepared_len(), 0);
+    assert_eq!(
+        node.engine()
+            .unwrap()
+            .db()
+            .resource(ResourceId(501))
+            .unwrap()
+            .current_state,
+        ResourceState::Available
+    );
+    assert_eq!(
+        node.engine()
+            .unwrap()
+            .db()
+            .reservation(reservation_id, Slot(12))
+            .unwrap()
+            .state,
+        ReservationState::Expired
+    );
+    drop(node);
+
+    let recovered =
+        ReplicaNode::recover(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    assert_eq!(recovered.metadata().commit_lsn, Some(commit_lsn));
+    assert_eq!(recovered.prepared_len(), 0);
+    assert_eq!(
+        recovered
+            .engine()
+            .unwrap()
+            .db()
+            .resource(ResourceId(501))
+            .unwrap()
+            .current_state,
+        ResourceState::Available
+    );
+    assert_eq!(
+        recovered
+            .engine()
+            .unwrap()
+            .db()
+            .reservation(reservation_id, Slot(12))
+            .unwrap()
+            .state,
+        ReservationState::Expired
+    );
 
     cleanup(&paths);
 }

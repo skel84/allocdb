@@ -2,7 +2,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use allocdb_core::ReservationState;
 use allocdb_core::command::{ClientRequest, Command as AllocCommand};
@@ -272,15 +272,12 @@ fn verify_qemu_surface(workspace_root: &Path) -> Result<(), String> {
             protocol_addr.port(),
             &[],
         )?;
-        let protocol_text = String::from_utf8_lossy(&protocol_response);
-        if protocol_text.contains("protocol transport not implemented")
-            || protocol_text.contains("network isolated by local harness")
-        {
-            return Err(format!(
-                "QEMU protocol surface is not ready for Jepsen: replica {} returned `{protocol_text}`",
-                guest.replica_id.map_or(0, allocdb_node::ReplicaId::get)
-            ));
-        }
+        validate_protocol_probe_response(
+            guest
+                .replica_id
+                .map_or(ReplicaId(0), |replica_id| replica_id),
+            &protocol_response,
+        )?;
     }
 
     let primary = primary_replica(&layout)?;
@@ -295,14 +292,7 @@ fn verify_qemu_surface(workspace_root: &Path) -> Result<(), String> {
             probe_create_request(resource_id),
         )),
     )?)?;
-    let applied_lsn = match submit_response {
-        ApiResponse::Submit(SubmitResponse::Committed(response)) => response.applied_lsn,
-        other => {
-            return Err(format!(
-                "QEMU client surface is not ready for Jepsen: primary submit probe did not commit: {other:?}"
-            ));
-        }
-    };
+    let applied_lsn = extract_probe_commit_lsn(submit_response)?;
 
     let read_response = decode_qemu_api_response(&send_remote_api_request(
         &layout,
@@ -313,15 +303,7 @@ fn verify_qemu_surface(workspace_root: &Path) -> Result<(), String> {
             required_lsn: Some(applied_lsn),
         }),
     )?)?;
-    if !matches!(
-        read_response,
-        ApiResponse::GetResource(ResourceResponse::Found(resource))
-            if resource.resource_id == ResourceId(resource_id)
-    ) {
-        return Err(format!(
-            "QEMU client surface is not ready for Jepsen: primary read probe returned unexpected response {read_response:?}"
-        ));
-    }
+    validate_probe_read_response(resource_id, &read_response)?;
 
     println!("qemu_surface=ready");
     Ok(())
@@ -329,6 +311,7 @@ fn verify_qemu_surface(workspace_root: &Path) -> Result<(), String> {
 
 fn run_qemu(workspace_root: &Path, run_id: &str, output_root: &Path) -> Result<(), String> {
     let run_spec = resolve_run_spec(run_id)?;
+    let started_at = Instant::now();
     verify_qemu_surface(workspace_root)?;
 
     let layout = load_qemu_layout(workspace_root)?;
@@ -358,6 +341,7 @@ fn run_qemu(workspace_root: &Path, run_id: &str, output_root: &Path) -> Result<(
     println!("artifact_bundle={}", bundle_dir.display());
     println!("qemu_logs_archive={}", logs_archive.display());
     print!("{}", render_analysis_report(&report));
+    enforce_minimum_fault_window(&run_spec, started_at.elapsed())?;
 
     if report.release_gate_passed() {
         Ok(())
@@ -2515,9 +2499,7 @@ fn run_remote_tcp_request(
 ) -> Result<Vec<u8>, String> {
     let request_hex = encode_hex(request_bytes);
     let mut args = ssh_args(layout);
-    args.push(format!(
-        "python3 - {host} {port} {request_hex} <<'PY'\nimport socket, sys\nhost = sys.argv[1]\nport = int(sys.argv[2])\npayload = bytes.fromhex(sys.argv[3])\nwith socket.create_connection((host, port), timeout=2) as stream:\n    if payload:\n        stream.sendall(payload)\n    stream.shutdown(socket.SHUT_WR)\n    chunks = []\n    while True:\n        chunk = stream.recv(4096)\n        if not chunk:\n            break\n        chunks.append(chunk)\n    sys.stdout.buffer.write(b''.join(chunks))\nPY"
-    ));
+    args.push(build_remote_tcp_probe_command(host, port, &request_hex));
     let output = Command::new("ssh")
         .args(args)
         .output()
@@ -2531,6 +2513,67 @@ fn run_remote_tcp_request(
             String::from_utf8_lossy(&output.stderr)
         ))
     }
+}
+
+fn build_remote_tcp_probe_command(host: &str, port: u16, request_hex: &str) -> String {
+    format!(
+        "python3 - {host} {port} {request_hex} <<'PY'\nimport socket, sys\nhost = sys.argv[1]\nport = int(sys.argv[2])\npayload = bytes.fromhex(sys.argv[3])\nwith socket.create_connection((host, port), timeout=2) as stream:\n    if payload:\n        stream.sendall(payload)\n    stream.shutdown(socket.SHUT_WR)\n    chunks = []\n    while True:\n        chunk = stream.recv(4096)\n        if not chunk:\n            break\n        chunks.append(chunk)\n    sys.stdout.buffer.write(b''.join(chunks))\nPY"
+    )
+}
+
+fn validate_protocol_probe_response(
+    replica_id: ReplicaId,
+    response_bytes: &[u8],
+) -> Result<(), String> {
+    let protocol_text = String::from_utf8_lossy(response_bytes);
+    if protocol_text.contains("protocol transport not implemented")
+        || protocol_text.contains("network isolated by local harness")
+    {
+        return Err(format!(
+            "QEMU protocol surface is not ready for Jepsen: replica {} returned `{protocol_text}`",
+            replica_id.get()
+        ));
+    }
+    Ok(())
+}
+
+fn extract_probe_commit_lsn(response: ApiResponse) -> Result<Lsn, String> {
+    match response {
+        ApiResponse::Submit(SubmitResponse::Committed(result)) => Ok(result.applied_lsn),
+        other => Err(format!(
+            "QEMU client surface is not ready for Jepsen: primary submit probe did not commit: {other:?}"
+        )),
+    }
+}
+
+fn validate_probe_read_response(resource_id: u128, response: &ApiResponse) -> Result<(), String> {
+    if matches!(
+        response,
+        ApiResponse::GetResource(ResourceResponse::Found(resource))
+            if resource.resource_id == ResourceId(resource_id)
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "QEMU client surface is not ready for Jepsen: primary read probe returned unexpected response {response:?}"
+        ))
+    }
+}
+
+fn enforce_minimum_fault_window(run_spec: &JepsenRunSpec, elapsed: Duration) -> Result<(), String> {
+    let Some(minimum_secs) = run_spec.minimum_fault_window_secs else {
+        return Ok(());
+    };
+    let minimum = Duration::from_secs(minimum_secs);
+    if elapsed < minimum {
+        return Err(format!(
+            "run `{}` finished before minimum fault window (required={}s observed={}s)",
+            run_spec.run_id,
+            minimum_secs,
+            elapsed.as_secs()
+        ));
+    }
+    Ok(())
 }
 
 fn decode_qemu_api_response(bytes: &[u8]) -> Result<ApiResponse, String> {
@@ -2600,6 +2643,7 @@ fn ssh_args(layout: &QemuTestbedLayout) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use allocdb_core::ResourceState;
 
     #[test]
     fn release_gate_plan_includes_faulted_qemu_runs() {
@@ -2646,5 +2690,74 @@ mod tests {
                 released_lsn: Some(Lsn(4)),
             }
         );
+    }
+
+    #[test]
+    fn remote_tcp_probe_command_places_args_before_heredoc() {
+        let command = build_remote_tcp_probe_command("127.0.0.1", 9000, "deadbeef");
+        assert!(command.starts_with("python3 - 127.0.0.1 9000 deadbeef <<'PY'\n"));
+        assert!(command.contains("payload = bytes.fromhex(sys.argv[3])"));
+        assert!(command.ends_with("\nPY"));
+    }
+
+    #[test]
+    fn protocol_probe_rejects_placeholder_responses() {
+        let not_ready =
+            validate_protocol_probe_response(ReplicaId(2), b"protocol transport not implemented")
+                .unwrap_err();
+        assert!(not_ready.contains("replica 2"));
+
+        let isolated =
+            validate_protocol_probe_response(ReplicaId(3), b"network isolated by local harness")
+                .unwrap_err();
+        assert!(isolated.contains("replica 3"));
+
+        assert!(validate_protocol_probe_response(ReplicaId(4), b"").is_ok());
+    }
+
+    #[test]
+    fn probe_submit_and_read_validation_cover_pass_and_fail_paths() {
+        let applied_lsn = extract_probe_commit_lsn(ApiResponse::Submit(SubmitResponse::Committed(
+            allocdb_node::SubmissionResult {
+                applied_lsn: Lsn(9),
+                outcome: allocdb_core::result::CommandOutcome::new(ResultCode::Ok),
+                from_retry_cache: false,
+            }
+            .into(),
+        )))
+        .unwrap();
+        assert_eq!(applied_lsn, Lsn(9));
+
+        let submit_error =
+            extract_probe_commit_lsn(ApiResponse::GetResource(ResourceResponse::NotFound))
+                .unwrap_err();
+        assert!(submit_error.contains("did not commit"));
+
+        let ok_read =
+            ApiResponse::GetResource(ResourceResponse::Found(allocdb_node::ResourceView {
+                resource_id: ResourceId(41),
+                state: ResourceState::Available,
+                current_reservation_id: None,
+                version: 1,
+            }));
+        assert!(validate_probe_read_response(41, &ok_read).is_ok());
+
+        let read_error =
+            validate_probe_read_response(41, &ApiResponse::GetResource(ResourceResponse::NotFound))
+                .unwrap_err();
+        assert!(read_error.contains("unexpected response"));
+    }
+
+    #[test]
+    fn resolve_run_spec_and_minimum_fault_window_are_enforced() {
+        let control = resolve_run_spec("reservation_contention-control").unwrap();
+        assert!(enforce_minimum_fault_window(&control, Duration::from_secs(0)).is_ok());
+
+        let faulted = resolve_run_spec("reservation_contention-crash-restart").unwrap();
+        let error = enforce_minimum_fault_window(&faulted, Duration::from_secs(10)).unwrap_err();
+        assert!(error.contains("minimum fault window"));
+
+        let unknown = resolve_run_spec("missing-run").unwrap_err();
+        assert!(unknown.contains("unknown Jepsen run id"));
     }
 }
