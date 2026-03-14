@@ -269,6 +269,23 @@ pub enum ReplicaMetadataDecodeError {
     InvalidLayout,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplicaPrepareLogDecodeError {
+    BufferTooShort,
+    InvalidMagic,
+    UnsupportedVersion(u8),
+    InvalidPreparedKind(u8),
+    EntryCountExceedsLimit {
+        count: u64,
+        max_entries: usize,
+    },
+    PayloadTooLarge {
+        payload_len: u64,
+        max_command_bytes: usize,
+    },
+    InvalidLayout,
+}
+
 #[derive(Debug)]
 pub enum ReplicaMetadataFileError {
     Io(std::io::Error),
@@ -284,6 +301,25 @@ impl From<std::io::Error> for ReplicaMetadataFileError {
 
 impl From<ReplicaMetadataDecodeError> for ReplicaMetadataFileError {
     fn from(error: ReplicaMetadataDecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+#[derive(Debug)]
+pub enum ReplicaPrepareLogFileError {
+    Io(std::io::Error),
+    Decode(ReplicaPrepareLogDecodeError),
+    TooLarge { file_len: u64, max_bytes: u64 },
+}
+
+impl From<std::io::Error> for ReplicaPrepareLogFileError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<ReplicaPrepareLogDecodeError> for ReplicaPrepareLogFileError {
+    fn from(error: ReplicaPrepareLogDecodeError) -> Self {
         Self::Decode(error)
     }
 }
@@ -329,6 +365,21 @@ pub enum ReplicaStartupValidationError {
         metadata_snapshot_lsn: Option<Lsn>,
         local_snapshot_lsn: Option<Lsn>,
     },
+    PreparedEntriesWithoutMetadata {
+        count: usize,
+    },
+    PreparedOrderMismatch {
+        expected_lsn: Lsn,
+        found_lsn: Lsn,
+    },
+    PreparedViewMismatch {
+        expected_view: u64,
+        found_view: u64,
+        lsn: Lsn,
+    },
+    PreparedPayloadRejected {
+        lsn: Lsn,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -339,9 +390,17 @@ pub enum ReplicaMetadataLoadError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplicaPrepareLogLoadError {
+    Io(std::io::ErrorKind),
+    Decode(ReplicaPrepareLogDecodeError),
+    TooLarge { file_len: u64, max_bytes: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplicaFaultReason {
     PersistedFaultState,
     MetadataLoad(ReplicaMetadataLoadError),
+    PrepareLogLoad(ReplicaPrepareLogLoadError),
     Validation(ReplicaStartupValidationError),
 }
 
@@ -592,6 +651,47 @@ impl ReplicaPrepareLogFile {
 
         replace_file_durably(&temp_path, &self.path)
     }
+
+    fn load_entries(
+        &self,
+        max_entries: usize,
+        max_command_bytes: usize,
+    ) -> Result<BTreeMap<u64, ReplicaPreparedEntry>, ReplicaPrepareLogFileError> {
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new());
+            }
+            Err(error) => return Err(ReplicaPrepareLogFileError::Io(error)),
+        };
+
+        let max_bytes = max_prepare_log_bytes(max_entries, max_command_bytes);
+        let file_len = file.metadata()?.len();
+        if file_len > max_bytes {
+            return Err(ReplicaPrepareLogFileError::TooLarge {
+                file_len,
+                max_bytes,
+            });
+        }
+
+        let mut bytes = Vec::new();
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        let read_len = bytes.len() as u64;
+        if read_len > max_bytes {
+            return Err(ReplicaPrepareLogFileError::TooLarge {
+                file_len: read_len,
+                max_bytes,
+            });
+        }
+
+        if bytes.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        decode_prepare_log(&bytes, max_entries, max_command_bytes)
+            .map_err(ReplicaPrepareLogFileError::from)
+    }
 }
 
 #[derive(Debug)]
@@ -622,11 +722,39 @@ impl ReplicaNode {
         paths: ReplicaPaths,
     ) -> Result<Self, ReplicaOpenError> {
         let metadata_file = ReplicaMetadataFile::new(&paths.metadata_path);
+        let prepare_log_file = ReplicaPrepareLogFile::new(prepare_log_path(&paths.metadata_path));
         match load_or_fault_existing_metadata(&metadata_file, identity) {
             LoadedMetadata::Missing => {
                 let engine = SingleNodeEngine::open(core_config, engine_config, &paths.wal_path)?;
                 let metadata =
                     ReplicaMetadata::bootstrap(identity, engine.db().last_applied_lsn(), None);
+                let prepared_entries = match load_prepared_entries(&prepare_log_file, engine_config)
+                {
+                    Ok(prepared_entries) => prepared_entries,
+                    Err(reason) => {
+                        warn!(
+                            "replica enters faulted state before metadata bootstrap because prepare-log load failed: replica_id={} shard_id={} reason={:?}",
+                            identity.replica_id.get(),
+                            identity.shard_id,
+                            reason,
+                        );
+                        return Ok(Self::faulted(metadata, metadata_file, paths, reason));
+                    }
+                };
+                if !prepared_entries.is_empty() {
+                    let reason = ReplicaFaultReason::Validation(
+                        ReplicaStartupValidationError::PreparedEntriesWithoutMetadata {
+                            count: prepared_entries.len(),
+                        },
+                    );
+                    warn!(
+                        "replica enters faulted state before metadata bootstrap because prepared suffix exists without replica metadata: replica_id={} shard_id={} count={}",
+                        identity.replica_id.get(),
+                        identity.shard_id,
+                        prepared_entries.len(),
+                    );
+                    return Ok(Self::faulted(metadata, metadata_file, paths, reason));
+                }
                 metadata_file.write_metadata(&metadata)?;
                 info!(
                     "bootstrapped replica metadata: replica_id={} shard_id={} view={} role={:?}",
@@ -635,7 +763,14 @@ impl ReplicaNode {
                     metadata.current_view,
                     metadata.role,
                 );
-                Ok(Self::active(metadata, metadata_file, paths, engine))
+                Ok(Self::active(
+                    metadata,
+                    metadata_file,
+                    prepare_log_file,
+                    paths,
+                    engine,
+                    prepared_entries,
+                ))
             }
             LoadedMetadata::Faulted(metadata, reason) => {
                 warn!(
@@ -649,7 +784,22 @@ impl ReplicaNode {
             }
             LoadedMetadata::Ready(metadata) => {
                 let engine = SingleNodeEngine::open(core_config, engine_config, &paths.wal_path)?;
-                match validate_active_metadata(&metadata, identity, &engine) {
+                let prepared_entries = match load_prepared_entries(&prepare_log_file, engine_config)
+                {
+                    Ok(prepared_entries) => prepared_entries,
+                    Err(reason) => {
+                        warn!(
+                            "replica enters faulted state after open-path prepare-log load failure: replica_id={} shard_id={} reason={:?}",
+                            metadata.identity.replica_id.get(),
+                            metadata.identity.shard_id,
+                            reason,
+                        );
+                        return Ok(Self::faulted(metadata, metadata_file, paths, reason));
+                    }
+                };
+                match validate_active_metadata(&metadata, identity, &engine).and_then(|()| {
+                    validate_loaded_prepared_entries(&metadata, &prepared_entries, &engine)
+                }) {
                     Err(reason) => {
                         error!(
                             "faulting replica after open-path validation: replica_id={} \
@@ -660,7 +810,14 @@ impl ReplicaNode {
                         );
                         Ok(Self::faulted(metadata, metadata_file, paths, reason))
                     }
-                    Ok(()) => Ok(Self::active(metadata, metadata_file, paths, engine)),
+                    Ok(()) => Ok(Self::active(
+                        metadata,
+                        metadata_file,
+                        prepare_log_file,
+                        paths,
+                        engine,
+                        prepared_entries,
+                    )),
                 }
             }
         }
@@ -675,6 +832,7 @@ impl ReplicaNode {
     ///
     /// Returns [`RecoverReplicaError`] if snapshot/WAL recovery fails or if metadata bootstrap
     /// persistence fails.
+    #[allow(clippy::too_many_lines)]
     pub fn recover(
         core_config: Config,
         engine_config: EngineConfig,
@@ -682,6 +840,7 @@ impl ReplicaNode {
         paths: ReplicaPaths,
     ) -> Result<Self, RecoverReplicaError> {
         let metadata_file = ReplicaMetadataFile::new(&paths.metadata_path);
+        let prepare_log_file = ReplicaPrepareLogFile::new(prepare_log_path(&paths.metadata_path));
         match load_or_fault_existing_metadata(&metadata_file, identity) {
             LoadedMetadata::Missing => {
                 let engine = SingleNodeEngine::recover(
@@ -695,6 +854,33 @@ impl ReplicaNode {
                     engine.db().last_applied_lsn(),
                     engine.active_snapshot_lsn(),
                 );
+                let prepared_entries = match load_prepared_entries(&prepare_log_file, engine_config)
+                {
+                    Ok(prepared_entries) => prepared_entries,
+                    Err(reason) => {
+                        warn!(
+                            "replica enters faulted state before recovered metadata bootstrap because prepare-log load failed: replica_id={} shard_id={} reason={:?}",
+                            identity.replica_id.get(),
+                            identity.shard_id,
+                            reason,
+                        );
+                        return Ok(Self::faulted(metadata, metadata_file, paths, reason));
+                    }
+                };
+                if !prepared_entries.is_empty() {
+                    let reason = ReplicaFaultReason::Validation(
+                        ReplicaStartupValidationError::PreparedEntriesWithoutMetadata {
+                            count: prepared_entries.len(),
+                        },
+                    );
+                    warn!(
+                        "replica enters faulted state before recovered metadata bootstrap because prepared suffix exists without replica metadata: replica_id={} shard_id={} count={}",
+                        identity.replica_id.get(),
+                        identity.shard_id,
+                        prepared_entries.len(),
+                    );
+                    return Ok(Self::faulted(metadata, metadata_file, paths, reason));
+                }
                 metadata_file.write_metadata(&metadata)?;
                 info!(
                     "bootstrapped recovered replica metadata: replica_id={} shard_id={} \
@@ -703,7 +889,14 @@ impl ReplicaNode {
                     metadata.identity.shard_id,
                     metadata.commit_lsn,
                 );
-                Ok(Self::active(metadata, metadata_file, paths, engine))
+                Ok(Self::active(
+                    metadata,
+                    metadata_file,
+                    prepare_log_file,
+                    paths,
+                    engine,
+                    prepared_entries,
+                ))
             }
             LoadedMetadata::Faulted(metadata, reason) => {
                 warn!(
@@ -722,7 +915,22 @@ impl ReplicaNode {
                     &paths.snapshot_path,
                     &paths.wal_path,
                 )?;
-                match validate_active_metadata(&metadata, identity, &engine) {
+                let prepared_entries = match load_prepared_entries(&prepare_log_file, engine_config)
+                {
+                    Ok(prepared_entries) => prepared_entries,
+                    Err(reason) => {
+                        warn!(
+                            "replica enters faulted state after recover-path prepare-log load failure: replica_id={} shard_id={} reason={:?}",
+                            metadata.identity.replica_id.get(),
+                            metadata.identity.shard_id,
+                            reason,
+                        );
+                        return Ok(Self::faulted(metadata, metadata_file, paths, reason));
+                    }
+                };
+                match validate_active_metadata(&metadata, identity, &engine).and_then(|()| {
+                    validate_loaded_prepared_entries(&metadata, &prepared_entries, &engine)
+                }) {
                     Err(reason) => {
                         error!(
                             "faulting replica after recover-path validation: replica_id={} \
@@ -733,7 +941,14 @@ impl ReplicaNode {
                         );
                         Ok(Self::faulted(metadata, metadata_file, paths, reason))
                     }
-                    Ok(()) => Ok(Self::active(metadata, metadata_file, paths, engine)),
+                    Ok(()) => Ok(Self::active(
+                        metadata,
+                        metadata_file,
+                        prepare_log_file,
+                        paths,
+                        engine,
+                        prepared_entries,
+                    )),
                 }
             }
         }
@@ -1247,14 +1462,16 @@ impl ReplicaNode {
     fn active(
         metadata: ReplicaMetadata,
         metadata_file: ReplicaMetadataFile,
+        prepare_log_file: ReplicaPrepareLogFile,
         paths: ReplicaPaths,
         engine: SingleNodeEngine,
+        prepared_entries: BTreeMap<u64, ReplicaPreparedEntry>,
     ) -> Self {
         Self {
             metadata,
             metadata_file,
-            prepare_log_file: ReplicaPrepareLogFile::new(prepare_log_path(&paths.metadata_path)),
-            prepared_entries: BTreeMap::new(),
+            prepare_log_file,
+            prepared_entries,
             paths,
             status: ReplicaNodeStatus::Active,
             engine: Some(engine),
@@ -1346,6 +1563,80 @@ fn validate_active_metadata(
         .map_err(ReplicaFaultReason::Validation)
 }
 
+fn load_prepared_entries(
+    prepare_log_file: &ReplicaPrepareLogFile,
+    engine_config: EngineConfig,
+) -> Result<BTreeMap<u64, ReplicaPreparedEntry>, ReplicaFaultReason> {
+    let max_entries = usize::try_from(engine_config.max_submission_queue)
+        .expect("validated max_submission_queue must fit usize");
+    prepare_log_file
+        .load_entries(max_entries, engine_config.max_command_bytes)
+        .map_err(|error| match error {
+            ReplicaPrepareLogFileError::Io(io_error) => {
+                ReplicaFaultReason::PrepareLogLoad(ReplicaPrepareLogLoadError::Io(io_error.kind()))
+            }
+            ReplicaPrepareLogFileError::Decode(decode_error) => {
+                ReplicaFaultReason::PrepareLogLoad(ReplicaPrepareLogLoadError::Decode(decode_error))
+            }
+            ReplicaPrepareLogFileError::TooLarge {
+                file_len,
+                max_bytes,
+            } => ReplicaFaultReason::PrepareLogLoad(ReplicaPrepareLogLoadError::TooLarge {
+                file_len,
+                max_bytes,
+            }),
+        })
+}
+
+fn validate_loaded_prepared_entries(
+    metadata: &ReplicaMetadata,
+    prepared_entries: &BTreeMap<u64, ReplicaPreparedEntry>,
+    engine: &SingleNodeEngine,
+) -> Result<(), ReplicaFaultReason> {
+    let mut expected_lsn = metadata
+        .commit_lsn
+        .and_then(|lsn| lsn.get().checked_add(1))
+        .map_or(Lsn(1), Lsn);
+
+    for entry in prepared_entries.values() {
+        if entry.lsn != expected_lsn {
+            return Err(ReplicaFaultReason::Validation(
+                ReplicaStartupValidationError::PreparedOrderMismatch {
+                    expected_lsn,
+                    found_lsn: entry.lsn,
+                },
+            ));
+        }
+        if entry.view != metadata.current_view {
+            return Err(ReplicaFaultReason::Validation(
+                ReplicaStartupValidationError::PreparedViewMismatch {
+                    expected_view: metadata.current_view,
+                    found_view: entry.view,
+                    lsn: entry.lsn,
+                },
+            ));
+        }
+
+        let validation = match entry.kind {
+            ReplicaPreparedKind::Client => {
+                engine.validate_encoded_submission(entry.request_slot, &entry.payload)
+            }
+            ReplicaPreparedKind::Internal => {
+                engine.validate_internal_submission(entry.request_slot, &entry.payload)
+            }
+        };
+        if validation.is_err() {
+            return Err(ReplicaFaultReason::Validation(
+                ReplicaStartupValidationError::PreparedPayloadRejected { lsn: entry.lsn },
+            ));
+        }
+
+        expected_lsn = entry.lsn.get().checked_add(1).map_or(expected_lsn, Lsn);
+    }
+
+    Ok(())
+}
+
 pub(crate) fn prepare_log_path(metadata_path: &Path) -> PathBuf {
     let mut path = metadata_path.to_path_buf();
     let extension = path
@@ -1394,6 +1685,97 @@ const fn encode_prepared_kind(kind: ReplicaPreparedKind) -> u8 {
     match kind {
         ReplicaPreparedKind::Client => 1,
         ReplicaPreparedKind::Internal => 2,
+    }
+}
+
+fn max_prepare_log_bytes(max_entries: usize, max_command_bytes: usize) -> u64 {
+    let per_entry = 1_u64
+        .saturating_add(8)
+        .saturating_add(8)
+        .saturating_add(8)
+        .saturating_add(8)
+        .saturating_add(u64::try_from(max_command_bytes).expect("max_command_bytes must fit u64"));
+    4_u64.saturating_add(1).saturating_add(8).saturating_add(
+        u64::try_from(max_entries)
+            .expect("prepared entry bound must fit u64")
+            .saturating_mul(per_entry),
+    )
+}
+
+fn decode_prepare_log(
+    bytes: &[u8],
+    max_entries: usize,
+    max_command_bytes: usize,
+) -> Result<BTreeMap<u64, ReplicaPreparedEntry>, ReplicaPrepareLogDecodeError> {
+    let mut cursor = PrepareLogCursor::new(bytes);
+    if cursor.read_exact::<4>()? != REPLICA_PREPARE_LOG_MAGIC {
+        return Err(ReplicaPrepareLogDecodeError::InvalidMagic);
+    }
+
+    let version = cursor.read_u8()?;
+    if version != REPLICA_PREPARE_LOG_VERSION {
+        return Err(ReplicaPrepareLogDecodeError::UnsupportedVersion(version));
+    }
+
+    let entry_count = cursor.read_u64()?;
+    let entry_count_usize = usize::try_from(entry_count).map_err(|_| {
+        ReplicaPrepareLogDecodeError::EntryCountExceedsLimit {
+            count: entry_count,
+            max_entries,
+        }
+    })?;
+    if entry_count_usize > max_entries {
+        return Err(ReplicaPrepareLogDecodeError::EntryCountExceedsLimit {
+            count: entry_count,
+            max_entries,
+        });
+    }
+
+    let mut entries = BTreeMap::new();
+    for _ in 0..entry_count_usize {
+        let kind = decode_prepared_kind(cursor.read_u8()?)?;
+        let view = cursor.read_u64()?;
+        let lsn = Lsn(cursor.read_u64()?);
+        let request_slot = Slot(cursor.read_u64()?);
+        let payload_len = cursor.read_u64()?;
+        let payload_len_usize = usize::try_from(payload_len).map_err(|_| {
+            ReplicaPrepareLogDecodeError::PayloadTooLarge {
+                payload_len,
+                max_command_bytes,
+            }
+        })?;
+        if payload_len_usize > max_command_bytes {
+            return Err(ReplicaPrepareLogDecodeError::PayloadTooLarge {
+                payload_len,
+                max_command_bytes,
+            });
+        }
+        let payload = cursor.read_bytes(payload_len_usize)?.to_vec();
+        let previous = entries.insert(
+            lsn.get(),
+            ReplicaPreparedEntry {
+                kind,
+                view,
+                lsn,
+                request_slot,
+                payload,
+            },
+        );
+        if previous.is_some() {
+            return Err(ReplicaPrepareLogDecodeError::InvalidLayout);
+        }
+    }
+    cursor.finish()?;
+    Ok(entries)
+}
+
+const fn decode_prepared_kind(
+    value: u8,
+) -> Result<ReplicaPreparedKind, ReplicaPrepareLogDecodeError> {
+    match value {
+        1 => Ok(ReplicaPreparedKind::Client),
+        2 => Ok(ReplicaPreparedKind::Internal),
+        _ => Err(ReplicaPrepareLogDecodeError::InvalidPreparedKind(value)),
     }
 }
 
@@ -1488,6 +1870,57 @@ fn encode_optional_vote(bytes: &mut Vec<u8>, vote: Option<DurableVote>) {
 struct MetadataCursor<'a> {
     bytes: &'a [u8],
     offset: usize,
+}
+
+struct PrepareLogCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> PrepareLogCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn finish(&self) -> Result<(), ReplicaPrepareLogDecodeError> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(ReplicaPrepareLogDecodeError::InvalidLayout)
+        }
+    }
+
+    fn read_exact<const N: usize>(&mut self) -> Result<[u8; N], ReplicaPrepareLogDecodeError> {
+        if self.offset + N > self.bytes.len() {
+            return Err(ReplicaPrepareLogDecodeError::BufferTooShort);
+        }
+
+        let mut array = [0; N];
+        array.copy_from_slice(&self.bytes[self.offset..self.offset + N]);
+        self.offset += N;
+        Ok(array)
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], ReplicaPrepareLogDecodeError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(ReplicaPrepareLogDecodeError::InvalidLayout)?;
+        if end > self.bytes.len() {
+            return Err(ReplicaPrepareLogDecodeError::BufferTooShort);
+        }
+        let bytes = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, ReplicaPrepareLogDecodeError> {
+        Ok(self.read_exact::<1>()?[0])
+    }
+
+    fn read_u64(&mut self) -> Result<u64, ReplicaPrepareLogDecodeError> {
+        Ok(u64::from_le_bytes(self.read_exact::<8>()?))
+    }
 }
 
 impl<'a> MetadataCursor<'a> {

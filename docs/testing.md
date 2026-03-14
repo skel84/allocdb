@@ -425,13 +425,15 @@ What this testbed proves today:
 - replica `control` moves onto one management network while replica `client` and `protocol`
   listeners move onto one separate cluster network
 - one generated control-node script can drive `status`, `isolate`, `heal`, `crash`, `restart`,
-  `reboot`, and `collect-logs` operations against the replica guests
+  `reboot`, `export-replica`, `import-replica`, and `collect-logs` operations against the replica
+  guests
 - the generated workspace keeps overlay images, firmware vars, guest seeds, console logs, and SSH
   keys in stable paths suitable for scripted follow-on runs
 
 What it still does not claim:
 
-- Jepsen workloads and release-blocking fault runs remain follow-on work in `M8-T04`
+- the QEMU testbed still relies on the host-side Jepsen runner for failover/rejoin orchestration;
+  the guest runtime itself does not contain a standalone distributed control plane
 
 ## Jepsen Harness Slice
 
@@ -458,21 +460,22 @@ What this harness slice proves today:
 - one surface-probe command can issue one real `get_metrics` request to every replica, then drive
   one real `create_resource` submit plus one fenced `get_resource` read through the configured
   primary against the QEMU cluster
-- one `run-qemu` command can execute the `*-control` runs against the live QEMU cluster and
-  persist one analyzed history plus one artifact bundle for each run
-- those control runs now exercise one real hot-resource contention sequence, one real stable
-  `operation_id` retry-cache replay, one real primary-versus-backup read-role check, and one real
-  replicated `tick_expirations` path through the external runtime
+- one `run-qemu` command can execute the full documented release-gate matrix against the live QEMU
+  cluster and persist one analyzed history plus one artifact bundle for each run
+- those runs now exercise one real hot-resource contention sequence, one real stable
+  `operation_id` retry-cache replay, one real primary-versus-backup read-role check, one real
+  replicated `tick_expirations` path through the external runtime, and one host-side
+  crash/partition/mixed-failover cutover path built from replica workspace export/import plus the
+  existing `ReplicaNode::recover(...)` logic on staged copies
 
 What it still does not claim:
 
-- the harness does not yet execute crash, partition, or mixed-failover nemesis runs against the
-  QEMU cluster
-- the external runtime still does not automate failover/view-change orchestration, so the
-  release-blocking faulted Jepsen runs remain follow-on work
-- the release gate therefore remains blocked on external workload execution, not on planning,
-  history interpretation, artifact handling, the basic QEMU client/protocol surface, or the
-  no-nemesis control workloads
+- the first QEMU Jepsen executor still drives one scripted gate scenario at a time, not one
+  free-running `30`-minute nemesis soak with independent background clients
+- partition control still uses the existing whole-replica client/protocol isolation surface, not
+  arbitrary packet loss or per-link delay injection
+- the release gate still depends on operators running the full QEMU matrix end to end; the unit
+  and integration suite only proves the harness and orchestration code paths
 
 ## Jepsen Validation Gate
 

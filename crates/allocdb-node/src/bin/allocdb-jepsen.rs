@@ -1,7 +1,7 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use allocdb_core::ReservationState;
@@ -16,13 +16,16 @@ use allocdb_node::jepsen::{
     create_artifact_bundle, load_history, persist_history, release_gate_plan,
     render_analysis_report,
 };
-use allocdb_node::local_cluster::LocalClusterReplicaConfig;
+use allocdb_node::local_cluster::{
+    LocalClusterReplicaConfig, ReplicaRuntimeStatus, decode_control_status_response,
+};
 use allocdb_node::qemu_testbed::{QemuTestbedLayout, qemu_testbed_layout_path};
 use allocdb_node::{
-    ApiRequest, ApiResponse, MetricsRequest, ReplicaRole, ReservationRequest, ReservationResponse,
-    ResourceRequest, ResourceResponse, SubmissionFailure, SubmissionFailureCode, SubmitRequest,
-    SubmitResponse, TickExpirationsRequest, TickExpirationsResponse, decode_response,
-    encode_request,
+    ApiRequest, ApiResponse, MetricsRequest, ReplicaId, ReplicaIdentity, ReplicaMetadata,
+    ReplicaMetadataFile, ReplicaNode, ReplicaPaths, ReplicaRole, ReservationRequest,
+    ReservationResponse, ResourceRequest, ResourceResponse, SubmissionFailure,
+    SubmissionFailureCode, SubmitRequest, SubmitResponse, TickExpirationsRequest,
+    TickExpirationsResponse, decode_response, encode_request,
 };
 
 const CONTROL_HOST_SSH_PORT: u16 = 2220;
@@ -258,12 +261,7 @@ fn verify_qemu_surface(workspace_root: &Path) -> Result<(), String> {
         }
     }
 
-    let primary = layout
-        .replica_layout
-        .replicas
-        .iter()
-        .find(|replica| replica.role == allocdb_node::ReplicaRole::Primary)
-        .ok_or_else(|| String::from("qemu layout has no configured primary"))?;
+    let primary = primary_replica(&layout)?;
     let primary_host = primary.client_addr.ip().to_string();
     let resource_id = unique_probe_resource_id();
     let submit_response = decode_qemu_api_response(&send_remote_api_request(
@@ -309,11 +307,10 @@ fn verify_qemu_surface(workspace_root: &Path) -> Result<(), String> {
 
 fn run_qemu(workspace_root: &Path, run_id: &str, output_root: &Path) -> Result<(), String> {
     let run_spec = resolve_run_spec(run_id)?;
-    ensure_supported_qemu_run(&run_spec)?;
     verify_qemu_surface(workspace_root)?;
 
     let layout = load_qemu_layout(workspace_root)?;
-    let history = execute_qemu_control_run(&layout, &run_spec)?;
+    let history = execute_qemu_run(&layout, &run_spec)?;
     fs::create_dir_all(output_root).map_err(|error| {
         format!(
             "failed to create output root {}: {error}",
@@ -354,16 +351,16 @@ fn resolve_run_spec(run_id: &str) -> Result<JepsenRunSpec, String> {
         .ok_or_else(|| format!("unknown Jepsen run id `{run_id}`"))
 }
 
-fn ensure_supported_qemu_run(run_spec: &JepsenRunSpec) -> Result<(), String> {
-    if run_spec.nemesis == JepsenNemesisFamily::None {
-        return Ok(());
+fn execute_qemu_run(
+    layout: &QemuTestbedLayout,
+    run_spec: &JepsenRunSpec,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    match run_spec.nemesis {
+        JepsenNemesisFamily::None => execute_qemu_control_run(layout, run_spec),
+        JepsenNemesisFamily::CrashRestart => execute_qemu_crash_restart_run(layout, run_spec),
+        JepsenNemesisFamily::PartitionHeal => execute_qemu_partition_heal_run(layout, run_spec),
+        JepsenNemesisFamily::MixedFailover => execute_qemu_mixed_failover_run(layout, run_spec),
     }
-
-    Err(format!(
-        "run `{}` requires nemesis `{}` but `allocdb-jepsen run-qemu` currently supports only control runs while external failover orchestration is still missing",
-        run_spec.run_id,
-        run_spec.nemesis.as_str(),
-    ))
 }
 
 fn archive_qemu_run(
@@ -436,27 +433,1380 @@ struct ReserveCommit {
     reservation_id: ReservationId,
 }
 
+struct StagedReplicaWorkspace {
+    root: PathBuf,
+    replica_id: ReplicaId,
+    paths: ReplicaPaths,
+}
+
+impl StagedReplicaWorkspace {
+    fn new(replica_id: ReplicaId) -> Result<Self, String> {
+        let root = temp_staging_dir(&format!("qemu-replica-{}", replica_id.get()))?;
+        let workspace_dir = root.join(format!("replica-{}", replica_id.get()));
+        fs::create_dir_all(&workspace_dir).map_err(|error| {
+            format!(
+                "failed to create staged workspace {}: {error}",
+                workspace_dir.display()
+            )
+        })?;
+        let paths = ReplicaPaths::new(
+            workspace_dir.join("replica.metadata"),
+            workspace_dir.join("state.snapshot"),
+            workspace_dir.join("state.wal"),
+        );
+        Ok(Self {
+            root,
+            replica_id,
+            paths,
+        })
+    }
+
+    fn from_export(layout: &QemuTestbedLayout, replica_id: ReplicaId) -> Result<Self, String> {
+        let staged = Self::new(replica_id)?;
+        let archive = run_remote_control_command(
+            layout,
+            &[String::from("export-replica"), replica_id.get().to_string()],
+            None,
+        )?;
+        run_local_tar_extract(&staged.root, &archive)?;
+        Ok(staged)
+    }
+
+    fn import_to_remote(&self, layout: &QemuTestbedLayout) -> Result<(), String> {
+        let archive =
+            run_local_tar_archive(&self.root, &format!("replica-{}", self.replica_id.get()))?;
+        let _ = run_remote_control_command(
+            layout,
+            &[
+                String::from("import-replica"),
+                self.replica_id.get().to_string(),
+            ],
+            Some(&archive),
+        )?;
+        Ok(())
+    }
+}
+
+impl Drop for StagedReplicaWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn temp_staging_dir(prefix: &str) -> Result<PathBuf, String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let root = std::env::temp_dir().join(format!("allocdb-{prefix}-{millis}"));
+    fs::create_dir_all(&root).map_err(|error| {
+        format!(
+            "failed to create temp staging dir {}: {error}",
+            root.display()
+        )
+    })?;
+    Ok(root)
+}
+
+fn run_remote_control_command(
+    layout: &QemuTestbedLayout,
+    args: &[String],
+    stdin_bytes: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    let mut remote_args = ssh_args(layout);
+    let remote_command = if args.is_empty() {
+        format!("sudo {REMOTE_CONTROL_SCRIPT_PATH}")
+    } else {
+        format!("sudo {REMOTE_CONTROL_SCRIPT_PATH} {}", args.join(" "))
+    };
+    remote_args.push(remote_command);
+
+    let output = if let Some(stdin_bytes) = stdin_bytes {
+        let mut child = Command::new("ssh")
+            .args(&remote_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("failed to spawn qemu control ssh command: {error}"))?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| String::from("qemu control ssh stdin was unavailable"))?
+            .write_all(stdin_bytes)
+            .map_err(|error| format!("failed to write qemu control stdin: {error}"))?;
+        child
+            .wait_with_output()
+            .map_err(|error| format!("failed to wait for qemu control ssh command: {error}"))?
+    } else {
+        Command::new("ssh")
+            .args(&remote_args)
+            .output()
+            .map_err(|error| format!("failed to run qemu control ssh command: {error}"))?
+    };
+
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!(
+            "qemu control command `{}` failed: status={} stderr={}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+fn run_local_tar_extract(destination_root: &Path, archive: &[u8]) -> Result<(), String> {
+    let mut child = Command::new("tar")
+        .arg("xzf")
+        .arg("-")
+        .arg("-C")
+        .arg(destination_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to spawn local tar extract: {error}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| String::from("local tar extract stdin was unavailable"))?
+        .write_all(archive)
+        .map_err(|error| format!("failed to write local tar extract stdin: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to wait for local tar extract: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to extract staged replica archive into {}: status={} stderr={}",
+            destination_root.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+fn run_local_tar_archive(root: &Path, entry_name: &str) -> Result<Vec<u8>, String> {
+    let output = Command::new("tar")
+        .arg("czf")
+        .arg("-")
+        .arg("-C")
+        .arg(root)
+        .arg(entry_name)
+        .output()
+        .map_err(|error| format!("failed to run local tar archive: {error}"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!(
+            "failed to build staged replica archive from {}: status={} stderr={}",
+            root.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+fn prepare_log_path_for(metadata_path: &Path) -> PathBuf {
+    let mut path = metadata_path.to_path_buf();
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map_or_else(
+            || String::from("prepare"),
+            |value| format!("{value}.prepare"),
+        );
+    path.set_extension(extension);
+    path
+}
+
+fn copy_file_or_remove(source: &Path, destination: &Path) -> Result<(), String> {
+    match fs::read(source) {
+        Ok(bytes) => {
+            fs::write(destination, bytes).map_err(|error| {
+                format!(
+                    "failed to write copied file {}: {error}",
+                    destination.display()
+                )
+            })?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if destination.exists() {
+                fs::remove_file(destination).map_err(|remove_error| {
+                    format!(
+                        "failed to remove stale copied file {}: {remove_error}",
+                        destination.display()
+                    )
+                })?;
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!("failed to read {}: {error}", source.display())),
+    }
+}
+
 fn execute_qemu_control_run(
     layout: &QemuTestbedLayout,
     run_spec: &JepsenRunSpec,
 ) -> Result<Vec<JepsenHistoryEvent>, String> {
     let primary = primary_replica(layout)?;
-    let backup = first_backup_replica(layout)?;
+    let backup = first_backup_replica(layout, Some(primary.replica_id))?;
     let base_id = unique_probe_resource_id();
     match run_spec.workload {
         JepsenWorkloadFamily::ReservationContention => {
-            run_reservation_contention(layout, primary, base_id)
+            run_reservation_contention(layout, &primary, base_id)
         }
         JepsenWorkloadFamily::AmbiguousWriteRetry => {
-            run_ambiguous_write_retry(layout, primary, base_id)
+            run_ambiguous_write_retry(layout, &primary, base_id)
         }
         JepsenWorkloadFamily::FailoverReadFences => {
-            run_failover_read_fences(layout, primary, backup, base_id)
+            run_failover_read_fences(layout, &primary, &backup, base_id)
         }
         JepsenWorkloadFamily::ExpirationAndRecovery => {
-            run_expiration_and_recovery(layout, primary, base_id)
+            run_expiration_and_recovery(layout, &primary, base_id)
         }
     }
+}
+
+fn execute_qemu_crash_restart_run(
+    layout: &QemuTestbedLayout,
+    run_spec: &JepsenRunSpec,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let primary = primary_replica(layout)?;
+    let failover_target = first_backup_replica(layout, Some(primary.replica_id))?;
+    let supporting_backup = first_backup_replica(layout, Some(failover_target.replica_id))?;
+    let base_id = unique_probe_resource_id();
+    match run_spec.workload {
+        JepsenWorkloadFamily::ReservationContention => run_crash_restart_reservation_contention(
+            layout,
+            &primary,
+            &failover_target,
+            &supporting_backup,
+            base_id,
+        ),
+        JepsenWorkloadFamily::AmbiguousWriteRetry => run_crash_restart_ambiguous_retry(
+            layout,
+            &primary,
+            &failover_target,
+            &supporting_backup,
+            base_id,
+        ),
+        JepsenWorkloadFamily::FailoverReadFences => run_crash_restart_failover_reads(
+            layout,
+            &primary,
+            &failover_target,
+            &supporting_backup,
+            base_id,
+        ),
+        JepsenWorkloadFamily::ExpirationAndRecovery => run_crash_restart_expiration_recovery(
+            layout,
+            &primary,
+            &failover_target,
+            &supporting_backup,
+            base_id,
+        ),
+    }
+}
+
+fn execute_qemu_partition_heal_run(
+    layout: &QemuTestbedLayout,
+    run_spec: &JepsenRunSpec,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let primary = primary_replica(layout)?;
+    let failover_target = first_backup_replica(layout, Some(primary.replica_id))?;
+    let supporting_backup = first_backup_replica(layout, Some(failover_target.replica_id))?;
+    let base_id = unique_probe_resource_id();
+    match run_spec.workload {
+        JepsenWorkloadFamily::ReservationContention => run_partition_heal_reservation_contention(
+            layout,
+            &primary,
+            &failover_target,
+            &supporting_backup,
+            base_id,
+        ),
+        JepsenWorkloadFamily::AmbiguousWriteRetry => run_partition_heal_ambiguous_retry(
+            layout,
+            &primary,
+            &failover_target,
+            &supporting_backup,
+            base_id,
+        ),
+        JepsenWorkloadFamily::FailoverReadFences => run_partition_heal_failover_reads(
+            layout,
+            &primary,
+            &failover_target,
+            &supporting_backup,
+            base_id,
+        ),
+        JepsenWorkloadFamily::ExpirationAndRecovery => run_partition_heal_expiration_recovery(
+            layout,
+            &primary,
+            &failover_target,
+            &supporting_backup,
+            base_id,
+        ),
+    }
+}
+
+fn execute_qemu_mixed_failover_run(
+    layout: &QemuTestbedLayout,
+    run_spec: &JepsenRunSpec,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let primary = primary_replica(layout)?;
+    let failover_target = first_backup_replica(layout, Some(primary.replica_id))?;
+    let supporting_backup = first_backup_replica(layout, Some(failover_target.replica_id))?;
+    let base_id = unique_probe_resource_id();
+    match run_spec.workload {
+        JepsenWorkloadFamily::ReservationContention => Err(String::from(
+            "mixed failover runs are not defined for reservation_contention",
+        )),
+        JepsenWorkloadFamily::AmbiguousWriteRetry => run_mixed_failover_ambiguous_retry(
+            layout,
+            &primary,
+            &failover_target,
+            &supporting_backup,
+            base_id,
+        ),
+        JepsenWorkloadFamily::FailoverReadFences => run_mixed_failover_reads(
+            layout,
+            &primary,
+            &failover_target,
+            &supporting_backup,
+            base_id,
+        ),
+        JepsenWorkloadFamily::ExpirationAndRecovery => run_mixed_failover_expiration_recovery(
+            layout,
+            &primary,
+            &failover_target,
+            &supporting_backup,
+            base_id,
+        ),
+    }
+}
+
+fn request_remote_control_status(
+    layout: &QemuTestbedLayout,
+    replica: &LocalClusterReplicaConfig,
+) -> Result<ReplicaRuntimeStatus, String> {
+    let response_bytes = run_remote_tcp_request(
+        layout,
+        &replica.control_addr.ip().to_string(),
+        replica.control_addr.port(),
+        b"status",
+    )?;
+    let response = String::from_utf8(response_bytes).map_err(|error| {
+        format!(
+            "invalid control status utf8 for replica {}: {error}",
+            replica.replica_id.get()
+        )
+    })?;
+    decode_control_status_response(&response).map_err(|error| {
+        format!(
+            "invalid control status for replica {}: {error}",
+            replica.replica_id.get()
+        )
+    })
+}
+
+fn runtime_replica_configs(
+    layout: &QemuTestbedLayout,
+) -> Result<Vec<LocalClusterReplicaConfig>, String> {
+    let mut replicas = layout.replica_layout.replicas.clone();
+    for replica in &mut replicas {
+        let status = request_remote_control_status(layout, replica)?;
+        replica.role = status.role;
+    }
+    Ok(replicas)
+}
+
+fn primary_replica(layout: &QemuTestbedLayout) -> Result<LocalClusterReplicaConfig, String> {
+    runtime_replica_configs(layout)?
+        .into_iter()
+        .find(|replica| replica.role == ReplicaRole::Primary)
+        .ok_or_else(|| String::from("qemu cluster has no live primary"))
+}
+
+fn first_backup_replica(
+    layout: &QemuTestbedLayout,
+    exclude: Option<ReplicaId>,
+) -> Result<LocalClusterReplicaConfig, String> {
+    runtime_replica_configs(layout)?
+        .into_iter()
+        .find(|replica| {
+            replica.role == ReplicaRole::Backup
+                && exclude.is_none_or(|excluded| replica.replica_id != excluded)
+        })
+        .ok_or_else(|| String::from("qemu cluster has no live backup"))
+}
+
+fn runtime_replica_by_id(
+    layout: &QemuTestbedLayout,
+    replica_id: ReplicaId,
+) -> Result<LocalClusterReplicaConfig, String> {
+    runtime_replica_configs(layout)?
+        .into_iter()
+        .find(|replica| replica.replica_id == replica_id)
+        .ok_or_else(|| format!("qemu cluster has no replica {}", replica_id.get()))
+}
+
+fn maybe_crash_replica(layout: &QemuTestbedLayout, replica_id: ReplicaId) -> Result<(), String> {
+    match run_remote_control_command(
+        layout,
+        &[String::from("crash"), replica_id.get().to_string()],
+        None,
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) if error.contains("already stopped") => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn restart_replica(layout: &QemuTestbedLayout, replica_id: ReplicaId) -> Result<(), String> {
+    let _ = run_remote_control_command(
+        layout,
+        &[String::from("restart"), replica_id.get().to_string()],
+        None,
+    )?;
+    Ok(())
+}
+
+fn isolate_replica(layout: &QemuTestbedLayout, replica_id: ReplicaId) -> Result<(), String> {
+    let _ = run_remote_control_command(
+        layout,
+        &[String::from("isolate"), replica_id.get().to_string()],
+        None,
+    )?;
+    Ok(())
+}
+
+fn heal_replica(layout: &QemuTestbedLayout, replica_id: ReplicaId) -> Result<(), String> {
+    let _ = run_remote_control_command(
+        layout,
+        &[String::from("heal"), replica_id.get().to_string()],
+        None,
+    )?;
+    Ok(())
+}
+
+fn staged_replica_summary(
+    layout: &QemuTestbedLayout,
+    staged: &StagedReplicaWorkspace,
+) -> Result<(u64, Option<Lsn>, Option<Lsn>), String> {
+    let node = ReplicaNode::recover(
+        layout.replica_layout.core_config.clone(),
+        layout.replica_layout.engine_config,
+        ReplicaIdentity {
+            replica_id: staged.replica_id,
+            shard_id: layout.replica_layout.core_config.shard_id,
+        },
+        staged.paths.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to recover staged replica {} summary: {error:?}",
+            staged.replica_id.get()
+        )
+    })?;
+    Ok((
+        node.metadata().current_view,
+        node.metadata().commit_lsn,
+        node.highest_prepared_lsn(),
+    ))
+}
+
+fn rewrite_replica_from_source(
+    layout: &QemuTestbedLayout,
+    source: &StagedReplicaWorkspace,
+    target: &StagedReplicaWorkspace,
+    target_commit_lsn: Option<Lsn>,
+    new_view: u64,
+    new_role: ReplicaRole,
+) -> Result<(), String> {
+    let source_node = ReplicaNode::recover(
+        layout.replica_layout.core_config.clone(),
+        layout.replica_layout.engine_config,
+        ReplicaIdentity {
+            replica_id: source.replica_id,
+            shard_id: layout.replica_layout.core_config.shard_id,
+        },
+        source.paths.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to recover staged source replica {}: {error:?}",
+            source.replica_id.get()
+        )
+    })?;
+    let source_metadata = *source_node.metadata();
+    let source_prepare_log_path = source_node.prepare_log_path().to_path_buf();
+    drop(source_node);
+
+    if source.replica_id != target.replica_id {
+        copy_file_or_remove(&source.paths.snapshot_path, &target.paths.snapshot_path)?;
+        copy_file_or_remove(&source.paths.wal_path, &target.paths.wal_path)?;
+        copy_file_or_remove(
+            &source_prepare_log_path,
+            &prepare_log_path_for(&target.paths.metadata_path),
+        )?;
+    }
+
+    let target_identity = ReplicaIdentity {
+        replica_id: target.replica_id,
+        shard_id: layout.replica_layout.core_config.shard_id,
+    };
+    ReplicaMetadataFile::new(&target.paths.metadata_path)
+        .write_metadata(&ReplicaMetadata {
+            identity: target_identity,
+            current_view: source_metadata.current_view,
+            role: ReplicaRole::Backup,
+            commit_lsn: source_metadata.commit_lsn,
+            active_snapshot_lsn: source_metadata.active_snapshot_lsn,
+            last_normal_view: source_metadata.last_normal_view,
+            durable_vote: None,
+        })
+        .map_err(|error| {
+            format!(
+                "failed to write staged metadata for replica {}: {error:?}",
+                target.replica_id.get()
+            )
+        })?;
+
+    let mut target_node = ReplicaNode::recover(
+        layout.replica_layout.core_config.clone(),
+        layout.replica_layout.engine_config,
+        target_identity,
+        target.paths.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to recover rewritten staged replica {}: {error:?}",
+            target.replica_id.get()
+        )
+    })?;
+    if let Some(target_commit_lsn) = target_commit_lsn {
+        if target_node
+            .metadata()
+            .commit_lsn
+            .is_none_or(|commit_lsn| commit_lsn.get() < target_commit_lsn.get())
+        {
+            target_node
+                .enter_view_uncertain()
+                .map_err(|error| format!("failed to enter view uncertain: {error:?}"))?;
+            target_node
+                .reconstruct_committed_prefix_through(target_commit_lsn)
+                .map_err(|error| format!("failed to reconstruct committed prefix: {error:?}"))?;
+        }
+    }
+    target_node
+        .discard_uncommitted_suffix()
+        .map_err(|error| format!("failed to discard staged suffix: {error:?}"))?;
+    target_node
+        .configure_normal_role(new_view, new_role)
+        .map_err(|error| format!("failed to configure staged role: {error:?}"))?;
+    Ok(())
+}
+
+fn perform_failover(
+    layout: &QemuTestbedLayout,
+    old_primary: ReplicaId,
+    new_primary: ReplicaId,
+    supporting_backup: ReplicaId,
+) -> Result<(), String> {
+    maybe_crash_replica(layout, old_primary)?;
+    maybe_crash_replica(layout, new_primary)?;
+    maybe_crash_replica(layout, supporting_backup)?;
+
+    let new_primary_stage = StagedReplicaWorkspace::from_export(layout, new_primary)?;
+    let supporting_stage = StagedReplicaWorkspace::from_export(layout, supporting_backup)?;
+    let new_primary_summary = staged_replica_summary(layout, &new_primary_stage)?;
+    let supporting_summary = staged_replica_summary(layout, &supporting_stage)?;
+
+    let target_commit_lsn = new_primary_summary
+        .1
+        .max(supporting_summary.1)
+        .or_else(|| new_primary_summary.2.max(supporting_summary.2));
+    let new_view = new_primary_summary
+        .0
+        .max(supporting_summary.0)
+        .saturating_add(1);
+
+    let source = if supporting_summary.1.unwrap_or(Lsn(0)).get()
+        > new_primary_summary.1.unwrap_or(Lsn(0)).get()
+        || (supporting_summary.1 == new_primary_summary.1
+            && supporting_summary.2.unwrap_or(Lsn(0)).get()
+                > new_primary_summary.2.unwrap_or(Lsn(0)).get())
+    {
+        &supporting_stage
+    } else {
+        &new_primary_stage
+    };
+
+    rewrite_replica_from_source(
+        layout,
+        source,
+        &new_primary_stage,
+        target_commit_lsn,
+        new_view,
+        ReplicaRole::Primary,
+    )?;
+    rewrite_replica_from_source(
+        layout,
+        source,
+        &supporting_stage,
+        target_commit_lsn,
+        new_view,
+        ReplicaRole::Backup,
+    )?;
+
+    supporting_stage.import_to_remote(layout)?;
+    new_primary_stage.import_to_remote(layout)?;
+    restart_replica(layout, supporting_backup)?;
+    restart_replica(layout, new_primary)?;
+    Ok(())
+}
+
+fn perform_rejoin(
+    layout: &QemuTestbedLayout,
+    current_primary: ReplicaId,
+    target_replica: ReplicaId,
+) -> Result<(), String> {
+    maybe_crash_replica(layout, target_replica)?;
+    let source_stage = StagedReplicaWorkspace::from_export(layout, current_primary)?;
+    let source_summary = staged_replica_summary(layout, &source_stage)?;
+    let target_stage = StagedReplicaWorkspace::new(target_replica)?;
+    rewrite_replica_from_source(
+        layout,
+        &source_stage,
+        &target_stage,
+        source_summary.1,
+        source_summary.0,
+        ReplicaRole::Backup,
+    )?;
+    target_stage.import_to_remote(layout)?;
+    restart_replica(layout, target_replica)?;
+    Ok(())
+}
+
+fn run_crash_restart_reservation_contention(
+    layout: &QemuTestbedLayout,
+    primary: &LocalClusterReplicaConfig,
+    failover_target: &LocalClusterReplicaConfig,
+    supporting_backup: &LocalClusterReplicaConfig,
+    base_id: u128,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let resource_id = ResourceId(base_id);
+    create_qemu_resource(layout, primary, resource_id, OperationId(base_id + 100))?;
+
+    maybe_crash_replica(layout, primary.replica_id)?;
+    perform_failover(
+        layout,
+        primary.replica_id,
+        failover_target.replica_id,
+        supporting_backup.replica_id,
+    )?;
+
+    let current_primary = primary_replica(layout)?;
+    let mut history = HistoryBuilder::default();
+    let first = reserve_event(
+        layout,
+        &current_primary,
+        OperationId(base_id + 1),
+        resource_id,
+        HolderId(101),
+        Slot(10),
+        5,
+    )?;
+    history.push(primary_process_name(&current_primary), first.0, first.1);
+
+    perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
+
+    let second = reserve_event(
+        layout,
+        &current_primary,
+        OperationId(base_id + 2),
+        resource_id,
+        HolderId(202),
+        Slot(11),
+        5,
+    )?;
+    history.push(primary_process_name(&current_primary), second.0, second.1);
+    Ok(history.finish())
+}
+
+fn run_crash_restart_ambiguous_retry(
+    layout: &QemuTestbedLayout,
+    primary: &LocalClusterReplicaConfig,
+    failover_target: &LocalClusterReplicaConfig,
+    supporting_backup: &LocalClusterReplicaConfig,
+    base_id: u128,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let resource_id = ResourceId(base_id + 1);
+    let operation_id = OperationId(base_id + 10);
+    create_qemu_resource(layout, primary, resource_id, OperationId(base_id + 101))?;
+
+    maybe_crash_replica(layout, failover_target.replica_id)?;
+    maybe_crash_replica(layout, supporting_backup.replica_id)?;
+
+    let mut history = HistoryBuilder::default();
+    let first = reserve_event(
+        layout,
+        primary,
+        operation_id,
+        resource_id,
+        HolderId(303),
+        Slot(20),
+        4,
+    )?;
+    history.push(primary_process_name(primary), first.0, first.1);
+
+    maybe_crash_replica(layout, primary.replica_id)?;
+    perform_failover(
+        layout,
+        primary.replica_id,
+        failover_target.replica_id,
+        supporting_backup.replica_id,
+    )?;
+
+    let current_primary = primary_replica(layout)?;
+    let retry = reserve_event(
+        layout,
+        &current_primary,
+        operation_id,
+        resource_id,
+        HolderId(303),
+        Slot(20),
+        4,
+    )?;
+    history.push(primary_process_name(&current_primary), retry.0, retry.1);
+
+    perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
+    Ok(history.finish())
+}
+
+fn run_crash_restart_failover_reads(
+    layout: &QemuTestbedLayout,
+    primary: &LocalClusterReplicaConfig,
+    failover_target: &LocalClusterReplicaConfig,
+    supporting_backup: &LocalClusterReplicaConfig,
+    base_id: u128,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let resource_id = ResourceId(base_id + 2);
+    create_qemu_resource(layout, primary, resource_id, OperationId(base_id + 102))?;
+
+    let mut history = HistoryBuilder::default();
+    let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
+        layout,
+        primary,
+        OperationId(base_id + 20),
+        resource_id,
+        HolderId(404),
+        Slot(30),
+        6,
+    )?;
+    let reserve_commit = reserve_commit.ok_or_else(|| {
+        String::from("crash-restart failover_read_fences expected one committed reserve")
+    })?;
+    history.push(
+        primary_process_name(primary),
+        reserve_operation,
+        reserve_outcome,
+    );
+
+    maybe_crash_replica(layout, primary.replica_id)?;
+    perform_failover(
+        layout,
+        primary.replica_id,
+        failover_target.replica_id,
+        supporting_backup.replica_id,
+    )?;
+
+    let current_primary = primary_replica(layout)?;
+    let primary_read = reservation_read_event(
+        layout,
+        &current_primary,
+        reserve_commit.reservation_id,
+        Slot(30),
+        Some(reserve_commit.applied_lsn),
+    )?;
+    history.push(
+        primary_process_name(&current_primary),
+        primary_read.0,
+        primary_read.1,
+    );
+
+    perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
+    let old_primary = runtime_replica_by_id(layout, primary.replica_id)?;
+    let stale_read = reservation_read_event(
+        layout,
+        &old_primary,
+        reserve_commit.reservation_id,
+        Slot(30),
+        Some(reserve_commit.applied_lsn),
+    )?;
+    history.push(
+        backup_process_name(&old_primary),
+        stale_read.0,
+        stale_read.1,
+    );
+    Ok(history.finish())
+}
+
+fn run_crash_restart_expiration_recovery(
+    layout: &QemuTestbedLayout,
+    primary: &LocalClusterReplicaConfig,
+    failover_target: &LocalClusterReplicaConfig,
+    supporting_backup: &LocalClusterReplicaConfig,
+    base_id: u128,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let resource_id = ResourceId(base_id + 3);
+    create_qemu_resource(layout, primary, resource_id, OperationId(base_id + 103))?;
+
+    let mut history = HistoryBuilder::default();
+    let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
+        layout,
+        primary,
+        OperationId(base_id + 30),
+        resource_id,
+        HolderId(505),
+        Slot(40),
+        2,
+    )?;
+    let reserve_commit = reserve_commit.ok_or_else(|| {
+        String::from("crash-restart expiration_and_recovery expected one committed reserve")
+    })?;
+    history.push(
+        primary_process_name(primary),
+        reserve_operation,
+        reserve_outcome,
+    );
+
+    maybe_crash_replica(layout, primary.replica_id)?;
+    perform_failover(
+        layout,
+        primary.replica_id,
+        failover_target.replica_id,
+        supporting_backup.replica_id,
+    )?;
+
+    let current_primary = primary_replica(layout)?;
+    let tick = tick_expirations_event(
+        layout,
+        &current_primary,
+        OperationId(base_id + 31),
+        Slot(42),
+        &[JepsenExpiredReservation {
+            resource_id,
+            holder_id: 505,
+            reservation_id: reserve_commit.reservation_id.get(),
+            released_lsn: None,
+        }],
+    )?;
+    let tick_lsn = tick.2.ok_or_else(|| {
+        String::from("crash-restart expiration_and_recovery expected one committed expiration tick")
+    })?;
+    history.push(primary_process_name(&current_primary), tick.0, tick.1);
+
+    let resource_read =
+        resource_available_event(layout, &current_primary, resource_id, Some(tick_lsn))?;
+    history.push(
+        primary_process_name(&current_primary),
+        resource_read.0,
+        resource_read.1,
+    );
+    let reservation_read = reservation_read_event(
+        layout,
+        &current_primary,
+        reserve_commit.reservation_id,
+        Slot(42),
+        Some(tick_lsn),
+    )?;
+    history.push(
+        primary_process_name(&current_primary),
+        reservation_read.0,
+        reservation_read.1,
+    );
+
+    perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
+    Ok(history.finish())
+}
+
+fn run_partition_heal_reservation_contention(
+    layout: &QemuTestbedLayout,
+    primary: &LocalClusterReplicaConfig,
+    failover_target: &LocalClusterReplicaConfig,
+    supporting_backup: &LocalClusterReplicaConfig,
+    base_id: u128,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let resource_id = ResourceId(base_id + 10);
+    let operation_id = OperationId(base_id + 11);
+    create_qemu_resource(layout, primary, resource_id, OperationId(base_id + 110))?;
+
+    isolate_replica(layout, failover_target.replica_id)?;
+    isolate_replica(layout, supporting_backup.replica_id)?;
+
+    let mut history = HistoryBuilder::default();
+    let first = reserve_event(
+        layout,
+        primary,
+        operation_id,
+        resource_id,
+        HolderId(601),
+        Slot(50),
+        5,
+    )?;
+    history.push(primary_process_name(primary), first.0, first.1);
+
+    heal_replica(layout, failover_target.replica_id)?;
+    heal_replica(layout, supporting_backup.replica_id)?;
+    maybe_crash_replica(layout, primary.replica_id)?;
+    perform_failover(
+        layout,
+        primary.replica_id,
+        failover_target.replica_id,
+        supporting_backup.replica_id,
+    )?;
+
+    let current_primary = primary_replica(layout)?;
+    let retry = reserve_event(
+        layout,
+        &current_primary,
+        operation_id,
+        resource_id,
+        HolderId(601),
+        Slot(50),
+        5,
+    )?;
+    history.push(primary_process_name(&current_primary), retry.0, retry.1);
+    let second = reserve_event(
+        layout,
+        &current_primary,
+        OperationId(base_id + 12),
+        resource_id,
+        HolderId(602),
+        Slot(51),
+        5,
+    )?;
+    history.push(primary_process_name(&current_primary), second.0, second.1);
+
+    perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
+    Ok(history.finish())
+}
+
+fn run_partition_heal_ambiguous_retry(
+    layout: &QemuTestbedLayout,
+    primary: &LocalClusterReplicaConfig,
+    failover_target: &LocalClusterReplicaConfig,
+    supporting_backup: &LocalClusterReplicaConfig,
+    base_id: u128,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let resource_id = ResourceId(base_id + 11);
+    let operation_id = OperationId(base_id + 20);
+    create_qemu_resource(layout, primary, resource_id, OperationId(base_id + 120))?;
+
+    isolate_replica(layout, failover_target.replica_id)?;
+    isolate_replica(layout, supporting_backup.replica_id)?;
+
+    let mut history = HistoryBuilder::default();
+    let first = reserve_event(
+        layout,
+        primary,
+        operation_id,
+        resource_id,
+        HolderId(603),
+        Slot(52),
+        4,
+    )?;
+    history.push(primary_process_name(primary), first.0, first.1);
+
+    heal_replica(layout, failover_target.replica_id)?;
+    heal_replica(layout, supporting_backup.replica_id)?;
+    maybe_crash_replica(layout, primary.replica_id)?;
+    perform_failover(
+        layout,
+        primary.replica_id,
+        failover_target.replica_id,
+        supporting_backup.replica_id,
+    )?;
+
+    let current_primary = primary_replica(layout)?;
+    let retry = reserve_event(
+        layout,
+        &current_primary,
+        operation_id,
+        resource_id,
+        HolderId(603),
+        Slot(52),
+        4,
+    )?;
+    history.push(primary_process_name(&current_primary), retry.0, retry.1);
+    perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
+    Ok(history.finish())
+}
+
+fn run_partition_heal_failover_reads(
+    layout: &QemuTestbedLayout,
+    primary: &LocalClusterReplicaConfig,
+    failover_target: &LocalClusterReplicaConfig,
+    supporting_backup: &LocalClusterReplicaConfig,
+    base_id: u128,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let resource_id = ResourceId(base_id + 12);
+    create_qemu_resource(layout, primary, resource_id, OperationId(base_id + 130))?;
+
+    let mut history = HistoryBuilder::default();
+    let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
+        layout,
+        primary,
+        OperationId(base_id + 21),
+        resource_id,
+        HolderId(604),
+        Slot(53),
+        6,
+    )?;
+    let reserve_commit = reserve_commit.ok_or_else(|| {
+        String::from("partition-heal failover_read_fences expected one committed reserve")
+    })?;
+    history.push(
+        primary_process_name(primary),
+        reserve_operation,
+        reserve_outcome,
+    );
+
+    isolate_replica(layout, failover_target.replica_id)?;
+    isolate_replica(layout, supporting_backup.replica_id)?;
+    let minority_write = reserve_event(
+        layout,
+        primary,
+        OperationId(base_id + 22),
+        resource_id,
+        HolderId(605),
+        Slot(54),
+        2,
+    )?;
+    history.push(
+        primary_process_name(primary),
+        minority_write.0,
+        minority_write.1,
+    );
+
+    heal_replica(layout, failover_target.replica_id)?;
+    heal_replica(layout, supporting_backup.replica_id)?;
+    maybe_crash_replica(layout, primary.replica_id)?;
+    perform_failover(
+        layout,
+        primary.replica_id,
+        failover_target.replica_id,
+        supporting_backup.replica_id,
+    )?;
+
+    let current_primary = primary_replica(layout)?;
+    let primary_read = reservation_read_event(
+        layout,
+        &current_primary,
+        reserve_commit.reservation_id,
+        Slot(54),
+        Some(reserve_commit.applied_lsn),
+    )?;
+    history.push(
+        primary_process_name(&current_primary),
+        primary_read.0,
+        primary_read.1,
+    );
+    perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
+    let old_primary = runtime_replica_by_id(layout, primary.replica_id)?;
+    let stale_read = reservation_read_event(
+        layout,
+        &old_primary,
+        reserve_commit.reservation_id,
+        Slot(54),
+        Some(reserve_commit.applied_lsn),
+    )?;
+    history.push(
+        backup_process_name(&old_primary),
+        stale_read.0,
+        stale_read.1,
+    );
+    Ok(history.finish())
+}
+
+fn run_partition_heal_expiration_recovery(
+    layout: &QemuTestbedLayout,
+    primary: &LocalClusterReplicaConfig,
+    failover_target: &LocalClusterReplicaConfig,
+    supporting_backup: &LocalClusterReplicaConfig,
+    base_id: u128,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let resource_id = ResourceId(base_id + 13);
+    create_qemu_resource(layout, primary, resource_id, OperationId(base_id + 140))?;
+
+    let mut history = HistoryBuilder::default();
+    let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
+        layout,
+        primary,
+        OperationId(base_id + 23),
+        resource_id,
+        HolderId(606),
+        Slot(55),
+        2,
+    )?;
+    let reserve_commit = reserve_commit.ok_or_else(|| {
+        String::from("partition-heal expiration_and_recovery expected one committed reserve")
+    })?;
+    history.push(
+        primary_process_name(primary),
+        reserve_operation,
+        reserve_outcome,
+    );
+
+    isolate_replica(layout, failover_target.replica_id)?;
+    isolate_replica(layout, supporting_backup.replica_id)?;
+    let failed_tick = tick_expirations_event(
+        layout,
+        primary,
+        OperationId(base_id + 24),
+        Slot(57),
+        &[JepsenExpiredReservation {
+            resource_id,
+            holder_id: 606,
+            reservation_id: reserve_commit.reservation_id.get(),
+            released_lsn: None,
+        }],
+    )?;
+    history.push(primary_process_name(primary), failed_tick.0, failed_tick.1);
+
+    heal_replica(layout, failover_target.replica_id)?;
+    heal_replica(layout, supporting_backup.replica_id)?;
+    maybe_crash_replica(layout, primary.replica_id)?;
+    perform_failover(
+        layout,
+        primary.replica_id,
+        failover_target.replica_id,
+        supporting_backup.replica_id,
+    )?;
+
+    let current_primary = primary_replica(layout)?;
+    let successful_tick = tick_expirations_event(
+        layout,
+        &current_primary,
+        OperationId(base_id + 24),
+        Slot(57),
+        &[JepsenExpiredReservation {
+            resource_id,
+            holder_id: 606,
+            reservation_id: reserve_commit.reservation_id.get(),
+            released_lsn: None,
+        }],
+    )?;
+    let tick_lsn = successful_tick.2.ok_or_else(|| {
+        String::from(
+            "partition-heal expiration_and_recovery expected one committed expiration tick",
+        )
+    })?;
+    history.push(
+        primary_process_name(&current_primary),
+        successful_tick.0,
+        successful_tick.1,
+    );
+    let resource_read =
+        resource_available_event(layout, &current_primary, resource_id, Some(tick_lsn))?;
+    history.push(
+        primary_process_name(&current_primary),
+        resource_read.0,
+        resource_read.1,
+    );
+    perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
+    Ok(history.finish())
+}
+
+fn run_mixed_failover_ambiguous_retry(
+    layout: &QemuTestbedLayout,
+    primary: &LocalClusterReplicaConfig,
+    failover_target: &LocalClusterReplicaConfig,
+    supporting_backup: &LocalClusterReplicaConfig,
+    base_id: u128,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let resource_id = ResourceId(base_id + 20);
+    let operation_id = OperationId(base_id + 30);
+    create_qemu_resource(layout, primary, resource_id, OperationId(base_id + 150))?;
+
+    maybe_crash_replica(layout, failover_target.replica_id)?;
+    isolate_replica(layout, supporting_backup.replica_id)?;
+
+    let mut history = HistoryBuilder::default();
+    let first = reserve_event(
+        layout,
+        primary,
+        operation_id,
+        resource_id,
+        HolderId(701),
+        Slot(60),
+        4,
+    )?;
+    history.push(primary_process_name(primary), first.0, first.1);
+
+    maybe_crash_replica(layout, primary.replica_id)?;
+    heal_replica(layout, supporting_backup.replica_id)?;
+    perform_failover(
+        layout,
+        primary.replica_id,
+        failover_target.replica_id,
+        supporting_backup.replica_id,
+    )?;
+
+    let current_primary = primary_replica(layout)?;
+    let retry = reserve_event(
+        layout,
+        &current_primary,
+        operation_id,
+        resource_id,
+        HolderId(701),
+        Slot(60),
+        4,
+    )?;
+    history.push(primary_process_name(&current_primary), retry.0, retry.1);
+    perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
+    Ok(history.finish())
+}
+
+fn run_mixed_failover_reads(
+    layout: &QemuTestbedLayout,
+    primary: &LocalClusterReplicaConfig,
+    failover_target: &LocalClusterReplicaConfig,
+    supporting_backup: &LocalClusterReplicaConfig,
+    base_id: u128,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let resource_id = ResourceId(base_id + 21);
+    create_qemu_resource(layout, primary, resource_id, OperationId(base_id + 160))?;
+
+    let mut history = HistoryBuilder::default();
+    let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
+        layout,
+        primary,
+        OperationId(base_id + 31),
+        resource_id,
+        HolderId(702),
+        Slot(61),
+        6,
+    )?;
+    let reserve_commit = reserve_commit
+        .ok_or_else(|| String::from("mixed failover read fences expected one committed reserve"))?;
+    history.push(
+        primary_process_name(primary),
+        reserve_operation,
+        reserve_outcome,
+    );
+
+    isolate_replica(layout, supporting_backup.replica_id)?;
+    maybe_crash_replica(layout, primary.replica_id)?;
+    heal_replica(layout, supporting_backup.replica_id)?;
+    perform_failover(
+        layout,
+        primary.replica_id,
+        failover_target.replica_id,
+        supporting_backup.replica_id,
+    )?;
+
+    let current_primary = primary_replica(layout)?;
+    let primary_read = reservation_read_event(
+        layout,
+        &current_primary,
+        reserve_commit.reservation_id,
+        Slot(61),
+        Some(reserve_commit.applied_lsn),
+    )?;
+    history.push(
+        primary_process_name(&current_primary),
+        primary_read.0,
+        primary_read.1,
+    );
+    perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
+    let old_primary = runtime_replica_by_id(layout, primary.replica_id)?;
+    let stale_read = reservation_read_event(
+        layout,
+        &old_primary,
+        reserve_commit.reservation_id,
+        Slot(61),
+        Some(reserve_commit.applied_lsn),
+    )?;
+    history.push(
+        backup_process_name(&old_primary),
+        stale_read.0,
+        stale_read.1,
+    );
+    Ok(history.finish())
+}
+
+fn run_mixed_failover_expiration_recovery(
+    layout: &QemuTestbedLayout,
+    primary: &LocalClusterReplicaConfig,
+    failover_target: &LocalClusterReplicaConfig,
+    supporting_backup: &LocalClusterReplicaConfig,
+    base_id: u128,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let resource_id = ResourceId(base_id + 22);
+    create_qemu_resource(layout, primary, resource_id, OperationId(base_id + 170))?;
+
+    let mut history = HistoryBuilder::default();
+    let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
+        layout,
+        primary,
+        OperationId(base_id + 32),
+        resource_id,
+        HolderId(703),
+        Slot(62),
+        2,
+    )?;
+    let reserve_commit = reserve_commit.ok_or_else(|| {
+        String::from("mixed failover expiration_and_recovery expected one committed reserve")
+    })?;
+    history.push(
+        primary_process_name(primary),
+        reserve_operation,
+        reserve_outcome,
+    );
+
+    isolate_replica(layout, supporting_backup.replica_id)?;
+    maybe_crash_replica(layout, primary.replica_id)?;
+    heal_replica(layout, supporting_backup.replica_id)?;
+    perform_failover(
+        layout,
+        primary.replica_id,
+        failover_target.replica_id,
+        supporting_backup.replica_id,
+    )?;
+
+    let current_primary = primary_replica(layout)?;
+    let tick = tick_expirations_event(
+        layout,
+        &current_primary,
+        OperationId(base_id + 33),
+        Slot(64),
+        &[JepsenExpiredReservation {
+            resource_id,
+            holder_id: 703,
+            reservation_id: reserve_commit.reservation_id.get(),
+            released_lsn: None,
+        }],
+    )?;
+    let tick_lsn = tick.2.ok_or_else(|| {
+        String::from(
+            "mixed failover expiration_and_recovery expected one committed expiration tick",
+        )
+    })?;
+    history.push(primary_process_name(&current_primary), tick.0, tick.1);
+    let resource_read =
+        resource_available_event(layout, &current_primary, resource_id, Some(tick_lsn))?;
+    history.push(
+        primary_process_name(&current_primary),
+        resource_read.0,
+        resource_read.1,
+    );
+    perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
+    Ok(history.finish())
 }
 
 fn run_reservation_contention(
@@ -642,24 +1992,6 @@ fn run_expiration_and_recovery(
         reservation_read.1,
     );
     Ok(history.finish())
-}
-
-fn primary_replica(layout: &QemuTestbedLayout) -> Result<&LocalClusterReplicaConfig, String> {
-    layout
-        .replica_layout
-        .replicas
-        .iter()
-        .find(|replica| replica.role == ReplicaRole::Primary)
-        .ok_or_else(|| String::from("qemu layout has no configured primary"))
-}
-
-fn first_backup_replica(layout: &QemuTestbedLayout) -> Result<&LocalClusterReplicaConfig, String> {
-    layout
-        .replica_layout
-        .replicas
-        .iter()
-        .find(|replica| replica.role == ReplicaRole::Backup)
-        .ok_or_else(|| String::from("qemu layout has no configured backup"))
 }
 
 fn create_qemu_resource(
@@ -1247,16 +2579,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn supported_qemu_run_rejects_non_control_nemesis() {
-        let error = ensure_supported_qemu_run(&JepsenRunSpec {
-            run_id: String::from("failover"),
-            workload: JepsenWorkloadFamily::FailoverReadFences,
-            nemesis: JepsenNemesisFamily::CrashRestart,
-            minimum_fault_window_secs: Some(60),
-            release_blocking: true,
-        })
-        .unwrap_err();
-        assert!(error.contains("supports only control runs"));
+    fn release_gate_plan_includes_faulted_qemu_runs() {
+        let runs = release_gate_plan();
+        assert!(runs.iter().any(|run| {
+            run.workload == JepsenWorkloadFamily::FailoverReadFences
+                && run.nemesis == JepsenNemesisFamily::CrashRestart
+        }));
+        assert!(runs.iter().any(|run| {
+            run.workload == JepsenWorkloadFamily::ExpirationAndRecovery
+                && run.nemesis == JepsenNemesisFamily::MixedFailover
+        }));
     }
 
     #[test]

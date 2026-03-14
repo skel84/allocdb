@@ -774,6 +774,17 @@ fn decode_status_response(response: &str) -> Result<ReplicaRuntimeStatus, Contro
     })
 }
 
+/// Decodes one text control-status payload returned by a replica daemon.
+///
+/// # Errors
+///
+/// Returns [`ControlProtocolError`] if the payload is malformed or contains one remote error.
+pub fn decode_control_status_response(
+    response: &str,
+) -> Result<ReplicaRuntimeStatus, ControlProtocolError> {
+    decode_status_response(response)
+}
+
 fn control_status_error_is_transient(error: &ControlProtocolError) -> bool {
     matches!(
         error,

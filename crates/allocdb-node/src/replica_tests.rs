@@ -11,8 +11,9 @@ use crate::engine::{EngineConfig, SingleNodeEngine};
 use crate::replica::{
     DurableVote, ReplicaFaultReason, ReplicaId, ReplicaIdentity, ReplicaMetadata,
     ReplicaMetadataDecodeError, ReplicaMetadataFile, ReplicaMetadataFileError,
-    ReplicaMetadataLoadError, ReplicaNode, ReplicaNodeStatus, ReplicaPaths, ReplicaPreparedEntry,
-    ReplicaRole, ReplicaStartupValidationError, prepare_log_path,
+    ReplicaMetadataLoadError, ReplicaNode, ReplicaNodeStatus, ReplicaPaths,
+    ReplicaPrepareLogDecodeError, ReplicaPrepareLogLoadError, ReplicaPreparedEntry, ReplicaRole,
+    ReplicaStartupValidationError, prepare_log_path,
 };
 
 fn test_path(name: &str, extension: &str) -> PathBuf {
@@ -277,6 +278,99 @@ fn replica_prepare_and_commit_keep_apply_gated_by_commit() {
             .resource(ResourceId(11))
             .is_some()
     );
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_recover_restores_prepared_suffix_from_prepare_log() {
+    let paths = ReplicaPaths::new(
+        metadata_path("recover-prepare-log"),
+        snapshot_path("recover-prepare-log"),
+        wal_path("recover-prepare-log"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+
+    let payload = encode_client_request(create(42, 1));
+    let entry = node.prepare_client_request(Slot(9), &payload).unwrap();
+    drop(node);
+
+    let recovered =
+        ReplicaNode::recover(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+
+    assert_eq!(recovered.status(), ReplicaNodeStatus::Active);
+    assert_eq!(recovered.metadata().current_view, 1);
+    assert_eq!(recovered.metadata().role, ReplicaRole::Primary);
+    assert_eq!(recovered.metadata().commit_lsn, None);
+    assert_eq!(recovered.prepared_len(), 1);
+    assert_eq!(recovered.prepared_entry(entry.lsn), Some(&entry));
+    assert_eq!(recovered.engine().unwrap().db().last_applied_lsn(), None);
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_open_faults_on_corrupt_prepare_log_bytes() {
+    let paths = ReplicaPaths::new(
+        metadata_path("corrupt-prepare-log"),
+        snapshot_path("corrupt-prepare-log"),
+        wal_path("corrupt-prepare-log"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+    let payload = encode_client_request(create(77, 1));
+    node.prepare_client_request(Slot(3), &payload).unwrap();
+    drop(node);
+
+    fs::write(prepare_log_path(&paths.metadata_path), [0x01, 0x02, 0x03]).unwrap();
+
+    let faulted =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+
+    assert_faulted(
+        &faulted,
+        ReplicaFaultReason::PrepareLogLoad(ReplicaPrepareLogLoadError::Decode(
+            ReplicaPrepareLogDecodeError::BufferTooShort,
+        )),
+    );
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_recover_faults_when_prepare_log_lsn_skips_commit_boundary() {
+    let paths = ReplicaPaths::new(
+        metadata_path("prepare-log-gap"),
+        snapshot_path("prepare-log-gap"),
+        wal_path("prepare-log-gap"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+    let payload = encode_client_request(create(88, 1));
+    let entry = node.prepare_client_request(Slot(4), &payload).unwrap();
+    drop(node);
+
+    let prepare_log = prepare_log_path(&paths.metadata_path);
+    let mut bytes = fs::read(&prepare_log).unwrap();
+    let lsn_offset = 4 + 1 + 8 + 1 + 8;
+    bytes[lsn_offset..lsn_offset + 8].copy_from_slice(&2_u64.to_le_bytes());
+    fs::write(&prepare_log, &bytes).unwrap();
+
+    let faulted =
+        ReplicaNode::recover(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+
+    assert_faulted(
+        &faulted,
+        ReplicaFaultReason::Validation(ReplicaStartupValidationError::PreparedOrderMismatch {
+            expected_lsn: Lsn(1),
+            found_lsn: Lsn(2),
+        }),
+    );
+    assert!(faulted.prepared_entry(entry.lsn).is_none());
 
     cleanup(&paths);
 }

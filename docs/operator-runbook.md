@@ -117,7 +117,7 @@ Command surface:
 - `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- status --workspace <path>`
 - `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- stop --workspace <path>`
 - `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- ssh-control --workspace <path>`
-- `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- control --workspace <path> -- <status|isolate|heal|crash|restart|reboot|collect-logs> ...`
+- `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- control --workspace <path> -- <status|isolate|heal|crash|restart|reboot|export-replica|import-replica|collect-logs> ...`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- analyze --history-file <history.txt>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-qemu-surface --workspace <path>`
@@ -180,6 +180,8 @@ Current control hooks:
 - `isolate`, `heal`, `crash`, and `restart` SSH into the target replica guest and reuse the
   existing local fault-control commands there
 - `reboot` reboots one target replica guest through the control node
+- `export-replica` and `import-replica` stream one replica workspace through the control guest so
+  host-side tools can stage failover and rejoin rewrites without inventing a second recovery path
 - `collect-logs` gathers replica `journalctl`, `cluster-faults.txt`, `cluster-timeline.log`, and
   control-status snapshots under the control guest
 
@@ -188,10 +190,10 @@ Current limits:
 - the first QEMU testbed still depends on one supported cloud image already being available or
   downloadable on the host
 - `verify-qemu-surface` still proves only one basic metrics plus primary submit/read round trip
-- `run-qemu` now executes the `*-control` Jepsen runs, including one real replicated
-  `tick_expirations` flow, but crash/partition/mixed-failover runs remain blocked
-- automated failover/view-change orchestration is still missing from the external runtime, so the
-  release-blocking nemesis runs remain follow-on work
+- `run-qemu` now executes the documented Jepsen control and nemesis runs, but it still drives one
+  scripted gate scenario at a time rather than one long-running soak with independent clients
+- failover and rejoin now use host-side staged workspace rewrites, so the operator still needs one
+  prepared QEMU testbed and enough local disk for fetched/pushed replica archives during those runs
 
 ## Single-Node Engine
 

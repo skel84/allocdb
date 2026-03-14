@@ -115,7 +115,7 @@
     stale successful reads, double allocation, and early reuse
 - Host-side Jepsen harness slice:
   - one release-gate matrix planner, one retry-aware history codec/analyzer, one host-side artifact bundler for duplicate-execution, double-allocation, stale-read, early-expiration, unresolved-ambiguity, and fetched QEMU-log checks, plus one explicit `verify-qemu-surface` probe that exercises one real QEMU metrics round trip on every replica and one real primary submit/read round trip through the live replicated protocol surface
-  - one real `run-qemu` executor for the `*-control` runs, with persisted histories and artifact bundles for hot-resource contention, stable-`operation_id` retry replay, strict-primary read rejection on backups, and replicated `tick_expirations` through the external runtime
+  - one real `run-qemu` executor for the full documented release-gate matrix, with persisted histories and artifact bundles for control, crash-restart, partition-heal, and mixed-failover runs, plus host-side failover/rejoin orchestration built from QEMU replica workspace export/import and staged `ReplicaNode::recover(...)` rewrites
 - Replicated node scaffolding:
   - dedicated replica metadata file with temp-write, rename, and directory-sync durability
   - persisted replica identity, role, view, commit point, snapshot anchor, last-normal view, and
@@ -202,8 +202,8 @@
   - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
 ## Current Focus
-- `M8-T04` now has one real external control-run executor: the live runtime surface covers replicated `tick_expirations`, and `allocdb-jepsen run-qemu` can drive the documented no-nemesis control workloads against the QEMU cluster with archived histories
-- the remaining blocker is external failover orchestration, not the basic client/protocol or control-run surface: the next target is to add crash/partition/mixed-failover execution so the release-blocking Jepsen nemesis runs can go green
+- `M8-T04` now has one real external Jepsen executor for the documented release-gate matrix: the live runtime surface covers replicated `submit`, strict reads, and `tick_expirations`, while `allocdb-jepsen run-qemu` can drive control, crash-restart, partition-heal, and mixed-failover runs with archived histories and host-side failover/rejoin cutovers
+- the next honest step is operational, not architectural: run the full QEMU matrix end to end, capture artifacts, and decide whether the roadmap should open a post-M8 hardening milestone or declare the current queue complete
 ## How To Check Progress
 - implementation status: [work-breakdown.md](./work-breakdown.md)
 - milestone sequencing: [roadmap.md](./roadmap.md)
