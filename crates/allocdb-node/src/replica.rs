@@ -761,6 +761,13 @@ impl ReplicaNode {
         &self.prepare_log_file.path
     }
 
+    #[must_use]
+    pub fn first_uncommitted_prepared_entry(&self) -> Option<ReplicaPreparedEntry> {
+        self.prepared_entries
+            .first_key_value()
+            .map(|(_, entry)| entry.clone())
+    }
+
     /// Persists one local checkpoint through the wrapped single-node engine and updates the active
     /// snapshot anchor in replica metadata.
     ///

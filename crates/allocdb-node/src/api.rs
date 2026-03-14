@@ -141,7 +141,13 @@ pub enum SubmissionFailureCode {
 }
 
 impl SubmissionFailure {
-    fn from_submission_error(error: &SubmissionError) -> Self {
+    #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics only if one in-memory length field exceeds `u64`, which cannot happen on supported
+    /// targets because those fields are already bounded by `usize`.
+    pub fn from_submission_error(error: &SubmissionError) -> Self {
         let category = error.category();
         let code = match *error {
             SubmissionError::EngineHalted => SubmissionFailureCode::EngineHalted,

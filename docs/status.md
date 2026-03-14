@@ -114,10 +114,10 @@
   - retry-aware history interpretation and release-blocking invariants for duplicate execution,
     stale successful reads, double allocation, and early reuse
 - Host-side Jepsen harness slice:
-  - one release-gate matrix planner, one retry-aware history codec/analyzer, one host-side artifact
-    bundler for duplicate-execution, double-allocation, stale-read, early-expiration,
+  - one release-gate matrix planner, one retry-aware history codec/analyzer, one host-side
+    artifact bundler for duplicate-execution, double-allocation, stale-read, early-expiration,
     unresolved-ambiguity, and fetched QEMU-log checks, plus one explicit `verify-qemu-surface`
-    probe that fails while the VM runtime still exposes placeholder client transport
+    probe that exercises one real QEMU metrics round trip on every replica and one real primary submit/read round trip through the live replicated protocol surface
 - Replicated node scaffolding:
   - dedicated replica metadata file with temp-write, rename, and directory-sync durability
   - persisted replica identity, role, view, commit point, snapshot anchor, last-normal view, and
@@ -202,12 +202,12 @@
   - simulation: `cargo test -p allocdb-node simulation -- --nocapture`, `cargo test -p allocdb-node replicated_simulation -- --nocapture`
   - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
-
 ## Current Focus
-
 - `M8-T04` now has one host-side harness slice: release-gate planning, retry-aware history
-  analysis, artifact bundling, and one explicit QEMU surface probe
-- the remaining blocker is runtime, not planning: the QEMU guests still expose `client transport not implemented` and `protocol transport not implemented`, so the next execution target is to wire the real replicated client/protocol surface into the VM-backed runtime so `verify-qemu-surface` can pass and the documented workload families can execute for real
+  analysis, artifact bundling, one basic live runtime surface, and one explicit QEMU surface probe
+- the remaining blocker is external workload execution, not basic transport wiring: the next target
+  is to drive the documented Jepsen workload families through that runtime, including replicated
+  `tick_expirations`, failover loops, and automated QEMU nemesis runs
 ## How To Check Progress
 - implementation status: [work-breakdown.md](./work-breakdown.md)
 - milestone sequencing: [roadmap.md](./roadmap.md)

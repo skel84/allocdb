@@ -431,7 +431,6 @@ What this testbed proves today:
 
 What it still does not claim:
 
-- the first QEMU layer does not yet validate the real replicated client transport
 - Jepsen workloads and release-blocking fault runs remain follow-on work in `M8-T04`
 
 ## Jepsen Harness Slice
@@ -454,15 +453,17 @@ What this harness slice proves today:
   early expiration release, unresolved ambiguity, and writes that are missing `operation_id`
 - one archive command can bundle the analyzed history with one fetched QEMU log archive and one
   manifest rooted on the host
-- one surface-probe command fails explicitly when the QEMU cluster still exposes the placeholder
-  `client transport not implemented` listener
+- one surface-probe command can issue one real `get_metrics` request to every replica, then drive
+  one real `create_resource` submit plus one fenced `get_resource` read through the configured
+  primary against the QEMU cluster
 
 What it still does not claim:
 
-- the harness does not yet execute the real workload families end-to-end against the QEMU cluster
-  because the VM runtime still lacks one real replicated client/protocol transport
-- the release gate therefore remains blocked on runtime work, not on history interpretation or
-  artifact handling
+- the harness does not yet execute the full workload families end-to-end against the QEMU cluster
+- the runtime probe does not yet cover replicated `tick_expirations`, automated failover, or the
+  full Jepsen nemesis loops
+- the release gate therefore remains blocked on external workload execution, not on planning,
+  history interpretation, artifact handling, or the basic QEMU client/protocol surface
 
 ## Jepsen Validation Gate
 

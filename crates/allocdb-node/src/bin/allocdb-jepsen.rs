@@ -4,11 +4,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use allocdb_core::command::{ClientRequest, Command as AllocCommand};
+use allocdb_core::ids::{ClientId, OperationId, ResourceId, Slot};
 use allocdb_node::jepsen::{
     analyze_history, create_artifact_bundle, load_history, release_gate_plan,
     render_analysis_report,
 };
 use allocdb_node::qemu_testbed::{QemuTestbedLayout, qemu_testbed_layout_path};
+use allocdb_node::{
+    ApiRequest, ApiResponse, MetricsRequest, ResourceRequest, ResourceResponse, SubmitRequest,
+    SubmitResponse, decode_response, encode_request,
+};
 
 const CONTROL_HOST_SSH_PORT: u16 = 2220;
 const REMOTE_CONTROL_SCRIPT_PATH: &str = "/usr/local/bin/allocdb-qemu-control";
@@ -187,20 +193,68 @@ fn verify_qemu_surface(workspace_root: &Path) -> Result<(), String> {
             )
         })?;
         let client_host = client_addr.ip().to_string();
-        let response = run_remote_python_probe(&layout, &client_host, client_addr.port())?;
-        if response.contains("client transport not implemented") {
+        let response_bytes = send_remote_api_request(
+            &layout,
+            &client_host,
+            client_addr.port(),
+            &ApiRequest::GetMetrics(MetricsRequest {
+                current_wall_clock_slot: Slot(0),
+            }),
+        )?;
+        let response = decode_qemu_api_response(&response_bytes)?;
+        if !matches!(response, ApiResponse::GetMetrics(_)) {
             return Err(format!(
-                "QEMU client surface is not ready for Jepsen: replica {} still reports `client transport not implemented`",
-                guest.replica_id.map_or(0, allocdb_node::ReplicaId::get)
-            ));
-        }
-        if response.contains("network isolated by local harness") {
-            return Err(format!(
-                "QEMU client surface is not ready for Jepsen: replica {} is currently isolated",
+                "QEMU client surface is not ready for Jepsen: replica {} returned unexpected metrics probe response {response:?}",
                 guest.replica_id.map_or(0, allocdb_node::ReplicaId::get)
             ));
         }
     }
+
+    let primary = layout
+        .replica_layout
+        .replicas
+        .iter()
+        .find(|replica| replica.role == allocdb_node::ReplicaRole::Primary)
+        .ok_or_else(|| String::from("qemu layout has no configured primary"))?;
+    let primary_host = primary.client_addr.ip().to_string();
+    let resource_id = unique_probe_resource_id();
+    let submit_response = decode_qemu_api_response(&send_remote_api_request(
+        &layout,
+        &primary_host,
+        primary.client_addr.port(),
+        &ApiRequest::Submit(SubmitRequest::from_client_request(
+            Slot(1),
+            probe_create_request(resource_id),
+        )),
+    )?)?;
+    let applied_lsn = match submit_response {
+        ApiResponse::Submit(SubmitResponse::Committed(response)) => response.applied_lsn,
+        other => {
+            return Err(format!(
+                "QEMU client surface is not ready for Jepsen: primary submit probe did not commit: {other:?}"
+            ));
+        }
+    };
+
+    let read_response = decode_qemu_api_response(&send_remote_api_request(
+        &layout,
+        &primary_host,
+        primary.client_addr.port(),
+        &ApiRequest::GetResource(ResourceRequest {
+            resource_id: ResourceId(resource_id),
+            required_lsn: Some(applied_lsn),
+        }),
+    )?)?;
+    if !matches!(
+        read_response,
+        ApiResponse::GetResource(ResourceResponse::Found(resource))
+            if resource.resource_id == ResourceId(resource_id)
+    ) {
+        return Err(format!(
+            "QEMU client surface is not ready for Jepsen: primary read probe returned unexpected response {read_response:?}"
+        ));
+    }
+
     println!("qemu_surface=ready");
     Ok(())
 }
@@ -297,27 +351,73 @@ fn fetch_qemu_logs_archive(
     Ok(archive_path)
 }
 
-fn run_remote_python_probe(
+fn send_remote_api_request(
     layout: &QemuTestbedLayout,
     host: &str,
     port: u16,
-) -> Result<String, String> {
-    let script = "python3 - <<'PY'\nimport socket, sys\nhost = sys.argv[1]\nport = int(sys.argv[2])\nwith socket.create_connection((host, port), timeout=2) as stream:\n    stream.shutdown(socket.SHUT_WR)\n    chunks = []\n    while True:\n        chunk = stream.recv(4096)\n        if not chunk:\n            break\n        chunks.append(chunk)\n    sys.stdout.buffer.write(b''.join(chunks))\nPY";
+    request: &ApiRequest,
+) -> Result<Vec<u8>, String> {
+    let request_bytes = encode_request(request)
+        .map_err(|error| format!("failed to encode api request: {error:?}"))?;
+    run_remote_tcp_request(layout, host, port, &request_bytes)
+}
+
+fn run_remote_tcp_request(
+    layout: &QemuTestbedLayout,
+    host: &str,
+    port: u16,
+    request_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    let request_hex = encode_hex(request_bytes);
+    let script = "python3 - <<'PY'\nimport socket, sys\nhost = sys.argv[1]\nport = int(sys.argv[2])\npayload = bytes.fromhex(sys.argv[3])\nwith socket.create_connection((host, port), timeout=2) as stream:\n    if payload:\n        stream.sendall(payload)\n    stream.shutdown(socket.SHUT_WR)\n    chunks = []\n    while True:\n        chunk = stream.recv(4096)\n        if not chunk:\n            break\n        chunks.append(chunk)\n    sys.stdout.buffer.write(b''.join(chunks))\nPY";
     let mut args = ssh_args(layout);
-    args.push(format!("{script} {host} {port}"));
+    args.push(format!("{script} {host} {port} {request_hex}"));
     let output = Command::new("ssh")
         .args(args)
         .output()
         .map_err(|error| format!("failed to probe remote client surface: {error}"))?;
     if output.status.success() {
-        String::from_utf8(output.stdout)
-            .map_err(|error| format!("invalid utf-8 from remote probe: {error}"))
+        Ok(output.stdout)
     } else {
         Err(format!(
             "remote probe failed: status={} stderr={}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         ))
+    }
+}
+
+fn decode_qemu_api_response(bytes: &[u8]) -> Result<ApiResponse, String> {
+    decode_response(bytes).map_err(|error| {
+        let text = String::from_utf8_lossy(bytes);
+        format!("invalid qemu api response: {error:?}; raw_response={text}")
+    })
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn unique_probe_resource_id() -> u128 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    9_000_000_000_000_000_000_u128.saturating_add(millis)
+}
+
+fn probe_create_request(resource_id: u128) -> ClientRequest {
+    ClientRequest {
+        operation_id: OperationId(resource_id),
+        client_id: ClientId(7),
+        command: AllocCommand::CreateResource {
+            resource_id: ResourceId(resource_id),
+        },
     }
 }
 

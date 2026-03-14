@@ -186,10 +186,11 @@ Current limits:
 
 - the first QEMU testbed still depends on one supported cloud image already being available or
   downloadable on the host
-- the first QEMU layer still does not carry the real replicated client transport
-- the Jepsen harness can now plan runs, analyze histories, and archive QEMU logs, but
-  `verify-qemu-surface` still fails until the guest runtime exposes the real replicated
-  client/protocol surface
+- `verify-qemu-surface` now proves one real metrics probe on every replica plus one real primary
+  submit/read round trip, but it is still only one surface check, not the full Jepsen workload
+  executor
+- replicated `tick_expirations`, automated failover runs, and the full release-blocking Jepsen
+  workload families remain follow-on work
 
 ## Single-Node Engine
 
