@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use allocdb_core::ReservationState;
@@ -30,6 +31,8 @@ use allocdb_node::{
 
 const CONTROL_HOST_SSH_PORT: u16 = 2220;
 const REMOTE_CONTROL_SCRIPT_PATH: &str = "/usr/local/bin/allocdb-qemu-control";
+const PROBE_RESOURCE_ID_BASE: u64 = 9_000_000_000_000_000_000;
+static NEXT_PROBE_RESOURCE_ID: AtomicU64 = AtomicU64::new(PROBE_RESOURCE_ID_BASE);
 
 enum ParsedCommand {
     Help,
@@ -630,16 +633,8 @@ fn prepare_log_path_for(metadata_path: &Path) -> PathBuf {
 }
 
 fn copy_file_or_remove(source: &Path, destination: &Path) -> Result<(), String> {
-    match fs::read(source) {
-        Ok(bytes) => {
-            fs::write(destination, bytes).map_err(|error| {
-                format!(
-                    "failed to write copied file {}: {error}",
-                    destination.display()
-                )
-            })?;
-            Ok(())
-        }
+    match fs::copy(source, destination) {
+        Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if destination.exists() {
                 fs::remove_file(destination).map_err(|remove_error| {
@@ -651,7 +646,11 @@ fn copy_file_or_remove(source: &Path, destination: &Path) -> Result<(), String> 
             }
             Ok(())
         }
-        Err(error) => Err(format!("failed to read {}: {error}", source.display())),
+        Err(error) => Err(format!(
+            "failed to copy {} -> {}: {error}",
+            source.display(),
+            destination.display()
+        )),
     }
 }
 
@@ -2593,11 +2592,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn unique_probe_resource_id() -> u128 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    9_000_000_000_000_000_000_u128.saturating_add(millis)
+    u128::from(NEXT_PROBE_RESOURCE_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 fn probe_create_request(resource_id: u128) -> ClientRequest {
@@ -2644,6 +2639,7 @@ fn ssh_args(layout: &QemuTestbedLayout) -> Vec<String> {
 mod tests {
     use super::*;
     use allocdb_core::ResourceState;
+    use std::fs;
 
     #[test]
     fn release_gate_plan_includes_faulted_qemu_runs() {
@@ -2759,5 +2755,33 @@ mod tests {
 
         let unknown = resolve_run_spec("missing-run").unwrap_err();
         assert!(unknown.contains("unknown Jepsen run id"));
+    }
+
+    #[test]
+    fn copy_file_or_remove_copies_and_removes_stale_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "allocdb-jepsen-copy-{}",
+            unique_probe_resource_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+
+        fs::write(&source, b"snapshot-bytes").unwrap();
+        copy_file_or_remove(&source, &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"snapshot-bytes");
+
+        fs::remove_file(&source).unwrap();
+        copy_file_or_remove(&source, &destination).unwrap();
+        assert!(!destination.exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unique_probe_resource_id_is_monotonic() {
+        let first = unique_probe_resource_id();
+        let second = unique_probe_resource_id();
+        assert!(second > first);
     }
 }

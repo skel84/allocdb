@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use allocdb_core::ids::{Lsn, ResourceId, Slot};
@@ -11,6 +12,7 @@ use crate::replica::{ReplicaId, ReplicaRole};
 
 const JEPSEN_HISTORY_VERSION: u32 = 1;
 const JEPSEN_MANIFEST_VERSION: u32 = 1;
+static ATOMIC_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 #[path = "jepsen_tests.rs"]
@@ -1431,7 +1433,8 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), JepsenCodecEr
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp_path = path.with_extension(format!("{}.tmp", std::process::id()));
+    let nonce = ATOMIC_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = path.with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
     let mut file = File::create(&temp_path)?;
     file.write_all(bytes)?;
     file.sync_all()?;

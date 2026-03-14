@@ -874,15 +874,20 @@ fn handle_replicated_tick_expirations(
         ));
     }
 
-    let entries = match node.prepare_expiration_tick(request.current_wall_clock_slot) {
-        Ok(entries) => entries,
-        Err(allocdb_node::ReplicaProtocolError::PendingPreparedEntries { .. }) => {
-            return Ok(storage_failure_tick_response());
+    let entries = loop {
+        match node.prepare_expiration_tick(request.current_wall_clock_slot) {
+            Ok(entries) => break entries,
+            Err(allocdb_node::ReplicaProtocolError::PendingPreparedEntries { .. }) => {
+                if drain_pending_internal_suffix(node, layout, replica)? {
+                    continue;
+                }
+                return Ok(storage_failure_tick_response());
+            }
+            Err(allocdb_node::ReplicaProtocolError::Submission(error)) => {
+                return Ok(tick_rejection_response(&error));
+            }
+            Err(error) => return Err(protocol_error_message(&error)),
         }
-        Err(allocdb_node::ReplicaProtocolError::Submission(error)) => {
-            return Ok(tick_rejection_response(&error));
-        }
-        Err(error) => return Err(protocol_error_message(&error)),
     };
 
     let mut processed_count = 0_u32;
@@ -994,6 +999,41 @@ fn commit_primary_entry(
             CommittedSubmit::Response(submission_rejection_response(&error)),
         ),
         Err(error) => Err(protocol_error_message(&error)),
+    }
+}
+
+fn drain_pending_internal_suffix(
+    node: &mut ReplicaNode,
+    layout: &LocalClusterLayout,
+    replica: &LocalClusterReplicaConfig,
+) -> Result<bool, String> {
+    let mut drained_any = false;
+    loop {
+        let Some(entry) = node.first_uncommitted_prepared_entry() else {
+            return Ok(drained_any);
+        };
+        if entry.kind != ReplicaPreparedKind::Internal {
+            return Ok(false);
+        }
+
+        let acked_replicas = collect_prepare_quorum(layout, replica, &entry);
+        if acked_replicas < majority_quorum(layout) {
+            log_quorum_unavailable(replica, &entry, acked_replicas, majority_quorum(layout));
+            return Ok(false);
+        }
+
+        match node.commit_prepared_through(entry.lsn) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(format!(
+                    "primary commit at lsn {} did not apply one prepared entry",
+                    entry.lsn.get()
+                ));
+            }
+            Err(error) => return Err(protocol_error_message(&error)),
+        }
+        broadcast_commit_to_backups(layout, replica, &entry);
+        drained_any = true;
     }
 }
 

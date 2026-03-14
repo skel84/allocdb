@@ -631,3 +631,123 @@ fn local_cluster_tick_expirations_replicates_internal_commands() {
         other => panic!("expected expired reservation after tick, got {other:?}"),
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn local_cluster_tick_retry_drains_pending_internal_suffix_after_quorum_recovers() {
+    let _serial_guard = local_cluster_test_guard();
+    let workspace_root = temp_workspace("tick-retry-drain");
+    let _guard = ClusterGuard::new(workspace_root.clone());
+
+    let start_output = start_cluster_with_retry(&workspace_root);
+    assert_success(&start_output, "initial cluster start");
+
+    let layout_path = allocdb_node::local_cluster::layout_path(&workspace_root);
+    let layout = LocalClusterLayout::load(&layout_path).unwrap();
+    let primary = layout.replica(ReplicaId(1)).unwrap();
+
+    let create = send_api_request(
+        primary.client_addr,
+        &ApiRequest::Submit(SubmitRequest::from_client_request(
+            Slot(1),
+            create_request(601, 9_400),
+        )),
+    );
+    assert!(matches!(
+        create,
+        ApiResponse::Submit(SubmitResponse::Committed(_))
+    ));
+
+    let reserve = send_api_request(
+        primary.client_addr,
+        &ApiRequest::Submit(SubmitRequest::from_client_request(
+            Slot(10),
+            reserve_request(601, 9_401, 55, 2),
+        )),
+    );
+    let reservation_id = match reserve {
+        ApiResponse::Submit(SubmitResponse::Committed(response)) => response
+            .outcome
+            .reservation_id
+            .expect("reserve should assign one reservation id"),
+        other => panic!("expected committed reserve response, got {other:?}"),
+    };
+
+    let isolate_two =
+        run_cluster_command_with_args(&workspace_root, "isolate", &["--replica-id", "2"]);
+    assert_success(&isolate_two, "replica two isolate");
+    let isolate_three =
+        run_cluster_command_with_args(&workspace_root, "isolate", &["--replica-id", "3"]);
+    assert_success(&isolate_three, "replica three isolate");
+
+    let first_tick = send_api_request(
+        primary.client_addr,
+        &ApiRequest::TickExpirations(TickExpirationsRequest {
+            current_wall_clock_slot: Slot(12),
+        }),
+    );
+    match first_tick {
+        ApiResponse::TickExpirations(TickExpirationsResponse::Rejected(response)) => {
+            assert_eq!(
+                response.category,
+                allocdb_node::SubmissionErrorCategory::Indefinite
+            );
+            assert_eq!(
+                response.code,
+                allocdb_node::SubmissionFailureCode::StorageFailure
+            );
+        }
+        other => panic!("expected storage-failure tick rejection, got {other:?}"),
+    }
+
+    let heal_two = run_cluster_command_with_args(&workspace_root, "heal", &["--replica-id", "2"]);
+    assert_success(&heal_two, "replica two heal");
+
+    let retry_tick = send_api_request(
+        primary.client_addr,
+        &ApiRequest::TickExpirations(TickExpirationsRequest {
+            current_wall_clock_slot: Slot(12),
+        }),
+    );
+    assert!(matches!(
+        retry_tick,
+        ApiResponse::TickExpirations(TickExpirationsResponse::Applied(_))
+    ));
+
+    let committed_lsn = request_control_status(primary.control_addr)
+        .unwrap()
+        .commit_lsn
+        .expect("retry should commit the pending internal suffix");
+    assert_eq!(committed_lsn, Lsn(3));
+
+    let resource = send_api_request(
+        primary.client_addr,
+        &ApiRequest::GetResource(ResourceRequest {
+            resource_id: ResourceId(601),
+            required_lsn: Some(committed_lsn),
+        }),
+    );
+    match resource {
+        ApiResponse::GetResource(ResourceResponse::Found(resource)) => {
+            assert_eq!(resource.state, ResourceState::Available);
+            assert_eq!(resource.current_reservation_id, None);
+        }
+        other => panic!("expected available resource after retry tick, got {other:?}"),
+    }
+
+    let reservation = send_api_request(
+        primary.client_addr,
+        &ApiRequest::GetReservation(allocdb_node::ReservationRequest {
+            reservation_id,
+            current_slot: Slot(12),
+            required_lsn: Some(committed_lsn),
+        }),
+    );
+    match reservation {
+        ApiResponse::GetReservation(allocdb_node::ReservationResponse::Found(reservation)) => {
+            assert_eq!(reservation.state, ReservationState::Expired);
+            assert_eq!(reservation.released_lsn, Some(committed_lsn));
+        }
+        other => panic!("expected expired reservation after retry tick, got {other:?}"),
+    }
+}
