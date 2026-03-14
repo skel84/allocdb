@@ -113,6 +113,11 @@
   - Jepsen gate with explicit contention, ambiguity, failover, and expiration workloads
   - retry-aware history interpretation and release-blocking invariants for duplicate execution,
     stale successful reads, double allocation, and early reuse
+- Host-side Jepsen harness slice:
+  - one release-gate matrix planner, one retry-aware history codec/analyzer, one host-side artifact
+    bundler for duplicate-execution, double-allocation, stale-read, early-expiration,
+    unresolved-ambiguity, and fetched QEMU-log checks, plus one explicit `verify-qemu-surface`
+    probe that fails while the VM runtime still exposes placeholder client transport
 - Replicated node scaffolding:
   - dedicated replica metadata file with temp-write, rename, and directory-sync durability
   - persisted replica identity, role, view, commit point, snapshot anchor, last-normal view, and
@@ -195,24 +200,20 @@
   - core durability: `cargo test -p allocdb-core wal -- --nocapture`, `cargo test -p allocdb-core snapshot -- --nocapture`, `cargo test -p allocdb-core recovery -- --nocapture`, `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
   - node runtime: `cargo test -p allocdb-node api_reservation_reports_retired_history`, `cargo test -p allocdb-node engine -- --nocapture`, `cargo test -p allocdb-node replica -- --nocapture`
   - simulation: `cargo test -p allocdb-node simulation -- --nocapture`, `cargo test -p allocdb-node replicated_simulation -- --nocapture`
-  - local cluster, qemu assets, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo run -p allocdb-bench -- --scenario all`
+  - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
 
 ## Current Focus
 
-- `M8-T03` is implemented on this branch; the next execution target is `M8-T04`
-- use the new control-node and per-guest asset surface as the target environment for Jepsen automation
-- keep the first VM-backed gate narrow: fixed membership, one shard, and fail-closed recovery rules before broader workload expansion
-- follow `M8-T04` with release-blocking Jepsen runs on the documented contention, ambiguity, failover, and expiration workload families
+- `M8-T04` now has one host-side harness slice: release-gate planning, retry-aware history
+  analysis, artifact bundling, and one explicit QEMU surface probe
+- the remaining blocker is runtime, not planning: the QEMU guests still expose `client transport not implemented` and `protocol transport not implemented`, so the next execution target is to wire the real replicated client/protocol surface into the VM-backed runtime so `verify-qemu-surface` can pass and the documented workload families can execute for real
 ## How To Check Progress
-
 - implementation status: [work-breakdown.md](./work-breakdown.md)
 - milestone sequencing: [roadmap.md](./roadmap.md)
 - reviewable history: `git log --oneline`
 ## Update Rule
-
 Update this file whenever a task or milestone materially changes:
-
 - milestone completion state
 - implementation coverage
 - recommended next step

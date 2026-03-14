@@ -118,6 +118,10 @@ Command surface:
 - `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- stop --workspace <path>`
 - `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- ssh-control --workspace <path>`
 - `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- control --workspace <path> -- <status|isolate|heal|crash|restart|reboot|collect-logs> ...`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- analyze --history-file <history.txt>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-qemu-surface --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-qemu --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
 
 What `prepare` does:
 
@@ -183,7 +187,9 @@ Current limits:
 - the first QEMU testbed still depends on one supported cloud image already being available or
   downloadable on the host
 - the first QEMU layer still does not carry the real replicated client transport
-- Jepsen automation remains follow-on work after this environment
+- the Jepsen harness can now plan runs, analyze histories, and archive QEMU logs, but
+  `verify-qemu-surface` still fails until the guest runtime exposes the real replicated
+  client/protocol surface
 
 ## Single-Node Engine
 

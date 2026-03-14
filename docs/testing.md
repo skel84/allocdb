@@ -434,6 +434,36 @@ What it still does not claim:
 - the first QEMU layer does not yet validate the real replicated client transport
 - Jepsen workloads and release-blocking fault runs remain follow-on work in `M8-T04`
 
+## Jepsen Harness Slice
+
+`M8-T04` now adds the first host-side Jepsen harness tooling around that QEMU surface:
+
+- `cargo test -p allocdb-node jepsen -- --nocapture`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- analyze --history-file <history.txt>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-qemu-surface --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-qemu --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
+
+What this harness slice proves today:
+
+- one command can materialize the exact `15` documented first-release gate runs as a stable matrix
+- one retry-aware history analyzer folds ambiguous attempts and later retries by stable
+  `operation_id`
+- the analyzer automatically blocks on the current release-blocking outcomes the repo already
+  documents: duplicate committed execution, double allocation, stale successful reads,
+  early expiration release, unresolved ambiguity, and writes that are missing `operation_id`
+- one archive command can bundle the analyzed history with one fetched QEMU log archive and one
+  manifest rooted on the host
+- one surface-probe command fails explicitly when the QEMU cluster still exposes the placeholder
+  `client transport not implemented` listener
+
+What it still does not claim:
+
+- the harness does not yet execute the real workload families end-to-end against the QEMU cluster
+  because the VM runtime still lacks one real replicated client/protocol transport
+- the release gate therefore remains blocked on runtime work, not on history interpretation or
+  artifact handling
+
 ## Jepsen Validation Gate
 
 `M6-T03` defines the external validation required before any replicated release.
@@ -557,7 +587,8 @@ Rules:
 
 The Jepsen analysis should include at least:
 
-- a linearizability checker over successful writes and successful reads
+- a linearizability checker over successful writes and successful reads once the VM-backed runtime
+  exposes the real replicated client surface
 - an `operation_id` uniqueness checker that rejects duplicate committed execution
 - a resource-safety checker that rejects double allocation
 - a strict-read fence checker for successful `required_lsn` reads
