@@ -1,6 +1,7 @@
 pub mod api;
 mod bounded_queue;
 pub mod engine;
+pub mod jepsen;
 pub mod local_cluster;
 pub mod qemu_testbed;
 pub mod replica;
@@ -13,7 +14,8 @@ pub use api::{
     ApiCodecError, ApiRequest, ApiResponse, InvalidRequestReason, MetricsRequest, MetricsResponse,
     ReservationRequest, ReservationResponse, ReservationView, ResourceRequest, ResourceResponse,
     ResourceView, SubmissionCommitted, SubmissionFailure, SubmissionFailureCode, SubmitRequest,
-    SubmitResponse, decode_request, decode_response, encode_request, encode_response,
+    SubmitResponse, TickExpirationsApplied, TickExpirationsRequest, TickExpirationsResponse,
+    decode_request, decode_response, encode_request, encode_response,
 };
 pub use engine::{
     EngineConfig, EngineConfigError, EngineMetrics, EngineOpenError, EnqueueResult, ReadError,
@@ -24,6 +26,6 @@ pub use replica::{
     DurableVote, NotPrimaryReadError, RecoverReplicaError, ReplicaFault, ReplicaFaultReason,
     ReplicaId, ReplicaIdentity, ReplicaMetadata, ReplicaMetadataDecodeError, ReplicaMetadataFile,
     ReplicaMetadataFileError, ReplicaMetadataLoadError, ReplicaNode, ReplicaNodeStatus,
-    ReplicaOpenError, ReplicaPaths, ReplicaPreparedEntry, ReplicaProtocolError, ReplicaRole,
-    ReplicaStartupValidationError,
+    ReplicaOpenError, ReplicaPaths, ReplicaPreparedEntry, ReplicaPreparedKind,
+    ReplicaProtocolError, ReplicaRole, ReplicaStartupValidationError,
 };

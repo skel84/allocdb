@@ -3,16 +3,18 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use allocdb_core::command::{ClientRequest, Command};
-use allocdb_core::command_codec::encode_client_request;
+use allocdb_core::command_codec::{decode_internal_command, encode_client_request};
 use allocdb_core::config::Config;
 use allocdb_core::ids::{ClientId, HolderId, Lsn, OperationId, ResourceId, Slot};
+use allocdb_core::{ReservationState, ResourceState};
 
 use crate::engine::{EngineConfig, SingleNodeEngine};
 use crate::replica::{
     DurableVote, ReplicaFaultReason, ReplicaId, ReplicaIdentity, ReplicaMetadata,
     ReplicaMetadataDecodeError, ReplicaMetadataFile, ReplicaMetadataFileError,
-    ReplicaMetadataLoadError, ReplicaNode, ReplicaNodeStatus, ReplicaPaths, ReplicaPreparedEntry,
-    ReplicaRole, ReplicaStartupValidationError, prepare_log_path,
+    ReplicaMetadataLoadError, ReplicaNode, ReplicaNodeStatus, ReplicaPaths,
+    ReplicaPrepareLogDecodeError, ReplicaPrepareLogLoadError, ReplicaPreparedEntry, ReplicaRole,
+    ReplicaStartupValidationError, prepare_log_path,
 };
 
 fn test_path(name: &str, extension: &str) -> PathBuf {
@@ -282,6 +284,368 @@ fn replica_prepare_and_commit_keep_apply_gated_by_commit() {
 }
 
 #[test]
+fn replica_first_uncommitted_prepared_entry_is_none_when_empty() {
+    let paths = ReplicaPaths::new(
+        metadata_path("first-prepared-empty"),
+        snapshot_path("first-prepared-empty"),
+        wal_path("first-prepared-empty"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Backup).unwrap();
+
+    assert_eq!(node.first_uncommitted_prepared_entry(), None);
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_first_uncommitted_prepared_entry_returns_lowest_lsn() {
+    let paths = ReplicaPaths::new(
+        metadata_path("first-prepared-lowest"),
+        snapshot_path("first-prepared-lowest"),
+        wal_path("first-prepared-lowest"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Backup).unwrap();
+
+    let first_entry = ReplicaPreparedEntry {
+        kind: crate::replica::ReplicaPreparedKind::Client,
+        view: 1,
+        lsn: Lsn(1),
+        request_slot: Slot(1),
+        payload: encode_client_request(create(11, 1)),
+    };
+    let second_entry = ReplicaPreparedEntry {
+        kind: crate::replica::ReplicaPreparedKind::Client,
+        view: 1,
+        lsn: Lsn(2),
+        request_slot: Slot(2),
+        payload: encode_client_request(create(12, 2)),
+    };
+    node.append_prepared_entry(first_entry.clone()).unwrap();
+    node.append_prepared_entry(second_entry).unwrap();
+
+    assert_eq!(node.first_uncommitted_prepared_entry(), Some(first_entry));
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_first_uncommitted_prepared_entry_is_stable_after_mutation() {
+    let paths = ReplicaPaths::new(
+        metadata_path("first-prepared-stable"),
+        snapshot_path("first-prepared-stable"),
+        wal_path("first-prepared-stable"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Backup).unwrap();
+
+    let first_entry = ReplicaPreparedEntry {
+        kind: crate::replica::ReplicaPreparedKind::Client,
+        view: 1,
+        lsn: Lsn(1),
+        request_slot: Slot(3),
+        payload: encode_client_request(create(21, 3)),
+    };
+    node.append_prepared_entry(first_entry.clone()).unwrap();
+
+    let returned = node.first_uncommitted_prepared_entry().unwrap();
+
+    node.append_prepared_entry(ReplicaPreparedEntry {
+        kind: crate::replica::ReplicaPreparedKind::Client,
+        view: 1,
+        lsn: Lsn(2),
+        request_slot: Slot(4),
+        payload: encode_client_request(create(22, 4)),
+    })
+    .unwrap();
+    assert_eq!(returned, first_entry);
+
+    node.discard_uncommitted_suffix().unwrap();
+    assert_eq!(returned, first_entry);
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_recover_restores_prepared_suffix_from_prepare_log() {
+    let paths = ReplicaPaths::new(
+        metadata_path("recover-prepare-log"),
+        snapshot_path("recover-prepare-log"),
+        wal_path("recover-prepare-log"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+
+    let payload = encode_client_request(create(42, 1));
+    let entry = node.prepare_client_request(Slot(9), &payload).unwrap();
+    drop(node);
+
+    let recovered =
+        ReplicaNode::recover(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+
+    assert_eq!(recovered.status(), ReplicaNodeStatus::Active);
+    assert_eq!(recovered.metadata().current_view, 1);
+    assert_eq!(recovered.metadata().role, ReplicaRole::Primary);
+    assert_eq!(recovered.metadata().commit_lsn, None);
+    assert_eq!(recovered.prepared_len(), 1);
+    assert_eq!(recovered.prepared_entry(entry.lsn), Some(&entry));
+    assert_eq!(recovered.engine().unwrap().db().last_applied_lsn(), None);
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_open_faults_on_corrupt_prepare_log_bytes() {
+    let paths = ReplicaPaths::new(
+        metadata_path("corrupt-prepare-log"),
+        snapshot_path("corrupt-prepare-log"),
+        wal_path("corrupt-prepare-log"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+    let payload = encode_client_request(create(77, 1));
+    node.prepare_client_request(Slot(3), &payload).unwrap();
+    drop(node);
+
+    fs::write(prepare_log_path(&paths.metadata_path), [0x01, 0x02, 0x03]).unwrap();
+
+    let faulted =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+
+    assert_faulted(
+        &faulted,
+        ReplicaFaultReason::PrepareLogLoad(ReplicaPrepareLogLoadError::Decode(
+            ReplicaPrepareLogDecodeError::BufferTooShort,
+        )),
+    );
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_open_faults_on_empty_prepare_log_file() {
+    let paths = ReplicaPaths::new(
+        metadata_path("empty-prepare-log"),
+        snapshot_path("empty-prepare-log"),
+        wal_path("empty-prepare-log"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+    let payload = encode_client_request(create(91, 1));
+    node.prepare_client_request(Slot(5), &payload).unwrap();
+    drop(node);
+
+    fs::write(prepare_log_path(&paths.metadata_path), []).unwrap();
+
+    let faulted =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+
+    assert_faulted(
+        &faulted,
+        ReplicaFaultReason::PrepareLogLoad(ReplicaPrepareLogLoadError::Decode(
+            ReplicaPrepareLogDecodeError::BufferTooShort,
+        )),
+    );
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_recover_faults_when_prepare_log_lsn_skips_commit_boundary() {
+    let paths = ReplicaPaths::new(
+        metadata_path("prepare-log-gap"),
+        snapshot_path("prepare-log-gap"),
+        wal_path("prepare-log-gap"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+    let payload = encode_client_request(create(88, 1));
+    let entry = node.prepare_client_request(Slot(4), &payload).unwrap();
+    drop(node);
+
+    let prepare_log = prepare_log_path(&paths.metadata_path);
+    let mut bytes = fs::read(&prepare_log).unwrap();
+    let lsn_offset = 4 + 1 + 8 + 1 + 8;
+    bytes[lsn_offset..lsn_offset + 8].copy_from_slice(&2_u64.to_le_bytes());
+    fs::write(&prepare_log, &bytes).unwrap();
+
+    let faulted =
+        ReplicaNode::recover(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+
+    assert_faulted(
+        &faulted,
+        ReplicaFaultReason::Validation(ReplicaStartupValidationError::PreparedOrderMismatch {
+            expected_lsn: Lsn(1),
+            found_lsn: Lsn(2),
+        }),
+    );
+    assert!(faulted.prepared_entry(entry.lsn).is_none());
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_prepare_expiration_tick_rejects_pending_prepared_suffix() {
+    let paths = ReplicaPaths::new(
+        metadata_path("tick-pending-suffix"),
+        snapshot_path("tick-pending-suffix"),
+        wal_path("tick-pending-suffix"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+
+    let payload = encode_client_request(create(301, 1));
+    node.prepare_client_request(Slot(1), &payload).unwrap();
+
+    let error = node.prepare_expiration_tick(Slot(12)).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::replica::ReplicaProtocolError::PendingPreparedEntries { count: 1 }
+    ));
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_prepare_expiration_tick_emits_internal_entries() {
+    let paths = ReplicaPaths::new(
+        metadata_path("tick-internal-kind"),
+        snapshot_path("tick-internal-kind"),
+        wal_path("tick-internal-kind"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+
+    let create_entry = node
+        .prepare_client_request(Slot(1), &encode_client_request(create(401, 1)))
+        .unwrap();
+    node.commit_prepared_through(create_entry.lsn).unwrap();
+
+    let reserve_entry = node
+        .prepare_client_request(Slot(10), &encode_client_request(reserve(401, 2, 77, 2)))
+        .unwrap();
+    let reserve_result = node
+        .commit_prepared_through(reserve_entry.lsn)
+        .unwrap()
+        .unwrap();
+    let reservation_id = reserve_result
+        .outcome
+        .reservation_id
+        .expect("reserve should assign one reservation id");
+
+    let entries = node.prepare_expiration_tick(Slot(12)).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.kind == crate::replica::ReplicaPreparedKind::Internal)
+    );
+    assert_eq!(
+        decode_internal_command(&entries[0].payload).unwrap(),
+        Command::Expire {
+            reservation_id,
+            deadline_slot: Slot(12),
+        }
+    );
+
+    cleanup(&paths);
+}
+
+#[test]
+fn replica_commit_expiration_tick_persists_and_recovers_expired_state() {
+    let paths = ReplicaPaths::new(
+        metadata_path("tick-recover"),
+        snapshot_path("tick-recover"),
+        wal_path("tick-recover"),
+    );
+    let mut node =
+        ReplicaNode::open(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    node.configure_normal_role(1, ReplicaRole::Primary).unwrap();
+
+    let create_entry = node
+        .prepare_client_request(Slot(1), &encode_client_request(create(501, 1)))
+        .unwrap();
+    node.commit_prepared_through(create_entry.lsn).unwrap();
+
+    let reserve_entry = node
+        .prepare_client_request(Slot(10), &encode_client_request(reserve(501, 2, 88, 2)))
+        .unwrap();
+    let reserve_result = node
+        .commit_prepared_through(reserve_entry.lsn)
+        .unwrap()
+        .unwrap();
+    let reservation_id = reserve_result
+        .outcome
+        .reservation_id
+        .expect("reserve should assign one reservation id");
+
+    let entries = node.prepare_expiration_tick(Slot(12)).unwrap();
+    let commit_lsn = entries.last().expect("tick should plan one entry").lsn;
+    let committed = node
+        .commit_prepared_through(commit_lsn)
+        .unwrap()
+        .expect("tick commit should apply one internal entry");
+    assert_eq!(committed.applied_lsn, commit_lsn);
+    assert_eq!(node.prepared_len(), 0);
+    assert_eq!(
+        node.engine()
+            .unwrap()
+            .db()
+            .resource(ResourceId(501))
+            .unwrap()
+            .current_state,
+        ResourceState::Available
+    );
+    assert_eq!(
+        node.engine()
+            .unwrap()
+            .db()
+            .reservation(reservation_id, Slot(12))
+            .unwrap()
+            .state,
+        ReservationState::Expired
+    );
+    drop(node);
+
+    let recovered =
+        ReplicaNode::recover(core_config(), engine_config(), identity(), paths.clone()).unwrap();
+    assert_eq!(recovered.metadata().commit_lsn, Some(commit_lsn));
+    assert_eq!(recovered.prepared_len(), 0);
+    assert_eq!(
+        recovered
+            .engine()
+            .unwrap()
+            .db()
+            .resource(ResourceId(501))
+            .unwrap()
+            .current_state,
+        ResourceState::Available
+    );
+    assert_eq!(
+        recovered
+            .engine()
+            .unwrap()
+            .db()
+            .reservation(reservation_id, Slot(12))
+            .unwrap()
+            .state,
+        ReservationState::Expired
+    );
+
+    cleanup(&paths);
+}
+
+#[test]
 fn replica_vote_persists_view_uncertainty_and_blocks_view_regression() {
     let paths = ReplicaPaths::new(
         metadata_path("vote-view-uncertain"),
@@ -336,6 +700,7 @@ fn replica_reconstructs_committed_prefix_and_discards_uncommitted_suffix() {
     node.configure_normal_role(1, ReplicaRole::Backup).unwrap();
 
     node.append_prepared_entry(ReplicaPreparedEntry {
+        kind: crate::replica::ReplicaPreparedKind::Client,
         view: 1,
         lsn: Lsn(1),
         request_slot: Slot(1),
@@ -343,6 +708,7 @@ fn replica_reconstructs_committed_prefix_and_discards_uncommitted_suffix() {
     })
     .unwrap();
     node.append_prepared_entry(ReplicaPreparedEntry {
+        kind: crate::replica::ReplicaPreparedKind::Client,
         view: 1,
         lsn: Lsn(2),
         request_slot: Slot(2),

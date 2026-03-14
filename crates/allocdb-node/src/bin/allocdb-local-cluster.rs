@@ -6,7 +6,10 @@ use std::process::{self, Child, Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use allocdb_core::ids::Slot;
+use allocdb_core::ReservationLookupError;
+use allocdb_core::command_codec::decode_client_request;
+use allocdb_core::ids::{Lsn, Slot};
+use allocdb_core::result::{CommandOutcome, ResultCode};
 use allocdb_node::local_cluster::{
     ControlRequest, LocalClusterFaultState, LocalClusterLayout, LocalClusterReplicaConfig,
     LocalClusterTimelineEventKind, ReplicaRuntimeState, ReplicaRuntimeStatus,
@@ -15,12 +18,25 @@ use allocdb_node::local_cluster::{
     parse_control_request, request_control_status, request_control_stop, timeline_path,
 };
 use allocdb_node::replica::{
-    ReplicaId, ReplicaIdentity, ReplicaNode, ReplicaNodeStatus, ReplicaRole,
+    ReplicaId, ReplicaIdentity, ReplicaNode, ReplicaNodeStatus, ReplicaPreparedKind, ReplicaRole,
+};
+use allocdb_node::{
+    ApiRequest, ApiResponse, MetricsResponse, ReservationResponse, ResourceResponse,
+    SubmissionFailure, SubmissionFailureCode, SubmitResponse, TickExpirationsApplied,
+    TickExpirationsResponse, decode_request, encode_response,
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const REPLICA_RPC_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_STREAM_BYTES: usize = 1 << 20;
+const PROTOCOL_REQUEST_PREPARE: u8 = 1;
+const PROTOCOL_REQUEST_COMMIT: u8 = 2;
+const PROTOCOL_RESPONSE_PREPARE_ACK: u8 = 1;
+const PROTOCOL_RESPONSE_COMMIT_ACK: u8 = 2;
+const PROTOCOL_PREPARED_KIND_CLIENT: u8 = 1;
+const PROTOCOL_PREPARED_KIND_INTERNAL: u8 = 2;
 
 enum ParsedCommand {
     Help,
@@ -54,6 +70,35 @@ enum ParsedCommand {
     },
     ReplicaDaemon {
         layout_file: PathBuf,
+        replica_id: ReplicaId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReplicaProtocolRequest {
+    Prepare {
+        kind: ReplicaPreparedKind,
+        view: u64,
+        lsn: u64,
+        request_slot: Slot,
+        payload: Vec<u8>,
+    },
+    Commit {
+        view: u64,
+        commit_lsn: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplicaProtocolResponse {
+    PrepareAck {
+        view: u64,
+        lsn: u64,
+        replica_id: ReplicaId,
+    },
+    CommitAck {
+        view: u64,
+        commit_lsn: u64,
         replica_id: ReplicaId,
     },
 }
@@ -566,6 +611,7 @@ fn run_replica_daemon(layout_file: &Path, replica_id: ReplicaId) -> Result<(), S
 
     let loop_result = replica_event_loop(
         &mut node,
+        &layout,
         &layout.workspace_root,
         replica,
         &control_listener,
@@ -587,6 +633,7 @@ fn run_replica_daemon(layout_file: &Path, replica_id: ReplicaId) -> Result<(), S
 
 fn replica_event_loop(
     node: &mut ReplicaNode,
+    layout: &LocalClusterLayout,
     workspace_root: &Path,
     replica: &LocalClusterReplicaConfig,
     control_listener: &TcpListener,
@@ -603,21 +650,11 @@ fn replica_event_loop(
         }
         if let Some(stream) = accept_nonblocking(client_listener)? {
             handled_work = true;
-            let response = if replica_isolated(workspace_root, replica.replica_id)? {
-                encode_control_error("network isolated by local harness")
-            } else {
-                encode_control_error("client transport not implemented")
-            };
-            write_response(stream, &response)?;
+            handle_client_stream(stream, node, layout, workspace_root, replica)?;
         }
         if let Some(stream) = accept_nonblocking(protocol_listener)? {
             handled_work = true;
-            let response = if replica_isolated(workspace_root, replica.replica_id)? {
-                encode_control_error("network isolated by local harness")
-            } else {
-                encode_control_error("protocol transport not implemented")
-            };
-            write_response(stream, &response)?;
+            handle_protocol_stream(stream, node, workspace_root, replica)?;
         }
         if !handled_work {
             thread::sleep(LISTENER_POLL_INTERVAL);
@@ -653,6 +690,802 @@ fn handle_control_stream(
             write_response(stream, &response)?;
             Ok(false)
         }
+    }
+}
+
+fn handle_client_stream(
+    mut stream: TcpStream,
+    node: &mut ReplicaNode,
+    layout: &LocalClusterLayout,
+    workspace_root: &Path,
+    replica: &LocalClusterReplicaConfig,
+) -> Result<(), String> {
+    if replica_isolated(workspace_root, replica.replica_id)? {
+        return write_response(
+            stream,
+            &encode_control_error("network isolated by local harness"),
+        );
+    }
+
+    let request_bytes = match read_stream_bytes(&mut stream, "client request") {
+        Ok(bytes) => bytes,
+        Err(error) => return write_response(stream, &encode_control_error(&error)),
+    };
+    if request_bytes.is_empty() {
+        return write_response(stream, &encode_control_error("invalid client request"));
+    }
+
+    let request = match decode_request(&request_bytes) {
+        Ok(request) => request,
+        Err(error) => {
+            let response = encode_control_error(&format!("invalid client request: {error:?}"));
+            return write_response(stream, &response);
+        }
+    };
+
+    let response = match request {
+        ApiRequest::Submit(request) => handle_replicated_submit(node, layout, replica, &request),
+        ApiRequest::GetResource(request) => Ok(handle_resource_request(node, request)),
+        ApiRequest::GetReservation(request) => Ok(handle_reservation_request(node, request)),
+        ApiRequest::GetMetrics(request) => Ok(handle_metrics_request(node, request)),
+        ApiRequest::TickExpirations(request) => {
+            handle_replicated_tick_expirations(node, layout, replica, request)
+        }
+    };
+
+    match response {
+        Ok(bytes) => write_bytes_response(stream, &bytes),
+        Err(message) => write_response(stream, &encode_control_error(&message)),
+    }
+}
+
+fn handle_protocol_stream(
+    mut stream: TcpStream,
+    node: &mut ReplicaNode,
+    workspace_root: &Path,
+    replica: &LocalClusterReplicaConfig,
+) -> Result<(), String> {
+    if replica_isolated(workspace_root, replica.replica_id)? {
+        return write_response(
+            stream,
+            &encode_control_error("network isolated by local harness"),
+        );
+    }
+
+    let request_bytes = match read_stream_bytes(&mut stream, "protocol request") {
+        Ok(bytes) => bytes,
+        Err(error) => return write_response(stream, &encode_control_error(&error)),
+    };
+    if request_bytes.is_empty() {
+        return write_response(stream, &encode_control_error("invalid protocol request"));
+    }
+
+    let request = decode_replica_protocol_request(&request_bytes)
+        .map_err(|error| format!("failed to decode protocol request: {error}"));
+    let response = match request {
+        Ok(ReplicaProtocolRequest::Prepare {
+            kind,
+            view,
+            lsn,
+            request_slot,
+            payload,
+        }) => {
+            let entry = allocdb_node::ReplicaPreparedEntry {
+                kind,
+                view,
+                lsn: Lsn(lsn),
+                request_slot,
+                payload,
+            };
+            node.append_prepared_entry(entry)
+                .map_err(|error| protocol_error_message(&error))?;
+            Ok(ReplicaProtocolResponse::PrepareAck {
+                view,
+                lsn,
+                replica_id: replica.replica_id,
+            })
+        }
+        Ok(ReplicaProtocolRequest::Commit { view, commit_lsn }) => {
+            if node.metadata().current_view != view {
+                return write_response(
+                    stream,
+                    &encode_control_error(&format!(
+                        "protocol view mismatch: expected={} found={view}",
+                        node.metadata().current_view
+                    )),
+                );
+            }
+            node.commit_prepared_through(Lsn(commit_lsn))
+                .map_err(|error| protocol_error_message(&error))?;
+            Ok(ReplicaProtocolResponse::CommitAck {
+                view,
+                commit_lsn,
+                replica_id: replica.replica_id,
+            })
+        }
+        Err(error) => Err(error),
+    };
+
+    match response {
+        Ok(response) => {
+            let bytes = encode_replica_protocol_response(response);
+            write_bytes_response(stream, &bytes)
+        }
+        Err(message) => write_response(stream, &encode_control_error(&message)),
+    }
+}
+
+fn handle_replicated_submit(
+    node: &mut ReplicaNode,
+    layout: &LocalClusterLayout,
+    replica: &LocalClusterReplicaConfig,
+    request: &allocdb_node::SubmitRequest,
+) -> Result<Vec<u8>, String> {
+    if node.status() != ReplicaNodeStatus::Active {
+        return Err(String::from("replica faulted"));
+    }
+    if node.metadata().role != ReplicaRole::Primary {
+        return Err(format!(
+            "not primary: role={}",
+            encode_role(node.metadata().role)
+        ));
+    }
+
+    if let Some(result) = lookup_retry_result(node, request.request_slot, &request.payload) {
+        return Ok(encode_response(&ApiResponse::Submit(
+            SubmitResponse::Committed(result.into()),
+        )));
+    }
+
+    let entry = match prepare_or_resume_entry(node, request)? {
+        PreparedSubmit::Entry(entry) => entry,
+        PreparedSubmit::Response(response) => return Ok(response),
+    };
+    let acked_replicas = collect_prepare_quorum(layout, replica, &entry);
+    if acked_replicas < majority_quorum(layout) {
+        log_quorum_unavailable(replica, &entry, acked_replicas, majority_quorum(layout));
+        return Ok(storage_failure_submit_response());
+    }
+
+    let result = match commit_primary_entry(node, &entry)? {
+        CommittedSubmit::Result(result) => result,
+        CommittedSubmit::Response(response) => return Ok(response),
+    };
+    broadcast_commit_to_backups(layout, replica, &entry);
+
+    Ok(encode_response(&ApiResponse::Submit(
+        SubmitResponse::Committed(result.into()),
+    )))
+}
+
+fn handle_replicated_tick_expirations(
+    node: &mut ReplicaNode,
+    layout: &LocalClusterLayout,
+    replica: &LocalClusterReplicaConfig,
+    request: allocdb_node::TickExpirationsRequest,
+) -> Result<Vec<u8>, String> {
+    if node.status() != ReplicaNodeStatus::Active {
+        return Err(String::from("replica faulted"));
+    }
+    if node.metadata().role != ReplicaRole::Primary {
+        return Err(format!(
+            "not primary: role={}",
+            encode_role(node.metadata().role)
+        ));
+    }
+
+    let entries = loop {
+        match node.prepare_expiration_tick(request.current_wall_clock_slot) {
+            Ok(entries) => break entries,
+            Err(allocdb_node::ReplicaProtocolError::PendingPreparedEntries { .. }) => {
+                if drain_pending_internal_suffix(node, layout, replica)? {
+                    continue;
+                }
+                return Ok(storage_failure_tick_response());
+            }
+            Err(allocdb_node::ReplicaProtocolError::Submission(error)) => {
+                return Ok(tick_rejection_response(&error));
+            }
+            Err(error) => return Err(protocol_error_message(&error)),
+        }
+    };
+
+    let mut processed_count = 0_u32;
+    let mut last_applied_lsn = None;
+    for entry in &entries {
+        let acked_replicas = collect_prepare_quorum(layout, replica, entry);
+        if acked_replicas < majority_quorum(layout) {
+            log_quorum_unavailable(replica, entry, acked_replicas, majority_quorum(layout));
+            return Ok(storage_failure_tick_response());
+        }
+
+        let result = match node.commit_prepared_through(entry.lsn) {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                return Err(format!(
+                    "primary commit at lsn {} did not apply one prepared entry",
+                    entry.lsn.get()
+                ));
+            }
+            Err(allocdb_node::ReplicaProtocolError::Submission(error)) => {
+                return Ok(tick_rejection_response(&error));
+            }
+            Err(error) => return Err(protocol_error_message(&error)),
+        };
+        broadcast_commit_to_backups(layout, replica, entry);
+        processed_count = processed_count.saturating_add(1);
+        last_applied_lsn = Some(result.applied_lsn);
+    }
+
+    Ok(encode_response(&ApiResponse::TickExpirations(
+        TickExpirationsResponse::Applied(TickExpirationsApplied {
+            processed_count,
+            last_applied_lsn,
+        }),
+    )))
+}
+
+enum PreparedSubmit {
+    Entry(allocdb_node::ReplicaPreparedEntry),
+    Response(Vec<u8>),
+}
+
+enum CommittedSubmit {
+    Result(allocdb_node::SubmissionResult),
+    Response(Vec<u8>),
+}
+
+fn prepare_or_resume_entry(
+    node: &mut ReplicaNode,
+    request: &allocdb_node::SubmitRequest,
+) -> Result<PreparedSubmit, String> {
+    match node.first_uncommitted_prepared_entry() {
+        Some(entry) => {
+            if entry.request_slot != request.request_slot || entry.payload != request.payload {
+                Ok(PreparedSubmit::Response(storage_failure_submit_response()))
+            } else {
+                Ok(PreparedSubmit::Entry(entry))
+            }
+        }
+        None => match node.prepare_client_request(request.request_slot, &request.payload) {
+            Ok(entry) => Ok(PreparedSubmit::Entry(entry)),
+            Err(allocdb_node::ReplicaProtocolError::Submission(error)) => Ok(
+                PreparedSubmit::Response(submission_rejection_response(&error)),
+            ),
+            Err(error) => Err(protocol_error_message(&error)),
+        },
+    }
+}
+
+fn collect_prepare_quorum(
+    layout: &LocalClusterLayout,
+    replica: &LocalClusterReplicaConfig,
+    entry: &allocdb_node::ReplicaPreparedEntry,
+) -> usize {
+    let mut acked_replicas = 1_usize;
+    for peer in &layout.replicas {
+        if peer.replica_id == replica.replica_id {
+            continue;
+        }
+        let request = ReplicaProtocolRequest::Prepare {
+            kind: entry.kind,
+            view: entry.view,
+            lsn: entry.lsn.get(),
+            request_slot: entry.request_slot,
+            payload: entry.payload.clone(),
+        };
+        match send_protocol_request(peer.protocol_addr, &request) {
+            Ok(response) if is_expected_prepare_ack(&response, peer.replica_id, entry) => {
+                acked_replicas += 1;
+            }
+            Ok(other) => log_prepare_ack_rejected(replica, peer, entry, &other),
+            Err(error) => log_prepare_ack_failed(replica, peer, entry, &error),
+        }
+    }
+    acked_replicas
+}
+
+fn commit_primary_entry(
+    node: &mut ReplicaNode,
+    entry: &allocdb_node::ReplicaPreparedEntry,
+) -> Result<CommittedSubmit, String> {
+    match node.commit_prepared_through(entry.lsn) {
+        Ok(Some(result)) => Ok(CommittedSubmit::Result(result)),
+        Ok(None) => Err(format!(
+            "primary commit at lsn {} did not publish one client result",
+            entry.lsn.get()
+        )),
+        Err(allocdb_node::ReplicaProtocolError::Submission(error)) => Ok(
+            CommittedSubmit::Response(submission_rejection_response(&error)),
+        ),
+        Err(error) => Err(protocol_error_message(&error)),
+    }
+}
+
+fn drain_pending_internal_suffix(
+    node: &mut ReplicaNode,
+    layout: &LocalClusterLayout,
+    replica: &LocalClusterReplicaConfig,
+) -> Result<bool, String> {
+    let mut drained_any = false;
+    loop {
+        let Some(entry) = node.first_uncommitted_prepared_entry() else {
+            return Ok(drained_any);
+        };
+        if entry.kind != ReplicaPreparedKind::Internal {
+            return Ok(false);
+        }
+
+        let acked_replicas = collect_prepare_quorum(layout, replica, &entry);
+        if acked_replicas < majority_quorum(layout) {
+            log_quorum_unavailable(replica, &entry, acked_replicas, majority_quorum(layout));
+            return Ok(false);
+        }
+
+        match node.commit_prepared_through(entry.lsn) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(format!(
+                    "primary commit at lsn {} did not apply one prepared entry",
+                    entry.lsn.get()
+                ));
+            }
+            Err(error) => return Err(protocol_error_message(&error)),
+        }
+        broadcast_commit_to_backups(layout, replica, &entry);
+        drained_any = true;
+    }
+}
+
+fn broadcast_commit_to_backups(
+    layout: &LocalClusterLayout,
+    replica: &LocalClusterReplicaConfig,
+    entry: &allocdb_node::ReplicaPreparedEntry,
+) {
+    for peer in &layout.replicas {
+        if peer.replica_id == replica.replica_id {
+            continue;
+        }
+        let request = ReplicaProtocolRequest::Commit {
+            view: entry.view,
+            commit_lsn: entry.lsn.get(),
+        };
+        if let Err(error) = send_protocol_request(peer.protocol_addr, &request) {
+            eprintln!(
+                "replica={} event=commit_broadcast_failed peer={} view={} commit_lsn={} error={error}",
+                replica.replica_id.get(),
+                peer.replica_id.get(),
+                entry.view,
+                entry.lsn.get(),
+            );
+        }
+    }
+}
+
+fn submission_rejection_response(error: &allocdb_node::SubmissionError) -> Vec<u8> {
+    let response = ApiResponse::Submit(SubmitResponse::Rejected(
+        SubmissionFailure::from_submission_error(error),
+    ));
+    encode_response(&response)
+}
+
+fn tick_rejection_response(error: &allocdb_node::SubmissionError) -> Vec<u8> {
+    encode_response(&ApiResponse::TickExpirations(
+        TickExpirationsResponse::Rejected(SubmissionFailure::from_submission_error(error)),
+    ))
+}
+
+fn storage_failure_submit_response() -> Vec<u8> {
+    let response = ApiResponse::Submit(SubmitResponse::Rejected(SubmissionFailure {
+        category: allocdb_node::SubmissionErrorCategory::Indefinite,
+        code: SubmissionFailureCode::StorageFailure,
+    }));
+    encode_response(&response)
+}
+
+fn storage_failure_tick_response() -> Vec<u8> {
+    encode_response(&ApiResponse::TickExpirations(
+        TickExpirationsResponse::Rejected(SubmissionFailure {
+            category: allocdb_node::SubmissionErrorCategory::Indefinite,
+            code: SubmissionFailureCode::StorageFailure,
+        }),
+    ))
+}
+
+fn log_prepare_ack_rejected(
+    replica: &LocalClusterReplicaConfig,
+    peer: &LocalClusterReplicaConfig,
+    entry: &allocdb_node::ReplicaPreparedEntry,
+    response: &ReplicaProtocolResponse,
+) {
+    eprintln!(
+        "replica={} event=prepare_ack_rejected peer={} expected_view={} expected_lsn={} response={response:?}",
+        replica.replica_id.get(),
+        peer.replica_id.get(),
+        entry.view,
+        entry.lsn.get(),
+    );
+}
+
+fn log_prepare_ack_failed(
+    replica: &LocalClusterReplicaConfig,
+    peer: &LocalClusterReplicaConfig,
+    entry: &allocdb_node::ReplicaPreparedEntry,
+    error: &str,
+) {
+    eprintln!(
+        "replica={} event=prepare_ack_failed peer={} view={} lsn={} error={error}",
+        replica.replica_id.get(),
+        peer.replica_id.get(),
+        entry.view,
+        entry.lsn.get(),
+    );
+}
+
+fn log_quorum_unavailable(
+    replica: &LocalClusterReplicaConfig,
+    entry: &allocdb_node::ReplicaPreparedEntry,
+    acked_replicas: usize,
+    required_quorum: usize,
+) {
+    eprintln!(
+        "replica={} event=quorum_unavailable lsn={} acked_replicas={} required_quorum={required_quorum}",
+        replica.replica_id.get(),
+        entry.lsn.get(),
+        acked_replicas,
+    );
+}
+
+fn handle_resource_request(node: &ReplicaNode, request: allocdb_node::ResourceRequest) -> Vec<u8> {
+    let response = match node.enforce_primary_read(request.required_lsn.unwrap_or(Lsn(0))) {
+        Ok(()) => node
+            .engine()
+            .expect("primary read requires one live engine")
+            .db()
+            .resource(request.resource_id)
+            .map_or(ResourceResponse::NotFound, |record| {
+                ResourceResponse::Found(record.into())
+            }),
+        Err(allocdb_node::NotPrimaryReadError::Fence(
+            allocdb_node::ReadError::RequiredLsnNotApplied {
+                required_lsn,
+                last_applied_lsn,
+            },
+        )) => ResourceResponse::FenceNotApplied {
+            required_lsn,
+            last_applied_lsn,
+        },
+        Err(
+            allocdb_node::NotPrimaryReadError::Fence(allocdb_node::ReadError::EngineHalted)
+            | allocdb_node::NotPrimaryReadError::ReplicaCrashed,
+        ) => ResourceResponse::EngineHalted,
+        Err(allocdb_node::NotPrimaryReadError::Role(role)) => {
+            return encode_control_error_bytes(&format!("not primary: role={}", encode_role(role)));
+        }
+    };
+    encode_response(&ApiResponse::GetResource(response))
+}
+
+fn handle_reservation_request(
+    node: &ReplicaNode,
+    request: allocdb_node::ReservationRequest,
+) -> Vec<u8> {
+    let response = match node.enforce_primary_read(request.required_lsn.unwrap_or(Lsn(0))) {
+        Ok(()) => match node
+            .engine()
+            .expect("primary read requires one live engine")
+            .db()
+            .reservation(request.reservation_id, request.current_slot)
+        {
+            Ok(record) => ReservationResponse::Found(record.into()),
+            Err(ReservationLookupError::NotFound) => ReservationResponse::NotFound,
+            Err(ReservationLookupError::Retired) => ReservationResponse::Retired,
+        },
+        Err(allocdb_node::NotPrimaryReadError::Fence(
+            allocdb_node::ReadError::RequiredLsnNotApplied {
+                required_lsn,
+                last_applied_lsn,
+            },
+        )) => ReservationResponse::FenceNotApplied {
+            required_lsn,
+            last_applied_lsn,
+        },
+        Err(
+            allocdb_node::NotPrimaryReadError::Fence(allocdb_node::ReadError::EngineHalted)
+            | allocdb_node::NotPrimaryReadError::ReplicaCrashed,
+        ) => ReservationResponse::EngineHalted,
+        Err(allocdb_node::NotPrimaryReadError::Role(role)) => {
+            return encode_control_error_bytes(&format!("not primary: role={}", encode_role(role)));
+        }
+    };
+    encode_response(&ApiResponse::GetReservation(response))
+}
+
+fn handle_metrics_request(node: &ReplicaNode, request: allocdb_node::MetricsRequest) -> Vec<u8> {
+    match node.engine() {
+        Some(engine) => encode_response(&ApiResponse::GetMetrics(MetricsResponse {
+            metrics: engine.metrics(request.current_wall_clock_slot),
+        })),
+        None => encode_control_error_bytes("replica faulted"),
+    }
+}
+
+fn lookup_retry_result(
+    node: &ReplicaNode,
+    request_slot: Slot,
+    payload: &[u8],
+) -> Option<allocdb_node::SubmissionResult> {
+    let Ok(request) = decode_client_request(payload) else {
+        return None;
+    };
+    let record = node
+        .engine()
+        .expect("active primary must keep one live engine")
+        .db()
+        .operation(request.operation_id, request_slot)?;
+
+    let outcome = if record.command_fingerprint == request.command.fingerprint() {
+        CommandOutcome {
+            result_code: record.result_code,
+            reservation_id: record.result_reservation_id,
+            deadline_slot: record.result_deadline_slot,
+        }
+    } else {
+        CommandOutcome::new(ResultCode::OperationConflict)
+    };
+    Some(allocdb_node::SubmissionResult {
+        applied_lsn: record.applied_lsn,
+        outcome,
+        from_retry_cache: true,
+    })
+}
+
+fn majority_quorum(layout: &LocalClusterLayout) -> usize {
+    (layout.replicas.len() / 2) + 1
+}
+
+fn protocol_error_message(error: &allocdb_node::ReplicaProtocolError) -> String {
+    format!("replica protocol error: {error:?}")
+}
+
+fn is_expected_prepare_ack(
+    response: &ReplicaProtocolResponse,
+    expected_replica_id: ReplicaId,
+    entry: &allocdb_node::ReplicaPreparedEntry,
+) -> bool {
+    matches!(
+        response,
+        ReplicaProtocolResponse::PrepareAck {
+            view,
+            lsn,
+            replica_id,
+        } if *view == entry.view
+            && *lsn == entry.lsn.get()
+            && *replica_id == expected_replica_id
+    )
+}
+
+fn read_stream_bytes(stream: &mut TcpStream, kind: &str) -> Result<Vec<u8>, String> {
+    stream
+        .set_read_timeout(Some(REPLICA_RPC_TIMEOUT))
+        .map_err(|error| format!("failed to set {kind} read timeout: {error}"))?;
+    let mut bytes = Vec::new();
+    let max_stream_bytes =
+        u64::try_from(MAX_STREAM_BYTES).expect("max stream bytes should fit in u64");
+    stream
+        .take(max_stream_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read {kind}: {error}"))?;
+    if bytes.len() > MAX_STREAM_BYTES {
+        return Err(format!("{kind} exceeds max size {MAX_STREAM_BYTES} bytes"));
+    }
+    Ok(bytes)
+}
+
+fn write_bytes_response(mut stream: TcpStream, response: &[u8]) -> Result<(), String> {
+    stream
+        .write_all(response)
+        .map_err(|error| format!("failed to write response: {error}"))
+}
+
+fn encode_control_error_bytes(message: &str) -> Vec<u8> {
+    encode_control_error(message).into_bytes()
+}
+
+fn send_protocol_request(
+    addr: SocketAddr,
+    request: &ReplicaProtocolRequest,
+) -> Result<ReplicaProtocolResponse, String> {
+    let mut stream = TcpStream::connect_timeout(&addr, REPLICA_RPC_TIMEOUT)
+        .map_err(|error| format!("failed to connect to replica protocol {addr}: {error}"))?;
+    stream
+        .set_read_timeout(Some(REPLICA_RPC_TIMEOUT))
+        .map_err(|error| format!("failed to set replica protocol read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(REPLICA_RPC_TIMEOUT))
+        .map_err(|error| format!("failed to set replica protocol write timeout: {error}"))?;
+
+    let bytes = encode_replica_protocol_request(request)?;
+    stream
+        .write_all(&bytes)
+        .map_err(|error| format!("failed to write replica protocol request to {addr}: {error}"))?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|error| {
+            format!("failed to half-close replica protocol request to {addr}: {error}")
+        })?;
+
+    let response_bytes = read_stream_bytes(&mut stream, "protocol response")?;
+    decode_replica_protocol_response(&response_bytes)
+        .map_err(|error| format!("failed to decode replica protocol response from {addr}: {error}"))
+}
+
+fn encode_replica_protocol_request(request: &ReplicaProtocolRequest) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    match request {
+        ReplicaProtocolRequest::Prepare {
+            kind,
+            view,
+            lsn,
+            request_slot,
+            payload,
+        } => {
+            bytes.push(PROTOCOL_REQUEST_PREPARE);
+            bytes.push(encode_protocol_prepared_kind(*kind));
+            bytes.extend_from_slice(&view.to_le_bytes());
+            bytes.extend_from_slice(&lsn.to_le_bytes());
+            bytes.extend_from_slice(&request_slot.get().to_le_bytes());
+            let payload_len = u32::try_from(payload.len())
+                .map_err(|_| format!("protocol payload too large: {} bytes", payload.len()))?;
+            bytes.extend_from_slice(&payload_len.to_le_bytes());
+            bytes.extend_from_slice(payload);
+        }
+        ReplicaProtocolRequest::Commit { view, commit_lsn } => {
+            bytes.push(PROTOCOL_REQUEST_COMMIT);
+            bytes.extend_from_slice(&view.to_le_bytes());
+            bytes.extend_from_slice(&commit_lsn.to_le_bytes());
+        }
+    }
+    Ok(bytes)
+}
+
+fn decode_replica_protocol_request(bytes: &[u8]) -> Result<ReplicaProtocolRequest, String> {
+    let mut cursor = 0_usize;
+    let tag = read_u8(bytes, &mut cursor)?;
+    let request = match tag {
+        PROTOCOL_REQUEST_PREPARE => {
+            let kind = decode_protocol_prepared_kind(read_u8(bytes, &mut cursor)?)?;
+            let view = read_u64(bytes, &mut cursor)?;
+            let lsn = read_u64(bytes, &mut cursor)?;
+            let request_slot = Slot(read_u64(bytes, &mut cursor)?);
+            let payload_len = usize::try_from(read_u32(bytes, &mut cursor)?)
+                .map_err(|_| String::from("protocol payload length exceeds usize"))?;
+            let payload = read_bytes(bytes, &mut cursor, payload_len)?;
+            ReplicaProtocolRequest::Prepare {
+                kind,
+                view,
+                lsn,
+                request_slot,
+                payload,
+            }
+        }
+        PROTOCOL_REQUEST_COMMIT => ReplicaProtocolRequest::Commit {
+            view: read_u64(bytes, &mut cursor)?,
+            commit_lsn: read_u64(bytes, &mut cursor)?,
+        },
+        other => return Err(format!("invalid protocol request tag {other}")),
+    };
+    finish_decode(bytes, cursor)?;
+    Ok(request)
+}
+
+const fn encode_protocol_prepared_kind(kind: ReplicaPreparedKind) -> u8 {
+    match kind {
+        ReplicaPreparedKind::Client => PROTOCOL_PREPARED_KIND_CLIENT,
+        ReplicaPreparedKind::Internal => PROTOCOL_PREPARED_KIND_INTERNAL,
+    }
+}
+
+fn decode_protocol_prepared_kind(value: u8) -> Result<ReplicaPreparedKind, String> {
+    match value {
+        PROTOCOL_PREPARED_KIND_CLIENT => Ok(ReplicaPreparedKind::Client),
+        PROTOCOL_PREPARED_KIND_INTERNAL => Ok(ReplicaPreparedKind::Internal),
+        other => Err(format!("invalid protocol prepared kind {other}")),
+    }
+}
+
+fn encode_replica_protocol_response(response: ReplicaProtocolResponse) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    match response {
+        ReplicaProtocolResponse::PrepareAck {
+            view,
+            lsn,
+            replica_id,
+        } => {
+            bytes.push(PROTOCOL_RESPONSE_PREPARE_ACK);
+            bytes.extend_from_slice(&view.to_le_bytes());
+            bytes.extend_from_slice(&lsn.to_le_bytes());
+            bytes.extend_from_slice(&replica_id.get().to_le_bytes());
+        }
+        ReplicaProtocolResponse::CommitAck {
+            view,
+            commit_lsn,
+            replica_id,
+        } => {
+            bytes.push(PROTOCOL_RESPONSE_COMMIT_ACK);
+            bytes.extend_from_slice(&view.to_le_bytes());
+            bytes.extend_from_slice(&commit_lsn.to_le_bytes());
+            bytes.extend_from_slice(&replica_id.get().to_le_bytes());
+        }
+    }
+    bytes
+}
+
+fn decode_replica_protocol_response(bytes: &[u8]) -> Result<ReplicaProtocolResponse, String> {
+    let mut cursor = 0_usize;
+    let tag = read_u8(bytes, &mut cursor)?;
+    let response = match tag {
+        PROTOCOL_RESPONSE_PREPARE_ACK => ReplicaProtocolResponse::PrepareAck {
+            view: read_u64(bytes, &mut cursor)?,
+            lsn: read_u64(bytes, &mut cursor)?,
+            replica_id: ReplicaId(read_u64(bytes, &mut cursor)?),
+        },
+        PROTOCOL_RESPONSE_COMMIT_ACK => ReplicaProtocolResponse::CommitAck {
+            view: read_u64(bytes, &mut cursor)?,
+            commit_lsn: read_u64(bytes, &mut cursor)?,
+            replica_id: ReplicaId(read_u64(bytes, &mut cursor)?),
+        },
+        other => {
+            let message = String::from_utf8_lossy(bytes);
+            return Err(format!(
+                "invalid protocol response tag {other}; raw_response={message}"
+            ));
+        }
+    };
+    finish_decode(bytes, cursor)?;
+    Ok(response)
+}
+
+fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, String> {
+    if *cursor >= bytes.len() {
+        return Err(String::from("buffer too short"));
+    }
+    let value = bytes[*cursor];
+    *cursor += 1;
+    Ok(value)
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, String> {
+    let raw = read_bytes(bytes, cursor, std::mem::size_of::<u32>())?;
+    let mut array = [0_u8; 4];
+    array.copy_from_slice(&raw);
+    Ok(u32::from_le_bytes(array))
+}
+
+fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    let raw = read_bytes(bytes, cursor, std::mem::size_of::<u64>())?;
+    let mut array = [0_u8; 8];
+    array.copy_from_slice(&raw);
+    Ok(u64::from_le_bytes(array))
+}
+
+fn read_bytes(bytes: &[u8], cursor: &mut usize, len: usize) -> Result<Vec<u8>, String> {
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| String::from("buffer length overflow"))?;
+    if end > bytes.len() {
+        return Err(String::from("buffer too short"));
+    }
+    let value = bytes[*cursor..end].to_vec();
+    *cursor = end;
+    Ok(value)
+}
+
+fn finish_decode(bytes: &[u8], cursor: usize) -> Result<(), String> {
+    if cursor == bytes.len() {
+        Ok(())
+    } else {
+        Err(String::from("trailing bytes"))
     }
 }
 
@@ -1147,5 +1980,75 @@ impl Drop for PidFileGuard {
                 eprintln!("failed to remove pid file {}: {error}", self.path.display());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Shutdown, TcpListener, TcpStream};
+
+    fn test_prepared_entry(lsn: u64) -> allocdb_node::ReplicaPreparedEntry {
+        allocdb_node::ReplicaPreparedEntry {
+            kind: ReplicaPreparedKind::Client,
+            view: 7,
+            lsn: Lsn(lsn),
+            request_slot: Slot(11),
+            payload: vec![0xAA],
+        }
+    }
+
+    #[test]
+    fn prepare_ack_requires_expected_replica_identity() {
+        let entry = test_prepared_entry(9);
+        let matching = ReplicaProtocolResponse::PrepareAck {
+            view: 7,
+            lsn: 9,
+            replica_id: ReplicaId(2),
+        };
+        let wrong_replica = ReplicaProtocolResponse::PrepareAck {
+            view: 7,
+            lsn: 9,
+            replica_id: ReplicaId(3),
+        };
+        let wrong_lsn = ReplicaProtocolResponse::PrepareAck {
+            view: 7,
+            lsn: 10,
+            replica_id: ReplicaId(2),
+        };
+
+        assert!(is_expected_prepare_ack(&matching, ReplicaId(2), &entry));
+        assert!(!is_expected_prepare_ack(
+            &wrong_replica,
+            ReplicaId(2),
+            &entry
+        ));
+        assert!(!is_expected_prepare_ack(&wrong_lsn, ReplicaId(2), &entry));
+        assert!(!is_expected_prepare_ack(
+            &ReplicaProtocolResponse::CommitAck {
+                view: 7,
+                commit_lsn: 9,
+                replica_id: ReplicaId(2),
+            },
+            ReplicaId(2),
+            &entry,
+        ));
+    }
+
+    #[test]
+    fn read_stream_bytes_rejects_oversized_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.write_all(&vec![0xAB; MAX_STREAM_BYTES + 1]).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+        });
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let error = read_stream_bytes(&mut stream, "test request").unwrap_err();
+        assert!(error.contains("exceeds max size"));
+
+        writer.join().unwrap();
     }
 }

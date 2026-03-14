@@ -774,6 +774,17 @@ fn decode_status_response(response: &str) -> Result<ReplicaRuntimeStatus, Contro
     })
 }
 
+/// Decodes one text control-status payload returned by a replica daemon.
+///
+/// # Errors
+///
+/// Returns [`ControlProtocolError`] if the payload is malformed or contains one remote error.
+pub fn decode_control_status_response(
+    response: &str,
+) -> Result<ReplicaRuntimeStatus, ControlProtocolError> {
+    decode_status_response(response)
+}
+
 fn control_status_error_is_transient(error: &ControlProtocolError) -> bool {
     matches!(
         error,
@@ -1557,6 +1568,25 @@ mod tests {
         let encoded = encode_status_response(&status);
         let decoded = decode_status_response(&encoded).unwrap();
         assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn decode_control_status_response_round_trips_through_text_encoding() {
+        let status = fixture_status();
+
+        let encoded = encode_status_response(&status);
+        let decoded = decode_control_status_response(&encoded).unwrap();
+        assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn decode_control_status_response_surfaces_remote_error() {
+        let error = decode_control_status_response("status=error\nmessage=replica unavailable\n")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlProtocolError::Remote(message) if message == "replica unavailable"
+        ));
     }
 
     #[test]

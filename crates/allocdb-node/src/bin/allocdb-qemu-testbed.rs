@@ -210,7 +210,7 @@ fn parse_control_args(args: impl IntoIterator<Item = String>) -> Result<ParsedCo
 
 fn usage() -> String {
     String::from(
-        "usage:\n  allocdb-qemu-testbed prepare --workspace <path> [--arch <aarch64|x86_64>] [--base-image-url <url>] [--base-image-path <path>] [--local-cluster-bin <path>]\n  allocdb-qemu-testbed start --workspace <path>\n  allocdb-qemu-testbed stop --workspace <path>\n  allocdb-qemu-testbed status --workspace <path>\n  allocdb-qemu-testbed ssh-control --workspace <path>\n  allocdb-qemu-testbed control --workspace <path> -- <status|isolate|heal|crash|restart|reboot|collect-logs> ...\n",
+        "usage:\n  allocdb-qemu-testbed prepare --workspace <path> [--arch <aarch64|x86_64>] [--base-image-url <url>] [--base-image-path <path>] [--local-cluster-bin <path>]\n  allocdb-qemu-testbed start --workspace <path>\n  allocdb-qemu-testbed stop --workspace <path>\n  allocdb-qemu-testbed status --workspace <path>\n  allocdb-qemu-testbed ssh-control --workspace <path>\n  allocdb-qemu-testbed control --workspace <path> -- <status|isolate|heal|crash|restart|reboot|export-replica|import-replica|collect-logs> ...\n",
     )
 }
 

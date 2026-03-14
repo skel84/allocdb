@@ -113,6 +113,9 @@
   - Jepsen gate with explicit contention, ambiguity, failover, and expiration workloads
   - retry-aware history interpretation and release-blocking invariants for duplicate execution,
     stale successful reads, double allocation, and early reuse
+- Host-side Jepsen harness slice:
+  - one release-gate matrix planner, one retry-aware history codec/analyzer, one host-side artifact bundler for duplicate-execution, double-allocation, stale-read, early-expiration, unresolved-ambiguity, and fetched QEMU-log checks, plus one explicit `verify-qemu-surface` probe that exercises one real QEMU metrics round trip on every replica and one real primary submit/read round trip through the live replicated protocol surface
+  - one real `run-qemu` executor for the full documented release-gate matrix, with persisted histories and artifact bundles for control, crash-restart, partition-heal, and mixed-failover runs, plus host-side failover/rejoin orchestration built from QEMU replica workspace export/import and staged `ReplicaNode::recover(...)` rewrites
 - Replicated node scaffolding:
   - dedicated replica metadata file with temp-write, rename, and directory-sync durability
   - persisted replica identity, role, view, commit point, snapshot anchor, last-normal view, and
@@ -133,6 +136,7 @@
   - per-replica pid, log, WAL, snapshot, metadata, and prepared-log paths exposed through `status`, with restart through the real `ReplicaNode::recover` path and stable durable workspace reuse
   - one persisted `cluster-faults.txt` file that marks whole-replica client/protocol isolation without affecting control reachability, plus one append-only `cluster-timeline.log` for later checker/debug reuse
   - reserved `client` and `protocol` listeners now fail with explicit isolation errors when the local fault harness marks that replica isolated
+  - real primary-side client/protocol transport for external `submit`, `get_resource`, `get_reservation`, `get_metrics`, and replicated `tick_expirations`, with majority append before publish and backup reads still failing closed as `not primary`
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -195,24 +199,17 @@
   - core durability: `cargo test -p allocdb-core wal -- --nocapture`, `cargo test -p allocdb-core snapshot -- --nocapture`, `cargo test -p allocdb-core recovery -- --nocapture`, `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
   - node runtime: `cargo test -p allocdb-node api_reservation_reports_retired_history`, `cargo test -p allocdb-node engine -- --nocapture`, `cargo test -p allocdb-node replica -- --nocapture`
   - simulation: `cargo test -p allocdb-node simulation -- --nocapture`, `cargo test -p allocdb-node replicated_simulation -- --nocapture`
-  - local cluster, qemu assets, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo run -p allocdb-bench -- --scenario all`
+  - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
-
 ## Current Focus
-
-- `M8-T03` is implemented on this branch; the next execution target is `M8-T04`
-- use the new control-node and per-guest asset surface as the target environment for Jepsen automation
-- keep the first VM-backed gate narrow: fixed membership, one shard, and fail-closed recovery rules before broader workload expansion
-- follow `M8-T04` with release-blocking Jepsen runs on the documented contention, ambiguity, failover, and expiration workload families
+- `M8-T04` now has one real external Jepsen executor for the documented release-gate matrix: the live runtime surface covers replicated `submit`, strict reads, and `tick_expirations`, while `allocdb-jepsen run-qemu` can drive control, crash-restart, partition-heal, and mixed-failover runs with archived histories and host-side failover/rejoin cutovers
+- the next honest step is operational, not architectural: run the full QEMU matrix end to end, capture artifacts, and decide whether the roadmap should open a post-M8 hardening milestone or declare the current queue complete
 ## How To Check Progress
-
 - implementation status: [work-breakdown.md](./work-breakdown.md)
 - milestone sequencing: [roadmap.md](./roadmap.md)
 - reviewable history: `git log --oneline`
 ## Update Rule
-
 Update this file whenever a task or milestone materially changes:
-
 - milestone completion state
 - implementation coverage
 - recommended next step

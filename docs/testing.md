@@ -358,8 +358,8 @@ What this smoke test proves today:
 
 What it does not claim yet:
 
-- there is still no replicated client transport on the external process boundary
-- there is still no replicated request routing on the external process boundary
+- it does not prove external failover, rejoin, or stale-primary rejection yet
+- it does not prove background expiration or checkpoint workers inside the replica daemons
 - Jepsen and QEMU-backed validation remain follow-on gates after the local process surface is in
   place
 
@@ -425,14 +425,57 @@ What this testbed proves today:
 - replica `control` moves onto one management network while replica `client` and `protocol`
   listeners move onto one separate cluster network
 - one generated control-node script can drive `status`, `isolate`, `heal`, `crash`, `restart`,
-  `reboot`, and `collect-logs` operations against the replica guests
+  `reboot`, `export-replica`, `import-replica`, and `collect-logs` operations against the replica
+  guests
 - the generated workspace keeps overlay images, firmware vars, guest seeds, console logs, and SSH
   keys in stable paths suitable for scripted follow-on runs
 
 What it still does not claim:
 
-- the first QEMU layer does not yet validate the real replicated client transport
-- Jepsen workloads and release-blocking fault runs remain follow-on work in `M8-T04`
+- the QEMU testbed still relies on the host-side Jepsen runner for failover/rejoin orchestration;
+  the guest runtime itself does not contain a standalone distributed control plane
+
+## Jepsen Harness Slice
+
+`M8-T04` now adds the first host-side Jepsen harness tooling around that QEMU surface:
+
+- `cargo test -p allocdb-node jepsen -- --nocapture`
+- `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- analyze --history-file <history.txt>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-qemu-surface --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- run-qemu --workspace <path> --run-id <run-id> --output-root <artifacts>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-qemu --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
+
+What this harness slice proves today:
+
+- one command can materialize the exact `15` documented first-release gate runs as a stable matrix
+- one retry-aware history analyzer folds ambiguous attempts and later retries by stable
+  `operation_id`
+- the analyzer automatically blocks on the current release-blocking outcomes the repo already
+  documents: duplicate committed execution, double allocation, stale successful reads,
+  early expiration release, unresolved ambiguity, and writes that are missing `operation_id`
+- one archive command can bundle the analyzed history with one fetched QEMU log archive and one
+  manifest rooted on the host
+- one surface-probe command can issue one real `get_metrics` request to every replica, then drive
+  one real `create_resource` submit plus one fenced `get_resource` read through the configured
+  primary against the QEMU cluster
+- one `run-qemu` command can execute the full documented release-gate matrix against the live QEMU
+  cluster and persist one analyzed history plus one artifact bundle for each run
+- those runs now exercise one real hot-resource contention sequence, one real stable
+  `operation_id` retry-cache replay, one real primary-versus-backup read-role check, one real
+  replicated `tick_expirations` path through the external runtime, and one host-side
+  crash/partition/mixed-failover cutover path built from replica workspace export/import plus the
+  existing `ReplicaNode::recover(...)` logic on staged copies
+
+What it still does not claim:
+
+- the first QEMU Jepsen executor still drives one scripted gate scenario at a time, not one
+  free-running `30`-minute nemesis soak with independent background clients
+- partition control still uses the existing whole-replica client/protocol isolation surface, not
+  arbitrary packet loss or per-link delay injection
+- the release gate still depends on operators running the full QEMU matrix end to end; the unit
+  and integration suite only proves the harness and orchestration code paths
 
 ## Jepsen Validation Gate
 
@@ -557,7 +600,8 @@ Rules:
 
 The Jepsen analysis should include at least:
 
-- a linearizability checker over successful writes and successful reads
+- a linearizability checker over successful writes and successful reads captured from the
+  QEMU-backed runtime histories
 - an `operation_id` uniqueness checker that rejects duplicate committed execution
 - a resource-safety checker that rejects double allocation
 - a strict-read fence checker for successful `required_lsn` reads

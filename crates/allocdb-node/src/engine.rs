@@ -4,7 +4,8 @@ use allocdb_core::ReservationState;
 use allocdb_core::SlotOverflowError;
 use allocdb_core::command::{ClientRequest, Command, CommandContext};
 use allocdb_core::command_codec::{
-    CommandCodecError, decode_client_request, encode_client_request, encode_internal_command,
+    CommandCodecError, decode_client_request, decode_internal_command, encode_client_request,
+    encode_internal_command,
 };
 use allocdb_core::config::{Config, ConfigError};
 use allocdb_core::ids::{Lsn, OperationId, ReservationId, Slot};
@@ -82,6 +83,12 @@ pub struct SubmissionResult {
 pub struct ExpirationTickResult {
     pub processed_count: u32,
     pub last_applied_lsn: Option<Lsn>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedExpirationBatch {
+    pub request_slot: Slot,
+    pub commands: Vec<Command>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -670,6 +677,65 @@ impl SingleNodeEngine {
         })
     }
 
+    /// Plans one bounded expiration batch without mutating allocator state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmissionError`] if the engine is halted or if the next internal command would
+    /// overflow the representable LSN range.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the configured `max_expirations_per_tick` does not fit into `usize`, which
+    /// cannot happen on supported targets because the value is already bounded by `u32`.
+    pub fn plan_expiration_batch(
+        &self,
+        current_wall_clock_slot: Slot,
+    ) -> Result<PlannedExpirationBatch, SubmissionError> {
+        if !self.accepting_writes {
+            return Err(SubmissionError::EngineHalted);
+        }
+        if self.queue.len() == 0 {
+            if let Some(error) = self.lsn_exhaustion_error() {
+                return Err(error);
+            }
+        }
+
+        let request_slot = self.expiration_request_slot(current_wall_clock_slot);
+        let commands = self
+            .collect_due_expirations(current_wall_clock_slot)
+            .into_iter()
+            .take(
+                usize::try_from(self.config.max_expirations_per_tick)
+                    .expect("max expirations per tick must fit usize"),
+            )
+            .map(|target| Command::Expire {
+                reservation_id: target.reservation_id,
+                deadline_slot: target.deadline_slot,
+            })
+            .collect();
+        Ok(PlannedExpirationBatch {
+            request_slot,
+            commands,
+        })
+    }
+
+    /// Applies one already-encoded internal command through the WAL plus allocator path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmissionError`] if the payload is structurally invalid, if the request slot is
+    /// not valid for that command, or if WAL persistence fails.
+    pub fn apply_encoded_internal(
+        &mut self,
+        request_slot: Slot,
+        encoded: &[u8],
+    ) -> Result<SubmissionResult, SubmissionError> {
+        self.validate_bytes(encoded)?;
+        let command = decode_internal_command(encoded).map_err(SubmissionError::InvalidRequest)?;
+        self.apply_internal_command(request_slot, command)
+    }
+
     fn process_queued_submissions(&mut self) -> Result<(), SubmissionError> {
         let mut drained_count = 0_u32;
         while self.process_one()?.is_some() {
@@ -728,6 +794,23 @@ impl SingleNodeEngine {
             })?;
 
         Ok(EnqueueResult::Queued)
+    }
+
+    pub(crate) fn validate_internal_submission(
+        &self,
+        request_slot: Slot,
+        encoded: &[u8],
+    ) -> Result<(), SubmissionError> {
+        if !self.accepting_writes {
+            return Err(SubmissionError::EngineHalted);
+        }
+        if let Some(error) = self.lsn_exhaustion_error() {
+            return Err(error);
+        }
+
+        self.validate_bytes(encoded)?;
+        let command = decode_internal_command(encoded).map_err(SubmissionError::InvalidRequest)?;
+        self.validate_internal_request_slot(request_slot, command)
     }
 
     fn process_one(&mut self) -> Result<Option<ProcessedSubmission>, SubmissionError> {
