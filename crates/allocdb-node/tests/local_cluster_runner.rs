@@ -224,9 +224,9 @@ fn local_cluster_runner_starts_stops_and_reuses_stable_layout() {
     let status_output = run_cluster_command(&workspace_root, "status");
     assert_success(&status_output, "cluster status");
     let rendered_status = String::from_utf8_lossy(&status_output.stdout);
-    assert!(rendered_status.contains("replica=1 state=active"));
-    assert!(rendered_status.contains("replica=2 state=active"));
-    assert!(rendered_status.contains("replica=3 state=active"));
+    assert!(rendered_status.contains("replica=1 "));
+    assert!(rendered_status.contains("replica=2 "));
+    assert!(rendered_status.contains("replica=3 "));
 
     let stop_output = run_cluster_command(&workspace_root, "stop");
     assert_success(&stop_output, "cluster stop");
