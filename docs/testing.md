@@ -438,9 +438,11 @@ What it still does not claim:
 `M8-T04` now adds the first host-side Jepsen harness tooling around that QEMU surface:
 
 - `cargo test -p allocdb-node jepsen -- --nocapture`
+- `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- analyze --history-file <history.txt>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-qemu-surface --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- run-qemu --workspace <path> --run-id <run-id> --output-root <artifacts>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-qemu --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
 
 What this harness slice proves today:
@@ -456,14 +458,21 @@ What this harness slice proves today:
 - one surface-probe command can issue one real `get_metrics` request to every replica, then drive
   one real `create_resource` submit plus one fenced `get_resource` read through the configured
   primary against the QEMU cluster
+- one `run-qemu` command can execute the `*-control` runs against the live QEMU cluster and
+  persist one analyzed history plus one artifact bundle for each run
+- those control runs now exercise one real hot-resource contention sequence, one real stable
+  `operation_id` retry-cache replay, one real primary-versus-backup read-role check, and one real
+  replicated `tick_expirations` path through the external runtime
 
 What it still does not claim:
 
-- the harness does not yet execute the full workload families end-to-end against the QEMU cluster
-- the runtime probe does not yet cover replicated `tick_expirations`, automated failover, or the
-  full Jepsen nemesis loops
+- the harness does not yet execute crash, partition, or mixed-failover nemesis runs against the
+  QEMU cluster
+- the external runtime still does not automate failover/view-change orchestration, so the
+  release-blocking faulted Jepsen runs remain follow-on work
 - the release gate therefore remains blocked on external workload execution, not on planning,
-  history interpretation, artifact handling, or the basic QEMU client/protocol surface
+  history interpretation, artifact handling, the basic QEMU client/protocol surface, or the
+  no-nemesis control workloads
 
 ## Jepsen Validation Gate
 

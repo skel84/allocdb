@@ -336,6 +336,7 @@ fn replica_reconstructs_committed_prefix_and_discards_uncommitted_suffix() {
     node.configure_normal_role(1, ReplicaRole::Backup).unwrap();
 
     node.append_prepared_entry(ReplicaPreparedEntry {
+        kind: crate::replica::ReplicaPreparedKind::Client,
         view: 1,
         lsn: Lsn(1),
         request_slot: Slot(1),
@@ -343,6 +344,7 @@ fn replica_reconstructs_committed_prefix_and_discards_uncommitted_suffix() {
     })
     .unwrap();
     node.append_prepared_entry(ReplicaPreparedEntry {
+        kind: crate::replica::ReplicaPreparedKind::Client,
         view: 1,
         lsn: Lsn(2),
         request_slot: Slot(2),

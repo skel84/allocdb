@@ -114,10 +114,8 @@
   - retry-aware history interpretation and release-blocking invariants for duplicate execution,
     stale successful reads, double allocation, and early reuse
 - Host-side Jepsen harness slice:
-  - one release-gate matrix planner, one retry-aware history codec/analyzer, one host-side
-    artifact bundler for duplicate-execution, double-allocation, stale-read, early-expiration,
-    unresolved-ambiguity, and fetched QEMU-log checks, plus one explicit `verify-qemu-surface`
-    probe that exercises one real QEMU metrics round trip on every replica and one real primary submit/read round trip through the live replicated protocol surface
+  - one release-gate matrix planner, one retry-aware history codec/analyzer, one host-side artifact bundler for duplicate-execution, double-allocation, stale-read, early-expiration, unresolved-ambiguity, and fetched QEMU-log checks, plus one explicit `verify-qemu-surface` probe that exercises one real QEMU metrics round trip on every replica and one real primary submit/read round trip through the live replicated protocol surface
+  - one real `run-qemu` executor for the `*-control` runs, with persisted histories and artifact bundles for hot-resource contention, stable-`operation_id` retry replay, strict-primary read rejection on backups, and replicated `tick_expirations` through the external runtime
 - Replicated node scaffolding:
   - dedicated replica metadata file with temp-write, rename, and directory-sync durability
   - persisted replica identity, role, view, commit point, snapshot anchor, last-normal view, and
@@ -138,6 +136,7 @@
   - per-replica pid, log, WAL, snapshot, metadata, and prepared-log paths exposed through `status`, with restart through the real `ReplicaNode::recover` path and stable durable workspace reuse
   - one persisted `cluster-faults.txt` file that marks whole-replica client/protocol isolation without affecting control reachability, plus one append-only `cluster-timeline.log` for later checker/debug reuse
   - reserved `client` and `protocol` listeners now fail with explicit isolation errors when the local fault harness marks that replica isolated
+  - real primary-side client/protocol transport for external `submit`, `get_resource`, `get_reservation`, `get_metrics`, and replicated `tick_expirations`, with majority append before publish and backup reads still failing closed as `not primary`
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -200,14 +199,11 @@
   - core durability: `cargo test -p allocdb-core wal -- --nocapture`, `cargo test -p allocdb-core snapshot -- --nocapture`, `cargo test -p allocdb-core recovery -- --nocapture`, `cargo test -p allocdb-core snapshot_restores_retired_lookup_watermark`
   - node runtime: `cargo test -p allocdb-node api_reservation_reports_retired_history`, `cargo test -p allocdb-node engine -- --nocapture`, `cargo test -p allocdb-node replica -- --nocapture`
   - simulation: `cargo test -p allocdb-node simulation -- --nocapture`, `cargo test -p allocdb-node replicated_simulation -- --nocapture`
-  - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
+  - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
 ## Current Focus
-- `M8-T04` now has one host-side harness slice: release-gate planning, retry-aware history
-  analysis, artifact bundling, one basic live runtime surface, and one explicit QEMU surface probe
-- the remaining blocker is external workload execution, not basic transport wiring: the next target
-  is to drive the documented Jepsen workload families through that runtime, including replicated
-  `tick_expirations`, failover loops, and automated QEMU nemesis runs
+- `M8-T04` now has one real external control-run executor: the live runtime surface covers replicated `tick_expirations`, and `allocdb-jepsen run-qemu` can drive the documented no-nemesis control workloads against the QEMU cluster with archived histories
+- the remaining blocker is external failover orchestration, not the basic client/protocol or control-run surface: the next target is to add crash/partition/mixed-failover execution so the release-blocking Jepsen nemesis runs can go green
 ## How To Check Progress
 - implementation status: [work-breakdown.md](./work-breakdown.md)
 - milestone sequencing: [roadmap.md](./roadmap.md)

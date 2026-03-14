@@ -18,11 +18,12 @@ use allocdb_node::local_cluster::{
     parse_control_request, request_control_status, request_control_stop, timeline_path,
 };
 use allocdb_node::replica::{
-    ReplicaId, ReplicaIdentity, ReplicaNode, ReplicaNodeStatus, ReplicaRole,
+    ReplicaId, ReplicaIdentity, ReplicaNode, ReplicaNodeStatus, ReplicaPreparedKind, ReplicaRole,
 };
 use allocdb_node::{
     ApiRequest, ApiResponse, MetricsResponse, ReservationResponse, ResourceResponse,
-    SubmissionFailure, SubmissionFailureCode, SubmitResponse, decode_request, encode_response,
+    SubmissionFailure, SubmissionFailureCode, SubmitResponse, TickExpirationsApplied,
+    TickExpirationsResponse, decode_request, encode_response,
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -33,6 +34,8 @@ const PROTOCOL_REQUEST_PREPARE: u8 = 1;
 const PROTOCOL_REQUEST_COMMIT: u8 = 2;
 const PROTOCOL_RESPONSE_PREPARE_ACK: u8 = 1;
 const PROTOCOL_RESPONSE_COMMIT_ACK: u8 = 2;
+const PROTOCOL_PREPARED_KIND_CLIENT: u8 = 1;
+const PROTOCOL_PREPARED_KIND_INTERNAL: u8 = 2;
 
 enum ParsedCommand {
     Help,
@@ -73,6 +76,7 @@ enum ParsedCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ReplicaProtocolRequest {
     Prepare {
+        kind: ReplicaPreparedKind,
         view: u64,
         lsn: u64,
         request_slot: Slot,
@@ -720,9 +724,9 @@ fn handle_client_stream(
         ApiRequest::GetResource(request) => Ok(handle_resource_request(node, request)),
         ApiRequest::GetReservation(request) => Ok(handle_reservation_request(node, request)),
         ApiRequest::GetMetrics(request) => Ok(handle_metrics_request(node, request)),
-        ApiRequest::TickExpirations(_) => Err(String::from(
-            "replicated tick_expirations transport not implemented",
-        )),
+        ApiRequest::TickExpirations(request) => {
+            handle_replicated_tick_expirations(node, layout, replica, request)
+        }
     };
 
     match response {
@@ -753,12 +757,14 @@ fn handle_protocol_stream(
         .map_err(|error| format!("failed to decode protocol request: {error}"));
     let response = match request {
         Ok(ReplicaProtocolRequest::Prepare {
+            kind,
             view,
             lsn,
             request_slot,
             payload,
         }) => {
             let entry = allocdb_node::ReplicaPreparedEntry {
+                kind,
                 view,
                 lsn: Lsn(lsn),
                 request_slot,
@@ -845,6 +851,68 @@ fn handle_replicated_submit(
     )))
 }
 
+fn handle_replicated_tick_expirations(
+    node: &mut ReplicaNode,
+    layout: &LocalClusterLayout,
+    replica: &LocalClusterReplicaConfig,
+    request: allocdb_node::TickExpirationsRequest,
+) -> Result<Vec<u8>, String> {
+    if node.status() != ReplicaNodeStatus::Active {
+        return Err(String::from("replica faulted"));
+    }
+    if node.metadata().role != ReplicaRole::Primary {
+        return Err(format!(
+            "not primary: role={}",
+            encode_role(node.metadata().role)
+        ));
+    }
+
+    let entries = match node.prepare_expiration_tick(request.current_wall_clock_slot) {
+        Ok(entries) => entries,
+        Err(allocdb_node::ReplicaProtocolError::PendingPreparedEntries { .. }) => {
+            return Ok(storage_failure_tick_response());
+        }
+        Err(allocdb_node::ReplicaProtocolError::Submission(error)) => {
+            return Ok(tick_rejection_response(&error));
+        }
+        Err(error) => return Err(protocol_error_message(&error)),
+    };
+
+    let mut processed_count = 0_u32;
+    let mut last_applied_lsn = None;
+    for entry in &entries {
+        let acked_replicas = collect_prepare_quorum(layout, replica, entry);
+        if acked_replicas < majority_quorum(layout) {
+            log_quorum_unavailable(replica, entry, acked_replicas, majority_quorum(layout));
+            return Ok(storage_failure_tick_response());
+        }
+
+        let result = match node.commit_prepared_through(entry.lsn) {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                return Err(format!(
+                    "primary commit at lsn {} did not apply one prepared entry",
+                    entry.lsn.get()
+                ));
+            }
+            Err(allocdb_node::ReplicaProtocolError::Submission(error)) => {
+                return Ok(tick_rejection_response(&error));
+            }
+            Err(error) => return Err(protocol_error_message(&error)),
+        };
+        broadcast_commit_to_backups(layout, replica, entry);
+        processed_count = processed_count.saturating_add(1);
+        last_applied_lsn = Some(result.applied_lsn);
+    }
+
+    Ok(encode_response(&ApiResponse::TickExpirations(
+        TickExpirationsResponse::Applied(TickExpirationsApplied {
+            processed_count,
+            last_applied_lsn,
+        }),
+    )))
+}
+
 enum PreparedSubmit {
     Entry(allocdb_node::ReplicaPreparedEntry),
     Response(Vec<u8>),
@@ -888,6 +956,7 @@ fn collect_prepare_quorum(
             continue;
         }
         let request = ReplicaProtocolRequest::Prepare {
+            kind: entry.kind,
             view: entry.view,
             lsn: entry.lsn.get(),
             request_slot: entry.request_slot,
@@ -955,12 +1024,27 @@ fn submission_rejection_response(error: &allocdb_node::SubmissionError) -> Vec<u
     encode_response(&response)
 }
 
+fn tick_rejection_response(error: &allocdb_node::SubmissionError) -> Vec<u8> {
+    encode_response(&ApiResponse::TickExpirations(
+        TickExpirationsResponse::Rejected(SubmissionFailure::from_submission_error(error)),
+    ))
+}
+
 fn storage_failure_submit_response() -> Vec<u8> {
     let response = ApiResponse::Submit(SubmitResponse::Rejected(SubmissionFailure {
         category: allocdb_node::SubmissionErrorCategory::Indefinite,
         code: SubmissionFailureCode::StorageFailure,
     }));
     encode_response(&response)
+}
+
+fn storage_failure_tick_response() -> Vec<u8> {
+    encode_response(&ApiResponse::TickExpirations(
+        TickExpirationsResponse::Rejected(SubmissionFailure {
+            category: allocdb_node::SubmissionErrorCategory::Indefinite,
+            code: SubmissionFailureCode::StorageFailure,
+        }),
+    ))
 }
 
 fn log_prepare_ack_rejected(
@@ -1171,12 +1255,14 @@ fn encode_replica_protocol_request(request: &ReplicaProtocolRequest) -> Result<V
     let mut bytes = Vec::new();
     match request {
         ReplicaProtocolRequest::Prepare {
+            kind,
             view,
             lsn,
             request_slot,
             payload,
         } => {
             bytes.push(PROTOCOL_REQUEST_PREPARE);
+            bytes.push(encode_protocol_prepared_kind(*kind));
             bytes.extend_from_slice(&view.to_le_bytes());
             bytes.extend_from_slice(&lsn.to_le_bytes());
             bytes.extend_from_slice(&request_slot.get().to_le_bytes());
@@ -1199,6 +1285,7 @@ fn decode_replica_protocol_request(bytes: &[u8]) -> Result<ReplicaProtocolReques
     let tag = read_u8(bytes, &mut cursor)?;
     let request = match tag {
         PROTOCOL_REQUEST_PREPARE => {
+            let kind = decode_protocol_prepared_kind(read_u8(bytes, &mut cursor)?)?;
             let view = read_u64(bytes, &mut cursor)?;
             let lsn = read_u64(bytes, &mut cursor)?;
             let request_slot = Slot(read_u64(bytes, &mut cursor)?);
@@ -1206,6 +1293,7 @@ fn decode_replica_protocol_request(bytes: &[u8]) -> Result<ReplicaProtocolReques
                 .map_err(|_| String::from("protocol payload length exceeds usize"))?;
             let payload = read_bytes(bytes, &mut cursor, payload_len)?;
             ReplicaProtocolRequest::Prepare {
+                kind,
                 view,
                 lsn,
                 request_slot,
@@ -1220,6 +1308,21 @@ fn decode_replica_protocol_request(bytes: &[u8]) -> Result<ReplicaProtocolReques
     };
     finish_decode(bytes, cursor)?;
     Ok(request)
+}
+
+const fn encode_protocol_prepared_kind(kind: ReplicaPreparedKind) -> u8 {
+    match kind {
+        ReplicaPreparedKind::Client => PROTOCOL_PREPARED_KIND_CLIENT,
+        ReplicaPreparedKind::Internal => PROTOCOL_PREPARED_KIND_INTERNAL,
+    }
+}
+
+fn decode_protocol_prepared_kind(value: u8) -> Result<ReplicaPreparedKind, String> {
+    match value {
+        PROTOCOL_PREPARED_KIND_CLIENT => Ok(ReplicaPreparedKind::Client),
+        PROTOCOL_PREPARED_KIND_INTERNAL => Ok(ReplicaPreparedKind::Internal),
+        other => Err(format!("invalid protocol prepared kind {other}")),
+    }
 }
 
 fn encode_replica_protocol_response(response: ReplicaProtocolResponse) -> Vec<u8> {

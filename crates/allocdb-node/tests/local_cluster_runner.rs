@@ -7,14 +7,16 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use allocdb_core::command::{ClientRequest, Command as AllocCommand};
-use allocdb_core::ids::{ClientId, Lsn, OperationId, ResourceId, Slot};
+use allocdb_core::ids::{ClientId, HolderId, Lsn, OperationId, ResourceId, Slot};
+use allocdb_core::{ReservationState, ResourceState};
 use allocdb_node::local_cluster::{
     LocalClusterFaultState, LocalClusterLayout, LocalClusterTimelineEventKind,
     load_local_cluster_timeline, request_control_status,
 };
 use allocdb_node::{
     ApiRequest, ApiResponse, ReplicaId, ReplicaMetadataFile, ReplicaRole, ResourceRequest,
-    ResourceResponse, SubmitRequest, SubmitResponse, decode_response, encode_request,
+    ResourceResponse, SubmitRequest, SubmitResponse, TickExpirationsRequest,
+    TickExpirationsResponse, decode_response, encode_request,
 };
 
 fn temp_workspace(name: &str) -> PathBuf {
@@ -160,6 +162,23 @@ fn create_request(resource_id: u128, operation_id: u128) -> ClientRequest {
         client_id: ClientId(7),
         command: AllocCommand::CreateResource {
             resource_id: ResourceId(resource_id),
+        },
+    }
+}
+
+fn reserve_request(
+    resource_id: u128,
+    operation_id: u128,
+    holder_id: u128,
+    ttl_slots: u64,
+) -> ClientRequest {
+    ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: AllocCommand::Reserve {
+            resource_id: ResourceId(resource_id),
+            holder_id: HolderId(holder_id),
+            ttl_slots,
         },
     }
 }
@@ -474,4 +493,101 @@ fn local_cluster_client_transport_retries_same_ambiguous_write() {
         read,
         ApiResponse::GetResource(ResourceResponse::Found(_))
     ));
+}
+
+#[test]
+fn local_cluster_tick_expirations_replicates_internal_commands() {
+    let _serial_guard = local_cluster_test_guard();
+    let workspace_root = temp_workspace("tick-expirations");
+    let _guard = ClusterGuard::new(workspace_root.clone());
+
+    let start_output = start_cluster_with_retry(&workspace_root);
+    assert_success(&start_output, "initial cluster start");
+
+    let layout_path = allocdb_node::local_cluster::layout_path(&workspace_root);
+    let layout = LocalClusterLayout::load(&layout_path).unwrap();
+    let primary = layout.replica(ReplicaId(1)).unwrap();
+
+    let create = send_api_request(
+        primary.client_addr,
+        &ApiRequest::Submit(SubmitRequest::from_client_request(
+            Slot(1),
+            create_request(501, 9_300),
+        )),
+    );
+    assert!(matches!(
+        create,
+        ApiResponse::Submit(SubmitResponse::Committed(_))
+    ));
+
+    let reserve = send_api_request(
+        primary.client_addr,
+        &ApiRequest::Submit(SubmitRequest::from_client_request(
+            Slot(10),
+            reserve_request(501, 9_301, 44, 2),
+        )),
+    );
+    let reservation_id = match reserve {
+        ApiResponse::Submit(SubmitResponse::Committed(response)) => {
+            assert_eq!(response.applied_lsn, Lsn(2));
+            response
+                .outcome
+                .reservation_id
+                .expect("reserve should assign one reservation id")
+        }
+        other => panic!("expected committed reserve response, got {other:?}"),
+    };
+
+    let tick = send_api_request(
+        primary.client_addr,
+        &ApiRequest::TickExpirations(TickExpirationsRequest {
+            current_wall_clock_slot: Slot(12),
+        }),
+    );
+    let tick_lsn = match tick {
+        ApiResponse::TickExpirations(TickExpirationsResponse::Applied(response)) => {
+            assert_eq!(response.processed_count, 1);
+            response
+                .last_applied_lsn
+                .expect("tick should apply one expiration")
+        }
+        other => panic!("expected applied tick response, got {other:?}"),
+    };
+    assert_eq!(tick_lsn, Lsn(3));
+
+    for replica in &layout.replicas {
+        let status = request_control_status(replica.control_addr).unwrap();
+        assert_eq!(status.commit_lsn, Some(Lsn(3)));
+    }
+
+    let resource = send_api_request(
+        primary.client_addr,
+        &ApiRequest::GetResource(ResourceRequest {
+            resource_id: ResourceId(501),
+            required_lsn: Some(tick_lsn),
+        }),
+    );
+    match resource {
+        ApiResponse::GetResource(ResourceResponse::Found(resource)) => {
+            assert_eq!(resource.state, ResourceState::Available);
+            assert_eq!(resource.current_reservation_id, None);
+        }
+        other => panic!("expected available resource after tick, got {other:?}"),
+    }
+
+    let reservation = send_api_request(
+        primary.client_addr,
+        &ApiRequest::GetReservation(allocdb_node::ReservationRequest {
+            reservation_id,
+            current_slot: Slot(12),
+            required_lsn: Some(tick_lsn),
+        }),
+    );
+    match reservation {
+        ApiResponse::GetReservation(allocdb_node::ReservationResponse::Found(reservation)) => {
+            assert_eq!(reservation.state, ReservationState::Expired);
+            assert_eq!(reservation.released_lsn, Some(tick_lsn));
+        }
+        other => panic!("expected expired reservation after tick, got {other:?}"),
+    }
 }

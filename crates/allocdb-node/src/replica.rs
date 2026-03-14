@@ -3,13 +3,15 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use allocdb_core::command::Command;
+use allocdb_core::command_codec::encode_internal_command;
 use allocdb_core::config::Config;
 use allocdb_core::ids::{Lsn, Slot};
 use log::{error, info, warn};
 
 use crate::engine::{
-    CheckpointError, CheckpointResult, EngineConfig, EngineOpenError, ReadError,
-    RecoverEngineError, SingleNodeEngine, SubmissionError, SubmissionResult,
+    CheckpointError, CheckpointResult, EngineConfig, EngineOpenError, PlannedExpirationBatch,
+    ReadError, RecoverEngineError, SingleNodeEngine, SubmissionError, SubmissionResult,
 };
 
 #[cfg(all(test, unix))]
@@ -24,7 +26,7 @@ const MAX_REPLICA_METADATA_BYTES: u64 = 256;
 const REPLICA_METADATA_MAGIC: [u8; 4] = *b"RPLM";
 const REPLICA_METADATA_VERSION: u8 = 2;
 const REPLICA_PREPARE_LOG_MAGIC: [u8; 4] = *b"RPLP";
-const REPLICA_PREPARE_LOG_VERSION: u8 = 1;
+const REPLICA_PREPARE_LOG_VERSION: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplicaId(pub u64);
@@ -220,12 +222,41 @@ impl ReplicaPaths {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplicaPreparedKind {
+    Client,
+    Internal,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaPreparedEntry {
+    pub kind: ReplicaPreparedKind,
     pub view: u64,
     pub lsn: Lsn,
     pub request_slot: Slot,
     pub payload: Vec<u8>,
+}
+
+impl ReplicaPreparedEntry {
+    fn client(view: u64, lsn: Lsn, request_slot: Slot, payload: &[u8]) -> Self {
+        Self {
+            kind: ReplicaPreparedKind::Client,
+            view,
+            lsn,
+            request_slot,
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn internal(view: u64, lsn: Lsn, request_slot: Slot, command: Command) -> Self {
+        Self {
+            kind: ReplicaPreparedKind::Internal,
+            view,
+            lsn,
+            request_slot,
+            payload: encode_internal_command(command),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -406,6 +437,9 @@ pub enum ReplicaProtocolError {
     PrepareOrderMismatch {
         expected_lsn: Lsn,
         found_lsn: Lsn,
+    },
+    PendingPreparedEntries {
+        count: usize,
     },
     PreparedEntryConflict {
         lsn: Lsn,
@@ -768,6 +802,11 @@ impl ReplicaNode {
             .map(|(_, entry)| entry.clone())
     }
 
+    #[must_use]
+    pub fn has_pending_prepared_entries(&self) -> bool {
+        !self.prepared_entries.is_empty()
+    }
+
     /// Persists one local checkpoint through the wrapped single-node engine and updates the active
     /// snapshot anchor in replica metadata.
     ///
@@ -901,14 +940,49 @@ impl ReplicaNode {
     ) -> Result<ReplicaPreparedEntry, ReplicaProtocolError> {
         self.require_role(ReplicaRole::Primary)?;
         let next_lsn = self.next_prepared_lsn()?;
-        let entry = ReplicaPreparedEntry {
-            view: self.metadata.current_view,
-            lsn: next_lsn,
+        let entry = ReplicaPreparedEntry::client(
+            self.metadata.current_view,
+            next_lsn,
             request_slot,
-            payload: payload.to_vec(),
-        };
+            payload,
+        );
         self.append_prepared_entry(entry.clone())?;
         Ok(entry)
+    }
+
+    /// Plans and durably prepares the bounded internal expiration batch for one primary tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicaProtocolError`] if the replica is not the active primary, if there is
+    /// already one unresolved prepared suffix, if the expiration planner rejects the current slot,
+    /// or if any prepared internal entry cannot be persisted.
+    pub fn prepare_expiration_tick(
+        &mut self,
+        current_wall_clock_slot: Slot,
+    ) -> Result<Vec<ReplicaPreparedEntry>, ReplicaProtocolError> {
+        self.require_role(ReplicaRole::Primary)?;
+        if !self.prepared_entries.is_empty() {
+            return Err(ReplicaProtocolError::PendingPreparedEntries {
+                count: self.prepared_entries.len(),
+            });
+        }
+
+        let PlannedExpirationBatch {
+            request_slot,
+            commands,
+        } = self
+            .engine
+            .as_ref()
+            .ok_or(ReplicaProtocolError::Inactive(self.status))?
+            .plan_expiration_batch(current_wall_clock_slot)?;
+
+        let mut entries = Vec::with_capacity(commands.len());
+        for command in commands {
+            let entry = self.prepare_internal_command(request_slot, command)?;
+            entries.push(entry);
+        }
+        Ok(entries)
     }
 
     /// Durably appends one already-assigned prepared entry without applying it to allocator state.
@@ -945,8 +1019,16 @@ impl ReplicaNode {
             });
         }
 
-        self.engine_mut()?
-            .validate_encoded_submission(entry.request_slot, &entry.payload)?;
+        match entry.kind {
+            ReplicaPreparedKind::Client => self
+                .engine_mut()?
+                .validate_encoded_submission(entry.request_slot, &entry.payload)?,
+            ReplicaPreparedKind::Internal => self
+                .engine
+                .as_ref()
+                .ok_or(ReplicaProtocolError::Inactive(self.status))?
+                .validate_internal_submission(entry.request_slot, &entry.payload)?,
+        }
         self.prepared_entries.insert(entry.lsn.get(), entry);
         self.persist_prepared_entries()
     }
@@ -1077,6 +1159,22 @@ impl ReplicaNode {
             .map_err(|error| ReplicaProtocolError::PrepareStorage(error.kind()))
     }
 
+    fn prepare_internal_command(
+        &mut self,
+        request_slot: Slot,
+        command: Command,
+    ) -> Result<ReplicaPreparedEntry, ReplicaProtocolError> {
+        let next_lsn = self.next_prepared_lsn()?;
+        let entry = ReplicaPreparedEntry::internal(
+            self.metadata.current_view,
+            next_lsn,
+            request_slot,
+            command,
+        );
+        self.append_prepared_entry(entry.clone())?;
+        Ok(entry)
+    }
+
     fn commit_prepared_through_impl(
         &mut self,
         commit_lsn: Lsn,
@@ -1107,9 +1205,14 @@ impl ReplicaNode {
                     found: entry.view,
                 });
             }
-            let result = self
-                .engine_mut()?
-                .submit_encoded(entry.request_slot, &entry.payload)?;
+            let result = match entry.kind {
+                ReplicaPreparedKind::Client => self
+                    .engine_mut()?
+                    .submit_encoded(entry.request_slot, &entry.payload)?,
+                ReplicaPreparedKind::Internal => self
+                    .engine_mut()?
+                    .apply_encoded_internal(entry.request_slot, &entry.payload)?,
+            };
             if result.applied_lsn != entry.lsn {
                 return Err(ReplicaProtocolError::AppliedLsnMismatch {
                     expected: entry.lsn,
@@ -1273,6 +1376,7 @@ fn encode_prepare_log(entries: &BTreeMap<u64, ReplicaPreparedEntry>) -> Vec<u8> 
             .to_le_bytes(),
     );
     for entry in entries.values() {
+        bytes.push(encode_prepared_kind(entry.kind));
         bytes.extend_from_slice(&entry.view.to_le_bytes());
         bytes.extend_from_slice(&entry.lsn.get().to_le_bytes());
         bytes.extend_from_slice(&entry.request_slot.get().to_le_bytes());
@@ -1284,6 +1388,13 @@ fn encode_prepare_log(entries: &BTreeMap<u64, ReplicaPreparedEntry>) -> Vec<u8> 
         bytes.extend_from_slice(&entry.payload);
     }
     bytes
+}
+
+const fn encode_prepared_kind(kind: ReplicaPreparedKind) -> u8 {
+    match kind {
+        ReplicaPreparedKind::Client => 1,
+        ReplicaPreparedKind::Internal => 2,
+    }
 }
 
 fn encode_replica_metadata(metadata: &ReplicaMetadata) -> Vec<u8> {

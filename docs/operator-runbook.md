@@ -121,6 +121,7 @@ Command surface:
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- analyze --history-file <history.txt>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-qemu-surface --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- run-qemu --workspace <path> --run-id <run-id> --output-root <artifacts>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-qemu --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
 
 What `prepare` does:
@@ -186,11 +187,11 @@ Current limits:
 
 - the first QEMU testbed still depends on one supported cloud image already being available or
   downloadable on the host
-- `verify-qemu-surface` now proves one real metrics probe on every replica plus one real primary
-  submit/read round trip, but it is still only one surface check, not the full Jepsen workload
-  executor
-- replicated `tick_expirations`, automated failover runs, and the full release-blocking Jepsen
-  workload families remain follow-on work
+- `verify-qemu-surface` still proves only one basic metrics plus primary submit/read round trip
+- `run-qemu` now executes the `*-control` Jepsen runs, including one real replicated
+  `tick_expirations` flow, but crash/partition/mixed-failover runs remain blocked
+- automated failover/view-change orchestration is still missing from the external runtime, so the
+  release-blocking nemesis runs remain follow-on work
 
 ## Single-Node Engine
 
