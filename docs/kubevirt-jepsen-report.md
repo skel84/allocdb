@@ -109,6 +109,10 @@ history and be treated as build/test artifacts.
 
 ## Representative Evidence
 
+These links point at local, git-ignored `.artifacts/` paths inside one developer workspace. They
+are representative evidence locations for rerun and audit work, not repository-hosted artifacts for
+fresh clones.
+
 Representative final status files:
 
 - [`reservation_contention-crash-restart-status.txt`](../.artifacts/kubevirt-jepsen-20260315/lane-a/reservation_contention-crash-restart-status.txt)

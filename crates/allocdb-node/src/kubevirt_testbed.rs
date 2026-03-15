@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::{self, Write as _};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -116,27 +117,7 @@ impl KubevirtTestbedLayout {
         control_guest: KubevirtGuestConfig,
         replica_guests: Vec<KubevirtGuestConfig>,
     ) -> Result<Self, KubevirtTestbedLayoutError> {
-        let workspace_root = prepare_workspace_root(&config.workspace_root)?;
-        let config = KubevirtTestbedConfig {
-            workspace_root: workspace_root.clone(),
-            kubeconfig_path: config
-                .kubeconfig_path
-                .as_deref()
-                .map(absolutize_path)
-                .transpose()?,
-            namespace: config.namespace,
-            helper_pod_name: config.helper_pod_name,
-            helper_image: config.helper_image,
-            helper_stage_dir: absolutize_path(&config.helper_stage_dir)?,
-            ssh_private_key_path: absolutize_path(&config.ssh_private_key_path)?,
-        };
-        validate_replica_guests(&replica_guests)?;
-        Ok(Self {
-            replica_layout: build_guest_local_cluster_layout(&replica_guests),
-            config,
-            control_guest,
-            replica_guests,
-        })
+        build_layout(config, control_guest, replica_guests, true)
     }
 
     /// Loads one persisted `KubeVirt` layout from disk.
@@ -253,6 +234,7 @@ fn validate_replica_guests(
             value: replica_guests.len().to_string(),
         });
     }
+    let mut seen_addrs = HashSet::new();
     for (index, guest) in replica_guests.iter().enumerate() {
         let expected = u64::try_from(index).unwrap_or(0).saturating_add(1);
         if guest.replica_id != Some(ReplicaId(expected)) {
@@ -264,6 +246,12 @@ fn validate_replica_guests(
                 ),
             });
         }
+        if !seen_addrs.insert(guest.addr) {
+            return Err(KubevirtTestbedLayoutError::InvalidField {
+                field: format!("replica.{}.addr", index + 1),
+                value: guest.addr.to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -271,6 +259,42 @@ fn validate_replica_guests(
 fn prepare_workspace_root(workspace_root: &Path) -> Result<PathBuf, KubevirtTestbedLayoutError> {
     fs::create_dir_all(workspace_root)?;
     absolutize_path(workspace_root)
+}
+
+fn normalize_config(
+    config: KubevirtTestbedConfig,
+    prepare_workspace: bool,
+) -> Result<KubevirtTestbedConfig, KubevirtTestbedLayoutError> {
+    let workspace_root = if prepare_workspace {
+        prepare_workspace_root(&config.workspace_root)?
+    } else {
+        absolutize_path(&config.workspace_root)?
+    };
+    Ok(KubevirtTestbedConfig {
+        workspace_root,
+        kubeconfig_path: config
+            .kubeconfig_path
+            .as_deref()
+            .map(absolutize_path)
+            .transpose()?,
+        namespace: config.namespace,
+        helper_pod_name: config.helper_pod_name,
+        helper_image: config.helper_image,
+        helper_stage_dir: absolutize_path(&config.helper_stage_dir)?,
+        ssh_private_key_path: absolutize_path(&config.ssh_private_key_path)?,
+    })
+}
+
+fn validate_control_guest(
+    control_guest: &KubevirtGuestConfig,
+) -> Result<(), KubevirtTestbedLayoutError> {
+    if let Some(replica_id) = control_guest.replica_id {
+        return Err(KubevirtTestbedLayoutError::InvalidField {
+            field: String::from("control.replica_id"),
+            value: replica_id.get().to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn absolutize_path(path: &Path) -> Result<PathBuf, KubevirtTestbedLayoutError> {
@@ -364,7 +388,24 @@ fn decode_layout(bytes: &str) -> Result<KubevirtTestbedLayout, KubevirtTestbedLa
             })
         })
         .collect::<Result<Vec<_>, KubevirtTestbedLayoutError>>()?;
-    KubevirtTestbedLayout::new(config, control_guest, replica_guests)
+    build_layout(config, control_guest, replica_guests, false)
+}
+
+fn build_layout(
+    config: KubevirtTestbedConfig,
+    control_guest: KubevirtGuestConfig,
+    replica_guests: Vec<KubevirtGuestConfig>,
+    prepare_workspace: bool,
+) -> Result<KubevirtTestbedLayout, KubevirtTestbedLayoutError> {
+    let config = normalize_config(config, prepare_workspace)?;
+    validate_control_guest(&control_guest)?;
+    validate_replica_guests(&replica_guests)?;
+    Ok(KubevirtTestbedLayout {
+        replica_layout: build_guest_local_cluster_layout(&replica_guests),
+        config,
+        control_guest,
+        replica_guests,
+    })
 }
 
 fn parse_fields(
@@ -413,6 +454,14 @@ fn parse_ipv4(value: &str, field: &str) -> Result<Ipv4Addr, KubevirtTestbedLayou
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_suffix() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos()
+    }
 
     fn fixture_layout() -> KubevirtTestbedLayout {
         KubevirtTestbedLayout::new(
@@ -505,5 +554,84 @@ mod tests {
             error,
             KubevirtTestbedLayoutError::InvalidField { field, .. } if field == "replica_count"
         ));
+    }
+
+    #[test]
+    fn layout_rejects_control_guest_replica_id() {
+        let error = KubevirtTestbedLayout::new(
+            KubevirtTestbedConfig {
+                workspace_root: std::env::temp_dir().join(format!(
+                    "allocdb-kubevirt-invalid-control-{}",
+                    unique_suffix()
+                )),
+                kubeconfig_path: None,
+                namespace: String::from("kubevirt"),
+                helper_pod_name: String::from("allocdb-bootstrap-helper"),
+                helper_image: String::from("nicolaka/netshoot:latest"),
+                helper_stage_dir: PathBuf::from("/tmp/allocdb-stage"),
+                ssh_private_key_path: std::env::temp_dir().join("allocdb-kubevirt-testbed-key"),
+            },
+            KubevirtGuestConfig {
+                name: String::from("allocdb-control"),
+                replica_id: Some(ReplicaId(9)),
+                addr: Ipv4Addr::new(10, 42, 2, 48),
+            },
+            fixture_layout().replica_guests,
+        )
+        .expect_err("control guest replica id should fail");
+        assert!(matches!(
+            error,
+            KubevirtTestbedLayoutError::InvalidField { field, .. } if field == "control.replica_id"
+        ));
+    }
+
+    #[test]
+    fn layout_rejects_duplicate_replica_addresses() {
+        let mut replica_guests = fixture_layout().replica_guests;
+        replica_guests[1].addr = replica_guests[0].addr;
+        let error = KubevirtTestbedLayout::new(
+            KubevirtTestbedConfig {
+                workspace_root: std::env::temp_dir().join(format!(
+                    "allocdb-kubevirt-duplicate-addr-{}",
+                    unique_suffix()
+                )),
+                kubeconfig_path: None,
+                namespace: String::from("kubevirt"),
+                helper_pod_name: String::from("allocdb-bootstrap-helper"),
+                helper_image: String::from("nicolaka/netshoot:latest"),
+                helper_stage_dir: PathBuf::from("/tmp/allocdb-stage"),
+                ssh_private_key_path: std::env::temp_dir().join("allocdb-kubevirt-testbed-key"),
+            },
+            KubevirtGuestConfig {
+                name: String::from("allocdb-control"),
+                replica_id: None,
+                addr: Ipv4Addr::new(10, 42, 2, 48),
+            },
+            replica_guests,
+        )
+        .expect_err("duplicate replica addresses should fail");
+        assert!(matches!(
+            error,
+            KubevirtTestbedLayoutError::InvalidField { field, .. } if field == "replica.2.addr"
+        ));
+    }
+
+    #[test]
+    fn load_is_read_only_for_missing_workspace_root() {
+        let mut layout = fixture_layout();
+        let temp_root = std::env::temp_dir().join(format!(
+            "allocdb-kubevirt-read-only-load-{}",
+            unique_suffix()
+        ));
+        let layout_path = temp_root.join("layout.txt");
+        let missing_workspace_root = temp_root.join("missing-workspace-root");
+        layout.config.workspace_root = missing_workspace_root.clone();
+        std::fs::create_dir_all(&temp_root).expect("create temp root");
+        std::fs::write(&layout_path, encode_layout(&layout)).expect("write layout");
+
+        let loaded = KubevirtTestbedLayout::load(&layout_path).expect("load kubevirt layout");
+
+        assert_eq!(loaded.config.workspace_root, missing_workspace_root);
+        assert!(!loaded.config.workspace_root.exists());
     }
 }

@@ -1157,7 +1157,7 @@ fn collect_prepare_quorum(
     entry: &allocdb_node::ReplicaPreparedEntry,
 ) -> PrepareQuorumResult {
     let mut acked_replicas = 1_usize;
-    let mut acked_peers = vec![replica.replica_id];
+    let mut acked_peers = Vec::new();
     for peer in &layout.replicas {
         if peer.replica_id == replica.replica_id {
             continue;
@@ -1249,7 +1249,7 @@ fn broadcast_commit_to_backups(
     entry: &allocdb_node::ReplicaPreparedEntry,
 ) -> CommitBroadcastResult {
     let mut acked_replicas = 1_usize;
-    let mut acked_peers = vec![replica.replica_id];
+    let mut acked_peers = Vec::new();
     for peer in &layout.replicas {
         if peer.replica_id == replica.replica_id {
             continue;

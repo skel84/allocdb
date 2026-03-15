@@ -447,12 +447,15 @@ surface:
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- capture-kubevirt-layout --workspace <path> --kubeconfig <path> --namespace <name> --ssh-private-key <path>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-qemu-surface --workspace <path>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-kubevirt-surface --workspace <path>`
-- `cargo run -p allocdb-node --bin allocdb-jepsen -- run-qemu --workspace <path> --run-id <run-id> --output-root <artifacts>`
-- `cargo run -p allocdb-node --bin allocdb-jepsen -- run-kubevirt --workspace <path> --run-id <run-id> --output-root <artifacts>`
-- `cargo run -p allocdb-node --bin allocdb-jepsen -- watch-kubevirt --workspace <path> --output-root <artifacts> [--run-id <run-id>] [--follow]`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- run-qemu --workspace <path> --run-id <run-id> --output-root .artifacts/`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- run-kubevirt --workspace <path> --run-id <run-id> --output-root .artifacts/`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- watch-kubevirt --workspace <path> --output-root .artifacts/ [--run-id <run-id>] [--follow]`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- watch-kubevirt-fleet --lane <name,workspace,output-root> [--lane <name,workspace,output-root> ...] [--refresh-millis <ms>] [--follow]`
-- `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-qemu --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
-- `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-kubevirt --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-qemu --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root .artifacts/`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-kubevirt --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root .artifacts/`
+
+Use the repo-local `.artifacts/` directory as the default Jepsen output root so release-gate
+evidence stays inside the workspace tree without polluting git history.
 
 For local debugging only, faulted `run-qemu` and `run-kubevirt` runs also honor
 `ALLOCDB_JEPSEN_FAULT_WINDOW_SECS_OVERRIDE=<secs>`. That override shortens the live fault window
