@@ -1,5 +1,6 @@
 import clsx from "clsx";
 import Link from "@docusaurus/Link";
+import type { ReactElement } from "react";
 import useDocusaurusContext from "@docusaurus/useDocusaurusContext";
 import Layout from "@theme/Layout";
 import Heading from "@theme/Heading";
@@ -24,14 +25,12 @@ function HomepageHeader() {
           </Link>
           <Link
             className="button button--secondary button--outline button--lg"
-            style={{ marginLeft: "10px" }}
             to="/docs/architecture"
           >
             View Architecture
           </Link>
           <Link
             className="button button--secondary button--outline button--lg"
-            style={{ marginLeft: "10px" }}
             to="/blog"
           >
             Read Blog
@@ -42,7 +41,7 @@ function HomepageHeader() {
   );
 }
 
-export default function Home(): JSX.Element {
+export default function Home(): ReactElement {
   const { siteConfig } = useDocusaurusContext();
   return (
     <Layout

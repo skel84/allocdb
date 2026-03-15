@@ -13,8 +13,8 @@ const config: Config = {
   organizationName: "skel84",
   projectName: "allocdb",
 
-  onBrokenLinks: "warn",
-  onBrokenMarkdownLinks: "warn",
+  onBrokenLinks: "throw",
+  onBrokenMarkdownLinks: "throw",
 
   i18n: {
     defaultLocale: "en",
