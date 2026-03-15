@@ -451,8 +451,11 @@ pub(super) fn decode_tracker_field(value: &str) -> String {
             match chars.next() {
                 Some('n') => output.push('\n'),
                 Some(other) => {
-                    output.push('\\');
-                    output.push(other);
+                    if other == '\\' {
+                        output.push('\\');
+                    } else {
+                        output.push(other);
+                    }
                 }
                 None => output.push('\\'),
             }

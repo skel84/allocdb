@@ -629,3 +629,356 @@ fn send_replica_api_request<T: ExternalTestbed>(
 fn response_text_is_not_primary(text: &str) -> bool {
     text.contains("not primary")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use allocdb_core::config::Config;
+    use allocdb_core::result::CommandOutcome;
+    use allocdb_node::encode_response;
+    use allocdb_node::engine::{EngineConfig, ExpirationTickResult, SubmissionErrorCategory};
+    use allocdb_node::local_cluster::LocalClusterLayout;
+    use allocdb_node::{InvalidRequestReason, SubmissionResult};
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    struct FakeExternalTestbed {
+        workspace_root: PathBuf,
+        replica_layout: LocalClusterLayout,
+        responses: Mutex<VecDeque<Result<Vec<u8>, String>>>,
+    }
+
+    impl FakeExternalTestbed {
+        fn new(responses: Vec<Result<Vec<u8>, String>>) -> Self {
+            let workspace_root = PathBuf::from("/tmp/allocdb-jepsen-events-tests");
+            let replica = LocalClusterReplicaConfig {
+                replica_id: allocdb_node::ReplicaId(1),
+                role: allocdb_node::ReplicaRole::Primary,
+                workspace_dir: workspace_root.join("replica-1"),
+                log_path: workspace_root.join("replica-1.log"),
+                pid_path: workspace_root.join("replica-1.pid"),
+                paths: allocdb_node::ReplicaPaths::new(
+                    workspace_root.join("replica-1.metadata"),
+                    workspace_root.join("replica-1.snapshot"),
+                    workspace_root.join("replica-1.wal"),
+                ),
+                control_addr: SocketAddr::from(([127, 0, 0, 1], 17_001)),
+                client_addr: SocketAddr::from(([127, 0, 0, 1], 18_001)),
+                protocol_addr: SocketAddr::from(([127, 0, 0, 1], 19_001)),
+            };
+            Self {
+                workspace_root: workspace_root.clone(),
+                replica_layout: LocalClusterLayout {
+                    workspace_root,
+                    current_view: 1,
+                    core_config: Config {
+                        shard_id: 1,
+                        max_resources: 64,
+                        max_reservations: 64,
+                        max_operations: 256,
+                        max_ttl_slots: 64,
+                        max_client_retry_window_slots: 64,
+                        reservation_history_window_slots: 32,
+                        max_expiration_bucket_len: 64,
+                    },
+                    engine_config: EngineConfig {
+                        max_submission_queue: 64,
+                        max_command_bytes: 4096,
+                        max_expirations_per_tick: 16,
+                    },
+                    replicas: vec![replica],
+                },
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+    }
+
+    impl crate::surface::ExternalTestbed for FakeExternalTestbed {
+        fn backend_name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn workspace_root(&self) -> &Path {
+            &self.workspace_root
+        }
+
+        fn replica_layout(&self) -> &LocalClusterLayout {
+            &self.replica_layout
+        }
+
+        fn run_remote_tcp_request(
+            &self,
+            _host: &str,
+            _port: u16,
+            _request_bytes: &[u8],
+        ) -> Result<Vec<u8>, String> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(String::from("no fake response queued")))
+        }
+
+        fn run_remote_host_command(
+            &self,
+            _remote_command: &str,
+            _stdin_bytes: Option<&[u8]>,
+        ) -> Result<Vec<u8>, String> {
+            Err(String::from("fake host command is not implemented"))
+        }
+    }
+
+    fn test_operation() -> JepsenOperation {
+        JepsenOperation {
+            kind: JepsenOperationKind::Reserve,
+            operation_id: Some(9),
+            resource_id: Some(ResourceId(7)),
+            reservation_id: None,
+            holder_id: Some(11),
+            required_lsn: None,
+            request_slot: Some(Slot(3)),
+            ttl_slots: Some(5),
+        }
+    }
+
+    fn encoded_api_response(response: &ApiResponse) -> Vec<u8> {
+        encode_response(response)
+    }
+
+    #[test]
+    fn map_reserve_submit_response_maps_expected_result_codes() {
+        let operation = test_operation();
+
+        let committed = map_reserve_submit_response(
+            operation.clone(),
+            ResourceId(7),
+            HolderId(11),
+            SubmitResponse::Committed(
+                SubmissionResult {
+                    applied_lsn: Lsn(21),
+                    outcome: CommandOutcome::with_reservation(
+                        ResultCode::Ok,
+                        ReservationId(31),
+                        Slot(99),
+                    ),
+                    from_retry_cache: false,
+                }
+                .into(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(committed.2.unwrap().reservation_id, ReservationId(31));
+
+        let busy = map_reserve_submit_response(
+            operation.clone(),
+            ResourceId(7),
+            HolderId(11),
+            SubmitResponse::Committed(
+                SubmissionResult {
+                    applied_lsn: Lsn(21),
+                    outcome: CommandOutcome::new(ResultCode::ResourceBusy),
+                    from_retry_cache: false,
+                }
+                .into(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            busy.1,
+            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::Busy)
+        );
+
+        let retired = map_reserve_submit_response(
+            operation,
+            ResourceId(7),
+            HolderId(11),
+            SubmitResponse::Committed(
+                SubmissionResult {
+                    applied_lsn: Lsn(21),
+                    outcome: CommandOutcome::new(ResultCode::ReservationRetired),
+                    from_retry_cache: false,
+                }
+                .into(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            retired.1,
+            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::Retired)
+        );
+    }
+
+    #[test]
+    fn outcome_from_submission_failure_maps_rejection_codes() {
+        let overloaded = outcome_from_submission_failure(SubmissionFailure {
+            category: SubmissionErrorCategory::DefiniteFailure,
+            code: SubmissionFailureCode::Overloaded {
+                queue_depth: 9,
+                queue_capacity: 16,
+            },
+        });
+        assert_eq!(
+            overloaded,
+            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::Busy)
+        );
+
+        let invalid = outcome_from_submission_failure(SubmissionFailure {
+            category: SubmissionErrorCategory::DefiniteFailure,
+            code: SubmissionFailureCode::InvalidRequest(InvalidRequestReason::InvalidLayout),
+        });
+        assert_eq!(
+            invalid,
+            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::InvalidRequest)
+        );
+
+        let halted = outcome_from_submission_failure(SubmissionFailure {
+            category: SubmissionErrorCategory::DefiniteFailure,
+            code: SubmissionFailureCode::EngineHalted,
+        });
+        assert_eq!(
+            halted,
+            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::EngineHalted)
+        );
+    }
+
+    #[test]
+    fn drain_expiration_until_resource_available_reports_retry_exhaustion() {
+        let mut responses = Vec::new();
+        for attempt in 0..MAX_EXPIRATION_RECOVERY_DRAIN_TICKS {
+            responses.push(Ok(encoded_api_response(&ApiResponse::GetResource(
+                ResourceResponse::Found(allocdb_node::ResourceView {
+                    resource_id: ResourceId(7),
+                    state: allocdb_core::ResourceState::Reserved,
+                    current_reservation_id: Some(ReservationId(70 + u128::from(attempt))),
+                    version: attempt,
+                }),
+            ))));
+            responses.push(Ok(encoded_api_response(&ApiResponse::TickExpirations(
+                TickExpirationsResponse::Applied(
+                    ExpirationTickResult {
+                        processed_count: 1,
+                        last_applied_lsn: Some(Lsn(40 + attempt)),
+                    }
+                    .into(),
+                ),
+            ))));
+        }
+        responses.push(Ok(encoded_api_response(&ApiResponse::GetResource(
+            ResourceResponse::Found(allocdb_node::ResourceView {
+                resource_id: ResourceId(7),
+                state: allocdb_core::ResourceState::Reserved,
+                current_reservation_id: Some(ReservationId(999)),
+                version: 99,
+            }),
+        ))));
+
+        let layout = FakeExternalTestbed::new(responses);
+        let replica = layout.replica_layout.replicas[0].clone();
+        let context = RunExecutionContext::new(
+            crate::tracker::RunTracker::new(
+                layout.backend_name(),
+                &allocdb_node::jepsen::JepsenRunSpec {
+                    run_id: String::from("test"),
+                    workload: allocdb_node::jepsen::JepsenWorkloadFamily::ExpirationAndRecovery,
+                    nemesis: allocdb_node::jepsen::JepsenNemesisFamily::None,
+                    minimum_fault_window_secs: None,
+                    release_blocking: false,
+                },
+                &std::env::temp_dir().join(format!("allocdb-events-tests-{}", std::process::id())),
+            )
+            .unwrap(),
+            0,
+        );
+        let mut history = HistoryBuilder::new(None, 0);
+        let error = drain_expiration_until_resource_available(
+            &layout,
+            &replica,
+            &context,
+            &mut history,
+            ExpirationDrainPlan {
+                resource_id: ResourceId(7),
+                expired: &[],
+                required_lsn: Lsn(1),
+                operation_id_base: 1000,
+                slot_base: 20,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("remained held"));
+        assert!(error.contains(&MAX_EXPIRATION_RECOVERY_DRAIN_TICKS.to_string()));
+    }
+
+    #[test]
+    fn drain_expiration_until_resource_available_stops_once_resource_is_available() {
+        let layout = FakeExternalTestbed::new(vec![
+            Ok(encoded_api_response(&ApiResponse::GetResource(
+                ResourceResponse::Found(allocdb_node::ResourceView {
+                    resource_id: ResourceId(7),
+                    state: allocdb_core::ResourceState::Reserved,
+                    current_reservation_id: Some(ReservationId(70)),
+                    version: 1,
+                }),
+            ))),
+            Ok(encoded_api_response(&ApiResponse::TickExpirations(
+                TickExpirationsResponse::Applied(
+                    ExpirationTickResult {
+                        processed_count: 1,
+                        last_applied_lsn: Some(Lsn(44)),
+                    }
+                    .into(),
+                ),
+            ))),
+            Ok(encoded_api_response(&ApiResponse::GetResource(
+                ResourceResponse::Found(allocdb_node::ResourceView {
+                    resource_id: ResourceId(7),
+                    state: allocdb_core::ResourceState::Available,
+                    current_reservation_id: None,
+                    version: 2,
+                }),
+            ))),
+        ]);
+        let replica = layout.replica_layout.replicas[0].clone();
+        let context = RunExecutionContext::new(
+            crate::tracker::RunTracker::new(
+                layout.backend_name(),
+                &allocdb_node::jepsen::JepsenRunSpec {
+                    run_id: String::from("test"),
+                    workload: allocdb_node::jepsen::JepsenWorkloadFamily::ExpirationAndRecovery,
+                    nemesis: allocdb_node::jepsen::JepsenNemesisFamily::None,
+                    minimum_fault_window_secs: None,
+                    release_blocking: false,
+                },
+                &std::env::temp_dir().join(format!(
+                    "allocdb-events-tests-{}-available",
+                    std::process::id()
+                )),
+            )
+            .unwrap(),
+            0,
+        );
+        let mut history = HistoryBuilder::new(None, 0);
+        let lsn = drain_expiration_until_resource_available(
+            &layout,
+            &replica,
+            &context,
+            &mut history,
+            ExpirationDrainPlan {
+                resource_id: ResourceId(7),
+                expired: &[],
+                required_lsn: Lsn(1),
+                operation_id_base: 2000,
+                slot_base: 30,
+            },
+        )
+        .unwrap();
+        assert_eq!(lsn, Lsn(44));
+    }
+
+    #[test]
+    fn response_text_not_primary_is_detected() {
+        assert!(response_text_is_not_primary("not primary: role=backup"));
+        assert!(!response_text_is_not_primary("unexpected failure"));
+    }
+}

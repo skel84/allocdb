@@ -30,10 +30,14 @@ The long-term binary layout should become:
 - [`allocdb-jepsen.rs`](../crates/allocdb-node/src/bin/allocdb-jepsen.rs): `main()`, high-level
   dispatch, and minimal glue only
 - `allocdb-jepsen/args.rs`: subcommand parsing and usage text
-- `allocdb-jepsen/watch.rs`: run status loading, fleet watching, and terminal rendering
-- `allocdb-jepsen/artifacts.rs`: run tracker, status/event persistence, archive/bundle helpers
-- `allocdb-jepsen/runtime.rs`: external backend execution, remote helpers, and scenario runners
-- `allocdb-jepsen/tests.rs`: binary-specific regression tests
+- `allocdb-jepsen/common.rs`: small parsing, filesystem, and time helpers shared across modules
+- `allocdb-jepsen/tracker.rs`: run tracker, status/event persistence, and request namespaces
+- `allocdb-jepsen/support.rs`: staging workspaces, history builders, and tar/import helpers
+- `allocdb-jepsen/surface.rs`: external testbed trait plus verify/analyze entry points
+- `allocdb-jepsen/runtime.rs`: runtime probe/topology summaries
+- `allocdb-jepsen/runs.rs`: run/archive orchestration and fault-window enforcement
+- `allocdb-jepsen/watch.rs`: watch loop orchestration and lane snapshot collection
+- `allocdb-jepsen/watch_render.rs`: terminal rendering and presentation helpers
 
 This keeps the binary implementation in one place under `src/bin/` while establishing seams that
 can later support a dedicated validation crate if it still makes sense.

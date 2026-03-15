@@ -510,6 +510,8 @@ fn kubevirt_helper_ssh_args(layout: &KubevirtTestbedLayout) -> Vec<String> {
             .display()
             .to_string(),
         String::from("-o"),
+        String::from("BatchMode=yes"),
+        String::from("-o"),
         String::from("StrictHostKeyChecking=no"),
         String::from("-o"),
         String::from("UserKnownHostsFile=/dev/null"),

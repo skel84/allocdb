@@ -209,15 +209,21 @@ fn render_run_summary(snapshot: Option<&RunStatusSnapshot>, color: bool) {
             "Blockers",
             &format_blocker_count(snapshot.blockers, color),
         );
-        render_summary_row(color, "Detail", &snapshot.detail);
+        let detail = flatten_watch_text(&snapshot.detail);
+        render_summary_row(
+            color,
+            "Detail",
+            &truncate_for_watch(&detail, WATCH_RULE_WIDTH),
+        );
         if let Some(error) = &snapshot.last_error {
+            let flattened_error = flatten_watch_text(error);
             render_summary_row(
                 color,
                 "Last Error",
                 &watch_style(
                     color,
                     &[ANSI_RED],
-                    &truncate_for_watch(error, WATCH_RULE_WIDTH.saturating_sub(18)),
+                    &truncate_for_watch(&flattened_error, WATCH_RULE_WIDTH.saturating_sub(18)),
                 ),
             );
         }
@@ -382,7 +388,7 @@ fn format_kubevirt_fleet_lane_row(
     );
     let lead_cell = pad_watch_cell(&fleet_primary_label(&lane.replicas), 5);
     let note = truncate_for_watch(
-        &lane.snapshot.as_ref().map_or_else(
+        &flatten_watch_text(&lane.snapshot.as_ref().map_or_else(
             || {
                 lane.lane_error
                     .clone()
@@ -395,7 +401,7 @@ fn format_kubevirt_fleet_lane_row(
                     .filter(|error| error != "none")
                     .unwrap_or_else(|| snapshot.detail.clone())
             },
-        ),
+        )),
         28,
     );
     let note_cell = pad_watch_cell(&note, 28);
@@ -533,7 +539,7 @@ fn render_recent_events(
             "  {} {} {}",
             icon,
             watch_style(color, &[ANSI_DIM], &pad_watch_cell(&elapsed, 8)),
-            style_event_detail(color, &event.detail)
+            style_event_detail(color, &flatten_watch_text(&event.detail))
         );
     }
 }
@@ -573,7 +579,10 @@ fn render_kubevirt_fleet_recent_events(lanes: &[KubevirtWatchLaneSnapshot], colo
                 "    {} {} {}",
                 icon,
                 watch_style(color, &[ANSI_DIM], &pad_watch_cell(&elapsed, 8)),
-                style_event_detail(color, &truncate_for_watch(&event.detail, 72))
+                style_event_detail(
+                    color,
+                    &truncate_for_watch(&flatten_watch_text(&event.detail), 72),
+                )
             );
         }
     }
@@ -791,9 +800,13 @@ fn truncate_for_watch(text: &str, max_chars: usize) -> String {
     format!("{prefix}…")
 }
 
+fn flatten_watch_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn replica_watch_note(replica: &ReplicaWatchSnapshot) -> String {
     if let Some(error) = &replica.error {
-        return error.clone();
+        return flatten_watch_text(error);
     }
     let Some(status) = &replica.status else {
         return String::from("☠ control link unavailable");
@@ -801,7 +814,7 @@ fn replica_watch_note(replica: &ReplicaWatchSnapshot) -> String {
     if status.state == ReplicaRuntimeState::Faulted {
         return status.fault_reason.clone().map_or_else(
             || String::from("💥 replica faulted"),
-            |reason| format!("💥 {reason}"),
+            |reason| format!("💥 {}", flatten_watch_text(&reason)),
         );
     }
     if replica.accepting_writes == Some(false) {

@@ -89,18 +89,22 @@ pub(super) fn watch_kubevirt_fleet(
 ) -> Result<(), String> {
     let mut contexts = lanes
         .iter()
-        .map(|_| None::<Result<KubevirtWatchLaneContext, String>>)
+        .map(|_| None::<KubevirtWatchLaneContext>)
         .collect::<Vec<_>>();
     let refresh_millis = refresh_millis.max(250);
 
     loop {
         let mut snapshots = Vec::with_capacity(lanes.len());
         for (index, spec) in lanes.iter().enumerate() {
+            let mut lane_error = None;
             if contexts[index].is_none() {
-                contexts[index] = Some(try_prepare_kubevirt_watch_lane_context(spec));
+                match try_prepare_kubevirt_watch_lane_context(spec) {
+                    Ok(context) => contexts[index] = Some(context),
+                    Err(error) => lane_error = Some(error),
+                }
             }
             let snapshot = match contexts[index].as_ref() {
-                Some(Ok(context)) => match collect_kubevirt_watch_lane_snapshot(context) {
+                Some(context) => match collect_kubevirt_watch_lane_snapshot(context) {
                     Ok(snapshot) => snapshot,
                     Err(error) => KubevirtWatchLaneSnapshot {
                         name: spec.name.clone(),
@@ -110,22 +114,17 @@ pub(super) fn watch_kubevirt_fleet(
                         lane_error: Some(error),
                     },
                 },
-                Some(Err(error)) => KubevirtWatchLaneSnapshot {
-                    name: spec.name.clone(),
-                    snapshot: None,
-                    replicas: Vec::new(),
-                    recent_events: Vec::new(),
-                    lane_error: Some(error.clone()),
-                },
                 None => KubevirtWatchLaneSnapshot {
                     name: spec.name.clone(),
                     snapshot: None,
                     replicas: Vec::new(),
                     recent_events: Vec::new(),
-                    lane_error: Some(format!(
-                        "lane workspace is not ready yet: expected {}",
-                        kubevirt_testbed_layout_path(&spec.workspace_root).display()
-                    )),
+                    lane_error: Some(lane_error.unwrap_or_else(|| {
+                        format!(
+                            "lane workspace is not ready yet: expected {}",
+                            kubevirt_testbed_layout_path(&spec.workspace_root).display()
+                        )
+                    })),
                 },
             };
             snapshots.push(snapshot);

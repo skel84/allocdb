@@ -222,12 +222,30 @@ pub(super) fn run_local_tar_extract(destination_root: &Path, archive: &[u8]) -> 
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("failed to spawn local tar extract: {error}"))?;
-    child
+    let write_result = child
         .stdin
-        .as_mut()
+        .take()
         .ok_or_else(|| String::from("local tar extract stdin was unavailable"))?
         .write_all(archive)
-        .map_err(|error| format!("failed to write local tar extract stdin: {error}"))?;
+        .map_err(|error| format!("failed to write local tar extract stdin: {error}"));
+    if let Err(write_error) = write_result {
+        match child.wait_with_output() {
+            Ok(output) if !output.status.success() => {
+                log::debug!(
+                    "local tar extract exited after stdin write failure: status={} stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(_) => {}
+            Err(wait_error) => {
+                return Err(format!(
+                    "{write_error}; additionally failed to reap local tar extract: {wait_error}"
+                ));
+            }
+        }
+        return Err(write_error);
+    }
     let output = child
         .wait_with_output()
         .map_err(|error| format!("failed to wait for local tar extract: {error}"))?;

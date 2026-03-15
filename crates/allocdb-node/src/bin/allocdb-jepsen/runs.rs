@@ -115,10 +115,20 @@ pub(super) fn render_fault_window_iteration_event(
 }
 
 pub(super) fn effective_minimum_fault_window_secs(run_spec: &JepsenRunSpec) -> Option<u64> {
-    if let Some(override_secs) = debug_fault_window_override_secs() {
-        return Some(override_secs);
-    }
-    run_spec.minimum_fault_window_secs
+    run_spec.minimum_fault_window_secs?;
+    Some(effective_minimum_fault_window_secs_with_override(
+        run_spec.minimum_fault_window_secs,
+        debug_fault_window_override_secs(),
+    ))
+}
+
+fn effective_minimum_fault_window_secs_with_override(
+    minimum_fault_window_secs: Option<u64>,
+    override_secs: Option<u64>,
+) -> u64 {
+    override_secs.unwrap_or_else(|| {
+        minimum_fault_window_secs.expect("fault-window override helper requires a faulted run")
+    })
 }
 
 fn debug_fault_window_override_secs() -> Option<u64> {
@@ -354,4 +364,32 @@ fn fetch_external_logs_archive<T: ExternalTestbed>(
     file.sync_all()
         .map_err(|error| format!("failed to sync {}: {error}", archive_path.display()))?;
     Ok(archive_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        effective_minimum_fault_window_secs, effective_minimum_fault_window_secs_with_override,
+    };
+    use allocdb_node::jepsen::{JepsenNemesisFamily, JepsenRunSpec, JepsenWorkloadFamily};
+
+    #[test]
+    fn fault_window_override_does_not_change_control_runs() {
+        let run_spec = JepsenRunSpec {
+            run_id: String::from("reservation_contention-control"),
+            workload: JepsenWorkloadFamily::ReservationContention,
+            nemesis: JepsenNemesisFamily::None,
+            minimum_fault_window_secs: None,
+            release_blocking: true,
+        };
+        assert_eq!(effective_minimum_fault_window_secs(&run_spec), None);
+    }
+
+    #[test]
+    fn fault_window_override_changes_faulted_runs() {
+        assert_eq!(
+            effective_minimum_fault_window_secs_with_override(Some(1_800), Some(180)),
+            180
+        );
+    }
 }

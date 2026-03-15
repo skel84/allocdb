@@ -163,7 +163,7 @@ pub(super) fn maybe_crash_replica<T: ExternalTestbed>(
     layout: &T,
     replica_id: ReplicaId,
 ) -> Result<(), String> {
-    eprintln!(
+    log::info!(
         "backend={} event=crash_replica workspace={} replica={}",
         layout.backend_name(),
         layout.workspace_root().display(),
@@ -184,7 +184,7 @@ pub(super) fn restart_replica<T: ExternalTestbed>(
     layout: &T,
     replica_id: ReplicaId,
 ) -> Result<(), String> {
-    eprintln!(
+    log::info!(
         "backend={} event=restart_replica workspace={} replica={}",
         layout.backend_name(),
         layout.workspace_root().display(),
@@ -202,7 +202,7 @@ pub(super) fn isolate_replica<T: ExternalTestbed>(
     layout: &T,
     replica_id: ReplicaId,
 ) -> Result<(), String> {
-    eprintln!(
+    log::info!(
         "backend={} event=isolate_replica workspace={} replica={}",
         layout.backend_name(),
         layout.workspace_root().display(),
@@ -220,7 +220,7 @@ pub(super) fn heal_replica<T: ExternalTestbed>(
     layout: &T,
     replica_id: ReplicaId,
 ) -> Result<(), String> {
-    eprintln!(
+    log::info!(
         "backend={} event=heal_replica workspace={} replica={}",
         layout.backend_name(),
         layout.workspace_root().display(),
@@ -350,7 +350,7 @@ fn log_rewrite_replica_begin<T: ExternalTestbed>(
     new_view: u64,
     new_role: ReplicaRole,
 ) {
-    eprintln!(
+    log::debug!(
         "backend={} event=rewrite_replica_from_source workspace={} source_replica={} target_replica={} source_role={:?} source_view={} source_commit_lsn={} source_snapshot_lsn={} target_commit_lsn={} new_view={} new_role={:?}",
         layout.backend_name(),
         layout.workspace_root().display(),
@@ -371,7 +371,7 @@ fn log_rewrite_replica_complete<T: ExternalTestbed>(
     target: &StagedReplicaWorkspace,
     target_node: &ReplicaNode,
 ) {
-    eprintln!(
+    log::debug!(
         "backend={} event=rewrite_replica_complete workspace={} target_replica={} final_role={:?} final_view={} final_commit_lsn={} final_snapshot_lsn={} final_highest_prepared_lsn={}",
         layout.backend_name(),
         layout.workspace_root().display(),
@@ -475,7 +475,7 @@ pub(super) fn perform_failover<T: ExternalTestbed>(
     new_primary: ReplicaId,
     supporting_backup: ReplicaId,
 ) -> Result<(), String> {
-    eprintln!(
+    log::info!(
         "backend={} event=perform_failover_begin workspace={} old_primary={} new_primary={} supporting_backup={}",
         layout.backend_name(),
         layout.workspace_root().display(),
@@ -503,7 +503,7 @@ pub(super) fn perform_failover<T: ExternalTestbed>(
     } else {
         &new_primary_stage
     };
-    eprintln!(
+    log::debug!(
         "backend={} event=perform_failover_plan workspace={} old_primary={} new_primary={} supporting_backup={} new_primary_summary=\"{}\" supporting_summary=\"{}\" chosen_source={} target_commit_lsn={} new_view={}",
         layout.backend_name(),
         layout.workspace_root().display(),
@@ -541,7 +541,7 @@ pub(super) fn perform_failover<T: ExternalTestbed>(
     restart_replica(layout, new_primary)?;
     wait_for_runtime_replica_role(layout, new_primary, ReplicaRole::Primary)?;
     wait_for_runtime_replica_role(layout, supporting_backup, ReplicaRole::Backup)?;
-    eprintln!(
+    log::info!(
         "backend={} event=perform_failover_complete workspace={} old_primary={} new_primary={} supporting_backup={} new_view={} target_commit_lsn={}",
         layout.backend_name(),
         layout.workspace_root().display(),
@@ -560,7 +560,7 @@ pub(super) fn perform_rejoin<T: ExternalTestbed>(
     current_primary: ReplicaId,
     target_replica: ReplicaId,
 ) -> Result<(), String> {
-    eprintln!(
+    log::info!(
         "backend={} event=perform_rejoin_begin workspace={} current_primary={} target_replica={}",
         layout.backend_name(),
         layout.workspace_root().display(),
@@ -572,7 +572,7 @@ pub(super) fn perform_rejoin<T: ExternalTestbed>(
     let source_summary = staged_replica_summary(layout, &source_stage)?;
     let plan = plan_rejoin(source_summary);
     let target_stage = StagedReplicaWorkspace::new(layout, target_replica)?;
-    eprintln!(
+    log::debug!(
         "backend={} event=perform_rejoin_plan workspace={} current_primary={} target_replica={} source_summary=\"{}\"",
         layout.backend_name(),
         layout.workspace_root().display(),
@@ -591,7 +591,7 @@ pub(super) fn perform_rejoin<T: ExternalTestbed>(
     target_stage.import_to_remote(layout)?;
     restart_replica(layout, target_replica)?;
     wait_for_runtime_replica_role(layout, target_replica, ReplicaRole::Backup)?;
-    eprintln!(
+    log::info!(
         "backend={} event=perform_rejoin_complete workspace={} current_primary={} target_replica={} target_view={} target_commit_lsn={}",
         layout.backend_name(),
         layout.workspace_root().display(),

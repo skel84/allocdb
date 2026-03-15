@@ -598,6 +598,14 @@ mod tests {
     }
 
     #[test]
+    fn tracker_field_round_trips_newlines_and_backslashes() {
+        let original = "C:\\tmp\\foo\nline2";
+        let encoded = tracker::encode_tracker_field(original);
+        let decoded = tracker::decode_tracker_field(&encoded);
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
     fn compact_counter_formats_large_values() {
         assert_eq!(compact_counter(999), "999");
         assert_eq!(compact_counter(1_234), "1.2K");
