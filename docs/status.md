@@ -215,6 +215,6 @@
   `longhorn-strict-local-wffc` completed the full documented `15`-run Jepsen matrix, and every
   control, crash-restart, partition-heal, and mixed-failover run finished with
   `release_gate_passed=true` and `blockers=0`
-- the immediate next honest step is no longer “run the matrix” but “decide whether to open a
-  post-M8 hardening milestone or promote the Hetzner follow-on for repeatable non-homelab gate
-  execution”
+- the immediate maintainability follow-up is issue `#70`: split `allocdb-jepsen.rs` into
+  focused bin-local modules first, then re-evaluate a dedicated validation crate or Hetzner
+  follow-on once the existing KubeVirt path is easier to maintain
