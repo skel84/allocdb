@@ -214,7 +214,6 @@ fn run_external<T: ExternalTestbed>(
     if report.release_gate_passed() {
         Ok(())
     } else {
-        let _ = tracker.fail(RunTrackerPhase::Completed, "Jepsen release gate is blocked");
         Err(String::from("Jepsen release gate is blocked"))
     }
 }

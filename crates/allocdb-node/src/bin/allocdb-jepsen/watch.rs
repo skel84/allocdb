@@ -49,7 +49,7 @@ pub(super) fn watch_kubevirt(
     follow: bool,
 ) -> Result<(), String> {
     let layout = load_kubevirt_layout(workspace_root)?;
-    let _helper = prepare_kubevirt_helper(&layout)?;
+    let _kubevirt_helper = prepare_kubevirt_helper(&layout)?;
     let status_path = run_id.map_or_else(
         || output_root.join(JEPSEN_LATEST_STATUS_FILE_NAME),
         |run_id| run_status_path(output_root, run_id),
@@ -68,10 +68,12 @@ pub(super) fn watch_kubevirt(
             refresh_millis,
             follow,
         )?;
-        if !follow
-            && snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.state != RunTrackerState::Running)
+        if !follow {
+            break;
+        }
+        if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.state != RunTrackerState::Running)
         {
             break;
         }
@@ -85,17 +87,20 @@ pub(super) fn watch_kubevirt_fleet(
     refresh_millis: u64,
     follow: bool,
 ) -> Result<(), String> {
-    let mut contexts = lanes.iter().map(|_| None).collect::<Vec<_>>();
+    let mut contexts = lanes
+        .iter()
+        .map(|_| None::<Result<KubevirtWatchLaneContext, String>>)
+        .collect::<Vec<_>>();
     let refresh_millis = refresh_millis.max(250);
 
     loop {
         let mut snapshots = Vec::with_capacity(lanes.len());
         for (index, spec) in lanes.iter().enumerate() {
             if contexts[index].is_none() {
-                contexts[index] = try_prepare_kubevirt_watch_lane_context(spec).ok();
+                contexts[index] = Some(try_prepare_kubevirt_watch_lane_context(spec));
             }
             let snapshot = match contexts[index].as_ref() {
-                Some(context) => match collect_kubevirt_watch_lane_snapshot(context) {
+                Some(Ok(context)) => match collect_kubevirt_watch_lane_snapshot(context) {
                     Ok(snapshot) => snapshot,
                     Err(error) => KubevirtWatchLaneSnapshot {
                         name: spec.name.clone(),
@@ -104,6 +109,13 @@ pub(super) fn watch_kubevirt_fleet(
                         recent_events: Vec::new(),
                         lane_error: Some(error),
                     },
+                },
+                Some(Err(error)) => KubevirtWatchLaneSnapshot {
+                    name: spec.name.clone(),
+                    snapshot: None,
+                    replicas: Vec::new(),
+                    recent_events: Vec::new(),
+                    lane_error: Some(error.clone()),
                 },
                 None => KubevirtWatchLaneSnapshot {
                     name: spec.name.clone(),
@@ -136,7 +148,7 @@ fn try_prepare_kubevirt_watch_lane_context(
     Ok(KubevirtWatchLaneContext {
         spec: spec.clone(),
         layout,
-        _helper: helper,
+        _kubevirt_helper: helper,
     })
 }
 

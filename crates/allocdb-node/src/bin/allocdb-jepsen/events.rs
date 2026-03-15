@@ -297,6 +297,13 @@ pub(super) fn classify_resource_read_outcome(
 ) -> Result<ResourceReadObservation, String> {
     match outcome {
         RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::Found(resource))) => {
+            if resource.resource_id != resource_id {
+                return Err(format!(
+                    "resource read for {} returned mismatched resource {}",
+                    resource_id.get(),
+                    resource.resource_id.get()
+                ));
+            }
             if matches!(resource.state, allocdb_core::ResourceState::Available) {
                 Ok(ResourceReadObservation::Available)
             } else {

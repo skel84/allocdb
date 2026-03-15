@@ -137,7 +137,8 @@ pub(super) fn verify_qemu_surface(workspace_root: &Path) -> Result<(), String> {
 
 pub(super) fn verify_kubevirt_surface(workspace_root: &Path) -> Result<(), String> {
     let layout = load_kubevirt_layout(workspace_root)?;
-    let _helper = prepare_kubevirt_helper(&layout)?;
+    // Keep the helper guard alive for the full verification flow so drop-based cleanup runs.
+    let _kubevirt_helper = prepare_kubevirt_helper(&layout)?;
     verify_external_surface(&layout)?;
     println!("kubevirt_surface=ready");
     Ok(())

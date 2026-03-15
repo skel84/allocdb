@@ -271,7 +271,11 @@ impl RunTracker {
     }
 
     pub(super) fn append_event(&self, detail: &str) -> Result<(), String> {
-        let line = format!("time_millis={} detail={detail}\n", current_time_millis());
+        let line = format!(
+            "time_millis={} detail={}\n",
+            current_time_millis(),
+            encode_tracker_field(detail)
+        );
         append_text_line(&self.events_path, &line)
     }
 
@@ -308,7 +312,7 @@ pub(super) fn encode_run_status_snapshot(snapshot: &RunStatusSnapshot) -> String
         format!("run_id={}", snapshot.run_id),
         format!("state={}", snapshot.state.as_str()),
         format!("phase={}", snapshot.phase.as_str()),
-        format!("detail={}", snapshot.detail),
+        format!("detail={}", encode_tracker_field(&snapshot.detail)),
         format!("started_at_millis={}", snapshot.started_at_millis),
         format!("updated_at_millis={}", snapshot.updated_at_millis),
         format!("elapsed_secs={}", snapshot.elapsed_secs),
@@ -362,7 +366,7 @@ pub(super) fn encode_run_status_snapshot(snapshot: &RunStatusSnapshot) -> String
             snapshot
                 .last_error
                 .as_ref()
-                .map_or_else(|| String::from("none"), Clone::clone)
+                .map_or_else(|| String::from("none"), |value| encode_tracker_field(value))
         ),
     ];
     lines.push(String::new());
@@ -416,7 +420,7 @@ pub(super) fn decode_run_status_snapshot(bytes: &str) -> Result<RunStatusSnapsho
         run_id: required_field(&fields, "run_id")?.to_owned(),
         state: RunTrackerState::parse(required_field(&fields, "state")?)?,
         phase: RunTrackerPhase::parse(required_field(&fields, "phase")?)?,
-        detail: required_field(&fields, "detail")?.to_owned(),
+        detail: decode_tracker_field(required_field(&fields, "detail")?),
         started_at_millis: parse_required_u128(&fields, "started_at_millis")?,
         updated_at_millis: parse_required_u128(&fields, "updated_at_millis")?,
         elapsed_secs: parse_required_u64(&fields, "elapsed_secs")?,
@@ -430,6 +434,31 @@ pub(super) fn decode_run_status_snapshot(bytes: &str) -> Result<RunStatusSnapsho
         logs_archive: parse_optional_path(required_field(&fields, "logs_archive")?),
         release_gate_passed: parse_optional_bool(required_field(&fields, "release_gate_passed")?)?,
         blockers: parse_optional_usize(required_field(&fields, "blockers")?)?,
-        last_error: parse_optional_string(required_field(&fields, "last_error")?),
+        last_error: parse_optional_string(required_field(&fields, "last_error")?)
+            .map(|value| decode_tracker_field(&value)),
     })
+}
+
+pub(super) fn encode_tracker_field(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+pub(super) fn decode_tracker_field(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('n') => output.push('\n'),
+                Some(other) => {
+                    output.push('\\');
+                    output.push(other);
+                }
+                None => output.push('\\'),
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+    output
 }

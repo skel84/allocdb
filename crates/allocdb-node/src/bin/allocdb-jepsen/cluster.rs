@@ -10,7 +10,7 @@ use allocdb_node::{
 
 use crate::runtime::{
     live_runtime_replica_matching, render_runtime_probe_summary, runtime_probe_is_active,
-    runtime_replica_probes, summarize_runtime_probes,
+    runtime_replica_probes_with_live_roles, summarize_runtime_probes,
 };
 use crate::support::{
     StagedReplicaWorkspace, copy_file_or_remove, prepare_log_path_for, run_remote_control_command,
@@ -19,6 +19,21 @@ use crate::watch_render::replica_role_label;
 use crate::{
     EXTERNAL_RUNTIME_DISCOVERY_RETRY_DELAY, EXTERNAL_RUNTIME_DISCOVERY_TIMEOUT, ExternalTestbed,
 };
+
+type StagedReplicaSummary = (u64, Option<Lsn>, Option<Lsn>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FailoverPlan {
+    chosen_source: ReplicaId,
+    target_commit_lsn: Option<Lsn>,
+    new_view: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RejoinPlan {
+    target_commit_lsn: Option<Lsn>,
+    target_view: u64,
+}
 
 pub(super) fn wait_for_runtime_replica_role<T: ExternalTestbed>(
     layout: &T,
@@ -38,13 +53,21 @@ pub(super) fn wait_for_runtime_replica_role<T: ExternalTestbed>(
 
 pub(super) fn ensure_runtime_cluster_ready<T: ExternalTestbed>(layout: &T) -> Result<(), String> {
     for replica in &layout.replica_layout().replicas {
-        let _ = heal_replica(layout, replica.replica_id);
+        if let Err(error) = heal_replica(layout, replica.replica_id) {
+            log::error!(
+                "backend={} event=heal_replica_failed workspace={} replica={} error={}",
+                layout.backend_name(),
+                layout.workspace_root().display(),
+                replica.replica_id.get(),
+                error
+            );
+        }
     }
 
     let expected_replica_count = layout.replica_layout().replicas.len();
     let started_at = Instant::now();
     loop {
-        let probes = runtime_replica_probes(layout);
+        let probes = runtime_replica_probes_with_live_roles(layout);
         let topology = summarize_runtime_probes(&probes);
         if topology.active == expected_replica_count
             && topology.primaries == 1
@@ -55,7 +78,15 @@ pub(super) fn ensure_runtime_cluster_ready<T: ExternalTestbed>(layout: &T) -> Re
 
         for probe in &probes {
             if !runtime_probe_is_active(probe) {
-                let _ = restart_replica(layout, probe.replica.replica_id);
+                if let Err(error) = restart_replica(layout, probe.replica.replica_id) {
+                    log::error!(
+                        "backend={} event=restart_replica_failed workspace={} replica={} error={}",
+                        layout.backend_name(),
+                        layout.workspace_root().display(),
+                        probe.replica.replica_id.get(),
+                        error
+                    );
+                }
             }
         }
 
@@ -83,7 +114,7 @@ where
 {
     let started_at = Instant::now();
     loop {
-        let probes = runtime_replica_probes(layout);
+        let probes = runtime_replica_probes_with_live_roles(layout);
         if let Some(replica) = live_runtime_replica_matching(&probes, &predicate) {
             return Ok(replica);
         }
@@ -206,7 +237,7 @@ pub(super) fn heal_replica<T: ExternalTestbed>(
 fn staged_replica_summary<T: ExternalTestbed>(
     layout: &T,
     staged: &StagedReplicaWorkspace,
-) -> Result<(u64, Option<Lsn>, Option<Lsn>), String> {
+) -> Result<StagedReplicaSummary, String> {
     let node = ReplicaNode::recover(
         layout.replica_layout().core_config.clone(),
         layout.replica_layout().engine_config,
@@ -229,7 +260,7 @@ fn staged_replica_summary<T: ExternalTestbed>(
     ))
 }
 
-fn format_staged_summary(summary: (u64, Option<Lsn>, Option<Lsn>)) -> String {
+fn format_staged_summary(summary: StagedReplicaSummary) -> String {
     format!(
         "view={} commit_lsn={} highest_prepared_lsn={}",
         summary.0,
@@ -244,6 +275,46 @@ fn format_staged_summary(summary: (u64, Option<Lsn>, Option<Lsn>)) -> String {
 
 fn format_optional_lsn(value: Option<Lsn>) -> String {
     value.map_or_else(|| String::from("none"), |lsn| lsn.get().to_string())
+}
+
+fn plan_failover(
+    new_primary: ReplicaId,
+    supporting_backup: ReplicaId,
+    new_primary_summary: StagedReplicaSummary,
+    supporting_summary: StagedReplicaSummary,
+) -> FailoverPlan {
+    let target_commit_lsn = new_primary_summary
+        .1
+        .max(supporting_summary.1)
+        .or_else(|| new_primary_summary.2.max(supporting_summary.2));
+    let new_view = new_primary_summary
+        .0
+        .max(supporting_summary.0)
+        .saturating_add(1);
+    let supporting_has_newer_commit = supporting_summary.1.unwrap_or(Lsn(0)).get()
+        > new_primary_summary.1.unwrap_or(Lsn(0)).get();
+    let supporting_has_newer_prepare_on_equal_commit = supporting_summary.1
+        == new_primary_summary.1
+        && supporting_summary.2.unwrap_or(Lsn(0)).get()
+            > new_primary_summary.2.unwrap_or(Lsn(0)).get();
+    let chosen_source =
+        if supporting_has_newer_commit || supporting_has_newer_prepare_on_equal_commit {
+            supporting_backup
+        } else {
+            new_primary
+        };
+    FailoverPlan {
+        chosen_source,
+        target_commit_lsn,
+        new_view,
+    }
+}
+
+fn plan_rejoin(source_summary: StagedReplicaSummary) -> RejoinPlan {
+    RejoinPlan {
+        target_commit_lsn: source_summary.1,
+        target_view: source_summary.0,
+    }
 }
 
 fn load_staged_source_metadata<T: ExternalTestbed>(
@@ -421,21 +492,13 @@ pub(super) fn perform_failover<T: ExternalTestbed>(
     let new_primary_summary = staged_replica_summary(layout, &new_primary_stage)?;
     let supporting_summary = staged_replica_summary(layout, &supporting_stage)?;
 
-    let target_commit_lsn = new_primary_summary
-        .1
-        .max(supporting_summary.1)
-        .or_else(|| new_primary_summary.2.max(supporting_summary.2));
-    let new_view = new_primary_summary
-        .0
-        .max(supporting_summary.0)
-        .saturating_add(1);
-
-    let source = if supporting_summary.1.unwrap_or(Lsn(0)).get()
-        > new_primary_summary.1.unwrap_or(Lsn(0)).get()
-        || (supporting_summary.1 == new_primary_summary.1
-            && supporting_summary.2.unwrap_or(Lsn(0)).get()
-                > new_primary_summary.2.unwrap_or(Lsn(0)).get())
-    {
+    let plan = plan_failover(
+        new_primary,
+        supporting_backup,
+        new_primary_summary,
+        supporting_summary,
+    );
+    let source = if plan.chosen_source == supporting_backup {
         &supporting_stage
     } else {
         &new_primary_stage
@@ -450,24 +513,25 @@ pub(super) fn perform_failover<T: ExternalTestbed>(
         format_staged_summary(new_primary_summary),
         format_staged_summary(supporting_summary),
         source.replica_id.get(),
-        target_commit_lsn.map_or_else(|| String::from("none"), |lsn| lsn.get().to_string()),
-        new_view
+        plan.target_commit_lsn
+            .map_or_else(|| String::from("none"), |lsn| lsn.get().to_string()),
+        plan.new_view
     );
 
     rewrite_replica_from_source(
         layout,
         source,
         &new_primary_stage,
-        target_commit_lsn,
-        new_view,
+        plan.target_commit_lsn,
+        plan.new_view,
         ReplicaRole::Primary,
     )?;
     rewrite_replica_from_source(
         layout,
         source,
         &supporting_stage,
-        target_commit_lsn,
-        new_view,
+        plan.target_commit_lsn,
+        plan.new_view,
         ReplicaRole::Backup,
     )?;
 
@@ -484,8 +548,9 @@ pub(super) fn perform_failover<T: ExternalTestbed>(
         old_primary.get(),
         new_primary.get(),
         supporting_backup.get(),
-        new_view,
-        target_commit_lsn.map_or_else(|| String::from("none"), |lsn| lsn.get().to_string())
+        plan.new_view,
+        plan.target_commit_lsn
+            .map_or_else(|| String::from("none"), |lsn| lsn.get().to_string())
     );
     Ok(())
 }
@@ -505,6 +570,7 @@ pub(super) fn perform_rejoin<T: ExternalTestbed>(
     maybe_crash_replica(layout, target_replica)?;
     let source_stage = StagedReplicaWorkspace::from_export(layout, current_primary)?;
     let source_summary = staged_replica_summary(layout, &source_stage)?;
+    let plan = plan_rejoin(source_summary);
     let target_stage = StagedReplicaWorkspace::new(layout, target_replica)?;
     eprintln!(
         "backend={} event=perform_rejoin_plan workspace={} current_primary={} target_replica={} source_summary=\"{}\"",
@@ -518,8 +584,8 @@ pub(super) fn perform_rejoin<T: ExternalTestbed>(
         layout,
         &source_stage,
         &target_stage,
-        source_summary.1,
-        source_summary.0,
+        plan.target_commit_lsn,
+        plan.target_view,
         ReplicaRole::Backup,
     )?;
     target_stage.import_to_remote(layout)?;
@@ -531,10 +597,76 @@ pub(super) fn perform_rejoin<T: ExternalTestbed>(
         layout.workspace_root().display(),
         current_primary.get(),
         target_replica.get(),
-        source_summary.0,
-        source_summary
-            .1
+        plan.target_view,
+        plan.target_commit_lsn
             .map_or_else(|| String::from("none"), |lsn| lsn.get().to_string())
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FailoverPlan, RejoinPlan, plan_failover, plan_rejoin};
+    use allocdb_core::ids::Lsn;
+    use allocdb_node::ReplicaId;
+
+    #[test]
+    fn plan_failover_prefers_supporting_backup_with_newer_commit() {
+        let plan = plan_failover(
+            ReplicaId(2),
+            ReplicaId(3),
+            (7, Some(Lsn(11)), Some(Lsn(12))),
+            (8, Some(Lsn(13)), Some(Lsn(13))),
+        );
+        assert_eq!(
+            plan,
+            FailoverPlan {
+                chosen_source: ReplicaId(3),
+                target_commit_lsn: Some(Lsn(13)),
+                new_view: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_failover_prefers_supporting_backup_with_higher_prepare_on_equal_commit() {
+        let plan = plan_failover(
+            ReplicaId(2),
+            ReplicaId(3),
+            (7, Some(Lsn(11)), Some(Lsn(11))),
+            (7, Some(Lsn(11)), Some(Lsn(14))),
+        );
+        assert_eq!(plan.chosen_source, ReplicaId(3));
+        assert_eq!(plan.target_commit_lsn, Some(Lsn(11)));
+        assert_eq!(plan.new_view, 8);
+    }
+
+    #[test]
+    fn plan_failover_prefers_new_primary_when_commits_and_prepares_match_or_lead() {
+        let plan = plan_failover(
+            ReplicaId(2),
+            ReplicaId(3),
+            (10, Some(Lsn(20)), Some(Lsn(21))),
+            (9, Some(Lsn(20)), Some(Lsn(19))),
+        );
+        assert_eq!(
+            plan,
+            FailoverPlan {
+                chosen_source: ReplicaId(2),
+                target_commit_lsn: Some(Lsn(20)),
+                new_view: 11,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_rejoin_uses_source_commit_and_view() {
+        assert_eq!(
+            plan_rejoin((15, Some(Lsn(44)), Some(Lsn(45)))),
+            RejoinPlan {
+                target_commit_lsn: Some(Lsn(44)),
+                target_view: 15,
+            }
+        );
+    }
 }

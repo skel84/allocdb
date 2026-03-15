@@ -17,11 +17,11 @@ without changing validated behavior, command surfaces, or release-gate semantics
 
 ## Non-Goals
 
-- No new Jepsen workloads or backend features.
-- No Hetzner backend work in this task.
-- No analyzer/history model redesign in [`jepsen.rs`](../crates/allocdb-node/src/jepsen.rs)
+- New Jepsen workloads or backend features are out of scope.
+- Hetzner backend work is deferred for this task.
+- Analyzer/history model redesign in [`jepsen.rs`](../crates/allocdb-node/src/jepsen.rs)
   unless a minimal extraction requires a purely mechanical move.
-- No dedicated `allocdb-validation` crate yet.
+- A dedicated `allocdb-validation` crate is still deferred.
 
 ## Target Shape
 

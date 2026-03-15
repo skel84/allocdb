@@ -469,6 +469,23 @@ mod tests {
     }
 
     #[test]
+    fn classify_resource_read_outcome_rejects_mismatched_resource() {
+        let error = classify_resource_read_outcome(
+            ResourceId(11),
+            RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::Found(
+                allocdb_node::ResourceView {
+                    resource_id: ResourceId(12),
+                    state: ResourceState::Available,
+                    current_reservation_id: None,
+                    version: 0,
+                },
+            ))),
+        )
+        .unwrap_err();
+        assert!(error.contains("mismatched resource 12"));
+    }
+
+    #[test]
     fn resolve_run_spec_and_minimum_fault_window_are_enforced() {
         let control = resolve_run_spec("reservation_contention-control").unwrap();
         assert!(enforce_minimum_fault_window(&control, Duration::from_secs(0)).is_ok());
@@ -555,6 +572,32 @@ mod tests {
     }
 
     #[test]
+    fn run_status_snapshot_round_trips_multiline_error_and_detail() {
+        let snapshot = RunStatusSnapshot {
+            backend_name: String::from("kubevirt"),
+            run_id: String::from("lane-a"),
+            state: RunTrackerState::Failed,
+            phase: RunTrackerPhase::Failed,
+            detail: String::from("collecting logs\nand artifacts"),
+            started_at_millis: 1,
+            updated_at_millis: 2,
+            elapsed_secs: 1,
+            minimum_fault_window_secs: None,
+            history_events: 0,
+            history_file: None,
+            artifact_bundle: None,
+            logs_archive: None,
+            release_gate_passed: Some(false),
+            blockers: Some(1),
+            last_error: Some(String::from("probe failed\nconnection refused")),
+        };
+
+        let encoded = tracker::encode_run_status_snapshot(&snapshot);
+        let decoded = tracker::decode_run_status_snapshot(&encoded).unwrap();
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
     fn compact_counter_formats_large_values() {
         assert_eq!(compact_counter(999), "999");
         assert_eq!(compact_counter(1_234), "1.2K");
@@ -570,6 +613,14 @@ mod tests {
         .unwrap();
         assert_eq!(event.time_millis, 1_773_492_183_417);
         assert_eq!(event.detail, "collecting logs and artifacts");
+    }
+
+    #[test]
+    fn parse_watch_event_line_unescapes_multiline_detail() {
+        let event =
+            parse_watch_event_line("time_millis=7 detail=error:\\nconnection refused").unwrap();
+        assert_eq!(event.time_millis, 7);
+        assert_eq!(event.detail, "error:\nconnection refused");
     }
 
     #[test]
@@ -843,6 +894,46 @@ mod tests {
     fn parse_watch_kubevirt_lane_spec_rejects_missing_fields() {
         let error = args::parse_watch_kubevirt_lane_spec("lane-a,/tmp/work-a").unwrap_err();
         assert!(error.contains("expected <name,workspace,output-root>"));
+    }
+
+    #[test]
+    fn parse_watch_kubevirt_lane_spec_rejects_blank_fields() {
+        let error = args::parse_watch_kubevirt_lane_spec("lane-a,   ,/tmp/out-a").unwrap_err();
+        assert!(error.contains("expected <name,workspace,output-root>"));
+    }
+
+    #[test]
+    fn parse_args_returns_help_without_subcommand() {
+        assert!(matches!(
+            args::parse_args(Vec::<String>::new()).unwrap(),
+            ParsedCommand::Help
+        ));
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_subcommand() {
+        let error = args::parse_args([String::from("wat")]).unwrap_err();
+        assert!(error.contains("unknown subcommand `wat`"));
+    }
+
+    #[test]
+    fn parse_args_rejects_trailing_plan_arguments() {
+        let error = args::parse_args([
+            String::from("plan"),
+            String::from("--workspace"),
+            String::from("/tmp"),
+        ])
+        .unwrap_err();
+        assert!(error.contains("unknown argument `--workspace /tmp`"));
+    }
+
+    #[test]
+    fn parse_args_rejects_missing_required_flags() {
+        let analyze_error = args::parse_args([String::from("analyze")]).unwrap_err();
+        assert!(analyze_error.contains("usage:"));
+
+        let verify_error = args::parse_args([String::from("verify-kubevirt-surface")]).unwrap_err();
+        assert!(verify_error.contains("usage:"));
     }
 
     #[test]

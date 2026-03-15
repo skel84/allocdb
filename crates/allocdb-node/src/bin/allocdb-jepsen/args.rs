@@ -9,6 +9,7 @@ use super::{
     DEFAULT_WATCH_REFRESH_MILLIS,
 };
 
+#[derive(Debug)]
 pub(super) enum ParsedCommand {
     Help,
     Plan,
@@ -75,7 +76,10 @@ pub(super) fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Parse
     };
     match subcommand.as_str() {
         "--help" | "-h" => Ok(ParsedCommand::Help),
-        "plan" => Ok(ParsedCommand::Plan),
+        "plan" => {
+            reject_trailing_args(args)?;
+            Ok(ParsedCommand::Plan)
+        }
         "analyze" => Ok(ParsedCommand::Analyze {
             history_file: parse_history_flag(args)?,
         }),
@@ -118,6 +122,19 @@ pub(super) fn usage() -> String {
     String::from(
         "usage:\n  allocdb-jepsen plan\n  allocdb-jepsen analyze --history-file <path>\n  allocdb-jepsen capture-kubevirt-layout --workspace <path> --namespace <name> --ssh-private-key <path> [--kubeconfig <path>] [--helper-pod <name>] [--helper-image <image>] [--helper-stage-dir <path>] [--control-vm <name>] [--replica-1-vm <name>] [--replica-2-vm <name>] [--replica-3-vm <name>]\n  allocdb-jepsen verify-qemu-surface --workspace <path>\n  allocdb-jepsen verify-kubevirt-surface --workspace <path>\n  allocdb-jepsen run-qemu --workspace <path> --run-id <run-id> --output-root <path>\n  allocdb-jepsen run-kubevirt --workspace <path> --run-id <run-id> --output-root <path>\n  allocdb-jepsen watch-kubevirt --workspace <path> --output-root <path> [--run-id <run-id>] [--refresh-millis <ms>] [--follow]\n  allocdb-jepsen watch-kubevirt-fleet --lane <name,workspace,output-root> [--lane <name,workspace,output-root> ...] [--refresh-millis <ms>] [--follow]\n  allocdb-jepsen archive-qemu --workspace <path> --run-id <run-id> --history-file <path> --output-root <path>\n  allocdb-jepsen archive-kubevirt --workspace <path> --run-id <run-id> --history-file <path> --output-root <path>\n",
     )
+}
+
+fn reject_trailing_args(args: impl IntoIterator<Item = String>) -> Result<(), String> {
+    let trailing = args.into_iter().collect::<Vec<_>>();
+    if trailing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown argument `{}`\n\n{}",
+            trailing.join(" "),
+            usage()
+        ))
+    }
 }
 
 fn parse_workspace_flag(args: impl IntoIterator<Item = String>) -> Result<PathBuf, String> {

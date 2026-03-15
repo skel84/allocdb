@@ -27,7 +27,7 @@ pub(super) struct KubevirtWatchLaneSpec {
 pub(super) struct KubevirtWatchLaneContext {
     pub(super) spec: KubevirtWatchLaneSpec,
     pub(super) layout: KubevirtTestbedLayout,
-    pub(super) _helper: KubevirtHelperGuard,
+    pub(super) _kubevirt_helper: KubevirtHelperGuard,
 }
 
 pub(super) struct CaptureKubevirtLayoutArgs<'a> {
@@ -297,7 +297,15 @@ fn kubevirt_helper_phase(layout: &KubevirtTestbedLayout) -> Result<Option<String
             .map(Some)
             .map_err(|error| format!("invalid helper pod phase output: {error}"))
     } else {
-        Ok(None)
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("NotFound") || stderr.to_ascii_lowercase().contains("not found") {
+            Ok(None)
+        } else {
+            Err(format!(
+                "failed to query kubevirt helper pod {}: status={} stderr={stderr}",
+                layout.config.helper_pod_name, output.status
+            ))
+        }
     }
 }
 
@@ -403,7 +411,7 @@ fn wait_for_kubevirt_helper_ready(layout: &KubevirtTestbedLayout) -> Result<(), 
 fn prepare_kubevirt_helper_stage_dir(layout: &KubevirtTestbedLayout) -> Result<(), String> {
     let stage_command = format!(
         "mkdir -p {stage_dir} && chmod 700 {stage_dir}",
-        stage_dir = layout.config.helper_stage_dir.display()
+        stage_dir = shell_single_quote(&layout.config.helper_stage_dir.display().to_string())
     );
     run_kubevirt_helper_exec(layout, &stage_command, "prepare kubevirt helper stage dir")
 }
@@ -439,10 +447,21 @@ fn copy_kubevirt_helper_ssh_key(layout: &KubevirtTestbedLayout) -> Result<(), St
 
 fn chmod_kubevirt_helper_ssh_key(layout: &KubevirtTestbedLayout) -> Result<(), String> {
     let chmod_command = format!(
-        "chmod 600 {stage_dir}/id_ed25519",
-        stage_dir = layout.config.helper_stage_dir.display()
+        "chmod 600 {key_path}",
+        key_path = shell_single_quote(
+            &layout
+                .config
+                .helper_stage_dir
+                .join("id_ed25519")
+                .display()
+                .to_string()
+        )
     );
     run_kubevirt_helper_exec(layout, &chmod_command, "chmod kubevirt helper ssh key")
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn run_kubevirt_helper_exec(

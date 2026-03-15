@@ -4,7 +4,9 @@ use std::path::Path;
 use allocdb_node::ReplicaRole;
 use allocdb_node::local_cluster::ReplicaRuntimeState;
 
-use super::tracker::{RunStatusSnapshot, RunTrackerPhase, RunTrackerState, WatchEvent};
+use super::tracker::{
+    RunStatusSnapshot, RunTrackerPhase, RunTrackerState, WatchEvent, decode_tracker_field,
+};
 use super::watch::{KubevirtWatchLaneSnapshot, ReplicaWatchSnapshot};
 use super::{
     ANSI_BLUE, ANSI_BOLD, ANSI_CYAN, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_ORANGE, ANSI_RED,
@@ -20,10 +22,13 @@ pub(super) fn render_kubevirt_watch(
     refresh_millis: u64,
     follow: bool,
 ) -> Result<(), String> {
+    let interactive = watch_interactive_output();
     let color = watch_color_enabled();
     let spinner = watch_spinner_frame(snapshot, refresh_millis);
     let pulse = watch_pulse_frame(snapshot);
-    print!("\x1B[2J\x1B[H");
+    if interactive {
+        print!("\x1B[2J\x1B[H");
+    }
     println!(
         "{}",
         watch_style(
@@ -61,6 +66,7 @@ pub(super) fn render_kubevirt_fleet_watch(
     refresh_millis: u64,
     follow: bool,
 ) -> Result<(), String> {
+    let interactive = watch_interactive_output();
     let color = watch_color_enabled();
     let anchor = lanes
         .iter()
@@ -72,7 +78,9 @@ pub(super) fn render_kubevirt_fleet_watch(
         .or_else(|| lanes.iter().find_map(|lane| lane.snapshot.as_ref()));
     let spinner = watch_spinner_frame(anchor, refresh_millis);
     let pulse = watch_pulse_frame(anchor);
-    print!("\x1B[2J\x1B[H");
+    if interactive {
+        print!("\x1B[2J\x1B[H");
+    }
     println!(
         "{}",
         watch_style(
@@ -131,7 +139,7 @@ pub(super) fn parse_watch_event_line(line: &str) -> Result<WatchEvent, String> {
         .map_err(|error| format!("invalid watch event timestamp `{line}`: {error}"))?;
     Ok(WatchEvent {
         time_millis,
-        detail: String::from(detail),
+        detail: decode_tracker_field(detail),
     })
 }
 
@@ -618,8 +626,12 @@ fn style_lane_note_cell(color: bool, lane: &KubevirtWatchLaneSnapshot, cell: &st
     }
 }
 
+fn watch_interactive_output() -> bool {
+    std::io::stdout().is_terminal()
+}
+
 fn watch_color_enabled() -> bool {
-    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+    watch_interactive_output() && std::env::var_os("NO_COLOR").is_none()
 }
 
 fn watch_style(color: bool, codes: &[&str], text: &str) -> String {

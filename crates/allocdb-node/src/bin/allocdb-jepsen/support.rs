@@ -75,8 +75,22 @@ impl HistoryBuilder {
             outcome,
         });
         if let Some(tracker) = &self.tracker {
-            let _ = tracker.set_history_events(self.next_sequence);
-            let _ = tracker.append_event(&format!("history sequence={}", self.next_sequence));
+            if let Err(error) = tracker.set_history_events(self.next_sequence) {
+                log::warn!(
+                    "failed to update history event count at sequence {}: {}",
+                    self.next_sequence,
+                    error
+                );
+            }
+            if let Err(error) =
+                tracker.append_event(&format!("history sequence={}", self.next_sequence))
+            {
+                log::warn!(
+                    "failed to append history event at sequence {}: {}",
+                    self.next_sequence,
+                    error
+                );
+            }
         }
     }
 

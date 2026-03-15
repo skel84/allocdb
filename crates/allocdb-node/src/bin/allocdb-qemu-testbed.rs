@@ -1028,6 +1028,12 @@ fn ssh_args(layout: &QemuTestbedLayout) -> Vec<String> {
         String::from("-i"),
         layout.ssh_private_key_path().display().to_string(),
         String::from("-o"),
+        String::from("BatchMode=yes"),
+        String::from("-o"),
+        String::from("ConnectTimeout=5"),
+        String::from("-o"),
+        String::from("LogLevel=ERROR"),
+        String::from("-o"),
         String::from("StrictHostKeyChecking=no"),
         String::from("-o"),
         String::from("UserKnownHostsFile=/dev/null"),
@@ -1054,7 +1060,7 @@ fn firmware_vars_template_path(layout: &QemuTestbedLayout) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_qemu_image_format, start_prepared_testbed};
+    use super::{parse_qemu_image_format, ssh_args, start_prepared_testbed};
     use allocdb_node::qemu_testbed::{QemuGuestArch, QemuTestbedConfig, QemuTestbedLayout};
     use std::cell::{Cell, RefCell};
     use std::collections::HashSet;
@@ -1179,5 +1185,14 @@ mod tests {
         );
         assert!(retry_result.is_ok());
         assert_eq!(running.borrow().len(), 4);
+    }
+
+    #[test]
+    fn ssh_args_include_fail_fast_options() {
+        let layout = fixture_layout();
+        let args = ssh_args(&layout);
+        assert!(args.contains(&String::from("BatchMode=yes")));
+        assert!(args.contains(&String::from("ConnectTimeout=5")));
+        assert!(args.contains(&String::from("LogLevel=ERROR")));
     }
 }

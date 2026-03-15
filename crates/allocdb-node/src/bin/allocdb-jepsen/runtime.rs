@@ -43,13 +43,16 @@ pub(super) fn request_remote_control_status<T: ExternalTestbed>(
     })
 }
 
-pub(super) fn runtime_replica_probes<T: ExternalTestbed>(layout: &T) -> Vec<RuntimeReplicaProbe> {
+pub(super) fn runtime_replica_probes_with_live_roles<T: ExternalTestbed>(
+    layout: &T,
+) -> Vec<RuntimeReplicaProbe> {
     layout
         .replica_layout()
         .replicas
         .iter()
         .cloned()
         .map(|mut replica| {
+            // Enrich the cloned layout replica with the live role reported by control status.
             let status = request_remote_control_status(layout, &replica);
             if let Ok(status) = status.as_ref() {
                 replica.role = status.role;
