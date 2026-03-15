@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -49,7 +49,28 @@ const DEFAULT_GUEST_USER: &str = "allocdb";
 const JEPSEN_RUN_STATUS_VERSION: u32 = 1;
 const JEPSEN_LATEST_STATUS_FILE_NAME: &str = "allocdb-jepsen-latest-status.txt";
 const DEFAULT_WATCH_REFRESH_MILLIS: u64 = 2_000;
+const FAULT_WINDOW_OVERRIDE_ENV: &str = "ALLOCDB_JEPSEN_FAULT_WINDOW_SECS_OVERRIDE";
+const EXTERNAL_RUNTIME_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const EXTERNAL_RUNTIME_DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(250);
+const EXTERNAL_REMOTE_TCP_TIMEOUT_SECS: u64 = 10;
+const WATCH_SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const WATCH_PULSE_FRAMES: &[&str] = &[
+    "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃", "▂",
+];
+const WATCH_RULE_WIDTH: usize = 88;
+const ANSI_RESET: &str = "\x1B[0m";
+const ANSI_BOLD: &str = "\x1B[1m";
+const ANSI_DIM: &str = "\x1B[2m";
+const ANSI_CYAN: &str = "\x1B[38;5;51m";
+const ANSI_BLUE: &str = "\x1B[38;5;39m";
+const ANSI_GREEN: &str = "\x1B[38;5;48m";
+const ANSI_YELLOW: &str = "\x1B[38;5;220m";
+const ANSI_ORANGE: &str = "\x1B[38;5;208m";
+const ANSI_RED: &str = "\x1B[38;5;196m";
+const ANSI_MAGENTA: &str = "\x1B[38;5;207m";
+const ANSI_WHITE: &str = "\x1B[38;5;15m";
 static NEXT_PROBE_RESOURCE_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_STAGING_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
 
 enum ParsedCommand {
     Help,
@@ -89,6 +110,12 @@ enum ParsedCommand {
         output_root: PathBuf,
         run_id: Option<String>,
         refresh_millis: u64,
+        follow: bool,
+    },
+    WatchKubevirtFleet {
+        lanes: Vec<KubevirtWatchLaneSpec>,
+        refresh_millis: u64,
+        follow: bool,
     },
     ArchiveQemu {
         workspace_root: PathBuf,
@@ -165,12 +192,19 @@ fn run() -> Result<(), String> {
             output_root,
             run_id,
             refresh_millis,
+            follow,
         } => watch_kubevirt(
             &workspace_root,
             &output_root,
             run_id.as_deref(),
             refresh_millis,
+            follow,
         ),
+        ParsedCommand::WatchKubevirtFleet {
+            lanes,
+            refresh_millis,
+            follow,
+        } => watch_kubevirt_fleet(&lanes, refresh_millis, follow),
         ParsedCommand::ArchiveQemu {
             workspace_root,
             run_id,
@@ -207,6 +241,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ParsedCommand, S
         "run-qemu" => parse_run_qemu_args(args),
         "run-kubevirt" => parse_run_kubevirt_args(args),
         "watch-kubevirt" => parse_watch_kubevirt_args(args),
+        "watch-kubevirt-fleet" => parse_watch_kubevirt_fleet_args(args),
         "archive-qemu" => parse_archive_qemu_args(args),
         "archive-kubevirt" => parse_archive_kubevirt_args(args),
         other => Err(format!("unknown subcommand `{other}`\n\n{}", usage())),
@@ -379,6 +414,7 @@ fn parse_watch_kubevirt_args(
     let mut output_root = None;
     let mut run_id = None;
     let mut refresh_millis = Some(DEFAULT_WATCH_REFRESH_MILLIS);
+    let mut follow = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--workspace" => {
@@ -400,6 +436,9 @@ fn parse_watch_kubevirt_args(
                 })?;
                 refresh_millis = Some(parsed);
             }
+            "--follow" => {
+                follow = true;
+            }
             "--help" | "-h" => return Err(usage()),
             other => return Err(format!("unknown argument `{other}`\n\n{}", usage())),
         }
@@ -410,6 +449,70 @@ fn parse_watch_kubevirt_args(
         output_root: output_root.ok_or_else(usage)?,
         run_id,
         refresh_millis: refresh_millis.ok_or_else(usage)?,
+        follow,
+    })
+}
+
+fn parse_watch_kubevirt_fleet_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<ParsedCommand, String> {
+    let mut args = args.into_iter();
+    let mut lanes = Vec::new();
+    let mut refresh_millis = Some(DEFAULT_WATCH_REFRESH_MILLIS);
+    let mut follow = false;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--lane" => {
+                let spec = args.next().ok_or_else(usage)?;
+                lanes.push(parse_watch_kubevirt_lane_spec(&spec)?);
+            }
+            "--refresh-millis" => {
+                let value = args.next().ok_or_else(usage)?;
+                let parsed = value.parse::<u64>().map_err(|error| {
+                    format!(
+                        "invalid --refresh-millis value `{value}`: {error}\n\n{}",
+                        usage()
+                    )
+                })?;
+                refresh_millis = Some(parsed);
+            }
+            "--follow" => {
+                follow = true;
+            }
+            "--help" | "-h" => return Err(usage()),
+            other => return Err(format!("unknown argument `{other}`\n\n{}", usage())),
+        }
+    }
+
+    if lanes.is_empty() {
+        return Err(format!(
+            "watch-kubevirt-fleet requires at least one --lane <name,workspace,output-root>\n\n{}",
+            usage()
+        ));
+    }
+
+    Ok(ParsedCommand::WatchKubevirtFleet {
+        lanes,
+        refresh_millis: refresh_millis.ok_or_else(usage)?,
+        follow,
+    })
+}
+
+fn parse_watch_kubevirt_lane_spec(spec: &str) -> Result<KubevirtWatchLaneSpec, String> {
+    let mut parts = spec.splitn(3, ',');
+    let name = parts.next().unwrap_or_default().trim();
+    let workspace_root = parts.next().unwrap_or_default().trim();
+    let output_root = parts.next().unwrap_or_default().trim();
+    if name.is_empty() || workspace_root.is_empty() || output_root.is_empty() {
+        return Err(format!(
+            "invalid --lane value `{spec}`; expected <name,workspace,output-root>\n\n{}",
+            usage()
+        ));
+    }
+    Ok(KubevirtWatchLaneSpec {
+        name: String::from(name),
+        workspace_root: PathBuf::from(workspace_root),
+        output_root: PathBuf::from(output_root),
     })
 }
 
@@ -488,12 +591,13 @@ fn parse_capture_kubevirt_args(
 
 fn usage() -> String {
     String::from(
-        "usage:\n  allocdb-jepsen plan\n  allocdb-jepsen analyze --history-file <path>\n  allocdb-jepsen capture-kubevirt-layout --workspace <path> --namespace <name> --ssh-private-key <path> [--kubeconfig <path>] [--helper-pod <name>] [--helper-image <image>] [--helper-stage-dir <path>] [--control-vm <name>] [--replica-1-vm <name>] [--replica-2-vm <name>] [--replica-3-vm <name>]\n  allocdb-jepsen verify-qemu-surface --workspace <path>\n  allocdb-jepsen verify-kubevirt-surface --workspace <path>\n  allocdb-jepsen run-qemu --workspace <path> --run-id <run-id> --output-root <path>\n  allocdb-jepsen run-kubevirt --workspace <path> --run-id <run-id> --output-root <path>\n  allocdb-jepsen watch-kubevirt --workspace <path> --output-root <path> [--run-id <run-id>] [--refresh-millis <ms>]\n  allocdb-jepsen archive-qemu --workspace <path> --run-id <run-id> --history-file <path> --output-root <path>\n  allocdb-jepsen archive-kubevirt --workspace <path> --run-id <run-id> --history-file <path> --output-root <path>\n",
+        "usage:\n  allocdb-jepsen plan\n  allocdb-jepsen analyze --history-file <path>\n  allocdb-jepsen capture-kubevirt-layout --workspace <path> --namespace <name> --ssh-private-key <path> [--kubeconfig <path>] [--helper-pod <name>] [--helper-image <image>] [--helper-stage-dir <path>] [--control-vm <name>] [--replica-1-vm <name>] [--replica-2-vm <name>] [--replica-3-vm <name>]\n  allocdb-jepsen verify-qemu-surface --workspace <path>\n  allocdb-jepsen verify-kubevirt-surface --workspace <path>\n  allocdb-jepsen run-qemu --workspace <path> --run-id <run-id> --output-root <path>\n  allocdb-jepsen run-kubevirt --workspace <path> --run-id <run-id> --output-root <path>\n  allocdb-jepsen watch-kubevirt --workspace <path> --output-root <path> [--run-id <run-id>] [--refresh-millis <ms>] [--follow]\n  allocdb-jepsen watch-kubevirt-fleet --lane <name,workspace,output-root> [--lane <name,workspace,output-root> ...] [--refresh-millis <ms>] [--follow]\n  allocdb-jepsen archive-qemu --workspace <path> --run-id <run-id> --history-file <path> --output-root <path>\n  allocdb-jepsen archive-kubevirt --workspace <path> --run-id <run-id> --history-file <path> --output-root <path>\n",
     )
 }
 
 trait ExternalTestbed {
     fn backend_name(&self) -> &'static str;
+    fn workspace_root(&self) -> &Path;
     fn replica_layout(&self) -> &LocalClusterLayout;
     fn run_remote_tcp_request(
         &self,
@@ -511,6 +615,10 @@ trait ExternalTestbed {
 impl ExternalTestbed for QemuTestbedLayout {
     fn backend_name(&self) -> &'static str {
         "qemu"
+    }
+
+    fn workspace_root(&self) -> &Path {
+        &self.config.workspace_root
     }
 
     fn replica_layout(&self) -> &LocalClusterLayout {
@@ -540,6 +648,10 @@ impl ExternalTestbed for KubevirtTestbedLayout {
         "kubevirt"
     }
 
+    fn workspace_root(&self) -> &Path {
+        &self.config.workspace_root
+    }
+
     fn replica_layout(&self) -> &LocalClusterLayout {
         &self.replica_layout
     }
@@ -567,6 +679,19 @@ struct KubevirtHelperGuard {
     namespace: String,
     pod_name: String,
     delete_on_drop: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KubevirtWatchLaneSpec {
+    name: String,
+    workspace_root: PathBuf,
+    output_root: PathBuf,
+}
+
+struct KubevirtWatchLaneContext {
+    spec: KubevirtWatchLaneSpec,
+    layout: KubevirtTestbedLayout,
+    _helper: KubevirtHelperGuard,
 }
 
 struct CaptureKubevirtLayoutArgs<'a> {
@@ -973,6 +1098,7 @@ fn verify_kubevirt_surface(workspace_root: &Path) -> Result<(), String> {
 }
 
 fn verify_external_surface<T: ExternalTestbed>(layout: &T) -> Result<(), String> {
+    ensure_runtime_cluster_ready(layout)?;
     let probe_namespace = RequestNamespace::new();
     for replica in &layout.replica_layout().replicas {
         let response_bytes = send_remote_api_request(
@@ -1065,11 +1191,8 @@ fn run_external<T: ExternalTestbed>(
         let _ = tracker.fail(RunTrackerPhase::VerifyingSurface, &error);
         return Err(error);
     }
-    // Surface verification performs a real committed write to prove the external runtime is live.
-    // Build the scenario namespace only after that probe so later requests cannot rewind slots.
-    let context = RunExecutionContext::new(tracker.clone());
     tracker.set_phase(RunTrackerPhase::Executing, "executing Jepsen scenario")?;
-    let history = match execute_external_run(layout, &run_spec, &context) {
+    let history = match execute_external_run(layout, &run_spec, &tracker) {
         Ok(history) => history,
         Err(error) => {
             let _ = tracker.fail(RunTrackerPhase::Executing, &error);
@@ -1151,14 +1274,58 @@ fn resolve_run_spec(run_id: &str) -> Result<JepsenRunSpec, String> {
 fn execute_external_run<T: ExternalTestbed>(
     layout: &T,
     run_spec: &JepsenRunSpec,
-    context: &RunExecutionContext,
+    tracker: &RunTracker,
 ) -> Result<Vec<JepsenHistoryEvent>, String> {
-    match run_spec.nemesis {
-        JepsenNemesisFamily::None => execute_control_run(layout, run_spec, context),
-        JepsenNemesisFamily::CrashRestart => execute_crash_restart_run(layout, run_spec, context),
-        JepsenNemesisFamily::PartitionHeal => execute_partition_heal_run(layout, run_spec, context),
-        JepsenNemesisFamily::MixedFailover => execute_mixed_failover_run(layout, run_spec, context),
+    let started_at = Instant::now();
+    let minimum_fault_window = minimum_fault_window_duration(run_spec);
+    let mut all_events = Vec::new();
+    let mut next_sequence = 0_u64;
+    let mut iteration = 0_u64;
+
+    loop {
+        iteration = iteration.saturating_add(1);
+        if !matches!(run_spec.nemesis, JepsenNemesisFamily::None) {
+            ensure_runtime_cluster_ready(layout)?;
+        }
+        // Surface verification already performed one committed write. Start each scenario slice
+        // with a fresh request namespace after that probe so later iterations cannot rewind slots.
+        let context = RunExecutionContext::new(tracker.clone(), next_sequence);
+        let mut iteration_events = match run_spec.nemesis {
+            JepsenNemesisFamily::None => execute_control_run(layout, run_spec, &context),
+            JepsenNemesisFamily::CrashRestart => {
+                execute_crash_restart_run(layout, run_spec, &context)
+            }
+            JepsenNemesisFamily::PartitionHeal => {
+                execute_partition_heal_run(layout, run_spec, &context)
+            }
+            JepsenNemesisFamily::MixedFailover => {
+                execute_mixed_failover_run(layout, run_spec, &context)
+            }
+        }?;
+        if iteration_events.is_empty() {
+            return Err(format!(
+                "run `{}` iteration {} produced no Jepsen history events",
+                run_spec.run_id, iteration
+            ));
+        }
+        next_sequence = iteration_events
+            .last()
+            .map_or(next_sequence, |event| event.sequence);
+        all_events.append(&mut iteration_events);
+
+        let elapsed = started_at.elapsed();
+        let _ = tracker.append_event(&render_fault_window_iteration_event(
+            run_spec,
+            iteration,
+            elapsed,
+            next_sequence,
+        ));
+        if fault_window_complete(minimum_fault_window, elapsed) {
+            break;
+        }
     }
+
+    Ok(all_events)
 }
 
 fn archive_qemu_run(
@@ -1360,7 +1527,7 @@ impl RunTracker {
             latest_status_path: output_root.join(JEPSEN_LATEST_STATUS_FILE_NAME),
             events_path: output_root.join(format!("{run_id}-events.log")),
             started_at_millis: current_time_millis(),
-            minimum_fault_window_secs: run_spec.minimum_fault_window_secs,
+            minimum_fault_window_secs: effective_minimum_fault_window_secs(run_spec),
         };
         tracker.write_status(&RunStatusSnapshot {
             backend_name: tracker.backend_name.clone(),
@@ -1465,13 +1632,15 @@ impl RunTracker {
 struct RunExecutionContext {
     namespace: RequestNamespace,
     tracker: RunTracker,
+    history_sequence_start: u64,
 }
 
 impl RunExecutionContext {
-    fn new(tracker: RunTracker) -> Self {
+    fn new(tracker: RunTracker, history_sequence_start: u64) -> Self {
         Self {
             namespace: RequestNamespace::new(),
             tracker,
+            history_sequence_start,
         }
     }
 
@@ -1491,9 +1660,9 @@ struct HistoryBuilder {
 }
 
 impl HistoryBuilder {
-    fn new(tracker: Option<RunTracker>) -> Self {
+    fn new(tracker: Option<RunTracker>, next_sequence: u64) -> Self {
         Self {
-            next_sequence: 0,
+            next_sequence,
             events: Vec::new(),
             tracker,
         }
@@ -1533,6 +1702,33 @@ struct ReplicaWatchSnapshot {
     expiration_backlog: Option<u64>,
     accepting_writes: Option<bool>,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeReplicaProbe {
+    replica: LocalClusterReplicaConfig,
+    status: Result<ReplicaRuntimeStatus, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeReplicaTopology {
+    active: usize,
+    primaries: usize,
+    backups: usize,
+}
+
+struct KubevirtWatchLaneSnapshot {
+    name: String,
+    snapshot: Option<RunStatusSnapshot>,
+    replicas: Vec<ReplicaWatchSnapshot>,
+    recent_events: Vec<WatchEvent>,
+    lane_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WatchEvent {
+    time_millis: u128,
+    detail: String,
 }
 
 fn run_status_path(output_root: &Path, run_id: &str) -> PathBuf {
@@ -1803,6 +1999,7 @@ fn watch_kubevirt(
     output_root: &Path,
     run_id: Option<&str>,
     refresh_millis: u64,
+    follow: bool,
 ) -> Result<(), String> {
     let layout = load_kubevirt_layout(workspace_root)?;
     let _helper = prepare_kubevirt_helper(&layout)?;
@@ -1822,16 +2019,94 @@ fn watch_kubevirt(
             &replicas,
             &recent_events,
             refresh_millis,
+            follow,
         )?;
-        if snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.state != RunTrackerState::Running)
+        if !follow
+            && snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.state != RunTrackerState::Running)
         {
             break;
         }
         thread::sleep(Duration::from_millis(refresh_millis));
     }
     Ok(())
+}
+
+fn watch_kubevirt_fleet(
+    lanes: &[KubevirtWatchLaneSpec],
+    refresh_millis: u64,
+    follow: bool,
+) -> Result<(), String> {
+    let mut contexts = lanes.iter().cloned().map(|_| None).collect::<Vec<_>>();
+    let refresh_millis = refresh_millis.max(250);
+
+    loop {
+        let mut snapshots = Vec::with_capacity(lanes.len());
+        for (index, spec) in lanes.iter().enumerate() {
+            if contexts[index].is_none() {
+                contexts[index] = try_prepare_kubevirt_watch_lane_context(spec).ok();
+            }
+            let snapshot = match contexts[index].as_ref() {
+                Some(context) => match collect_kubevirt_watch_lane_snapshot(context) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => KubevirtWatchLaneSnapshot {
+                        name: spec.name.clone(),
+                        snapshot: None,
+                        replicas: Vec::new(),
+                        recent_events: Vec::new(),
+                        lane_error: Some(error),
+                    },
+                },
+                None => KubevirtWatchLaneSnapshot {
+                    name: spec.name.clone(),
+                    snapshot: None,
+                    replicas: Vec::new(),
+                    recent_events: Vec::new(),
+                    lane_error: Some(format!(
+                        "lane workspace is not ready yet: expected {}",
+                        kubevirt_testbed_layout_path(&spec.workspace_root).display()
+                    )),
+                },
+            };
+            snapshots.push(snapshot);
+        }
+        render_kubevirt_fleet_watch(&snapshots, refresh_millis, follow)?;
+        if !follow {
+            break;
+        }
+        thread::sleep(Duration::from_millis(refresh_millis));
+    }
+
+    Ok(())
+}
+
+fn try_prepare_kubevirt_watch_lane_context(
+    spec: &KubevirtWatchLaneSpec,
+) -> Result<KubevirtWatchLaneContext, String> {
+    let layout = load_kubevirt_layout(&spec.workspace_root)?;
+    let helper = prepare_kubevirt_helper(&layout)?;
+    Ok(KubevirtWatchLaneContext {
+        spec: spec.clone(),
+        layout,
+        _helper: helper,
+    })
+}
+
+fn collect_kubevirt_watch_lane_snapshot(
+    lane: &KubevirtWatchLaneContext,
+) -> Result<KubevirtWatchLaneSnapshot, String> {
+    let status_path = lane.spec.output_root.join(JEPSEN_LATEST_STATUS_FILE_NAME);
+    let snapshot = maybe_load_run_status_snapshot(&status_path)?;
+    let replicas = collect_replica_watch_snapshots(&lane.layout);
+    let recent_events = load_recent_run_events(&lane.spec.output_root, snapshot.as_ref(), None, 4);
+    Ok(KubevirtWatchLaneSnapshot {
+        name: lane.spec.name.clone(),
+        snapshot,
+        replicas,
+        recent_events,
+        lane_error: None,
+    })
 }
 
 fn collect_replica_watch_snapshots(layout: &KubevirtTestbedLayout) -> Vec<ReplicaWatchSnapshot> {
@@ -1904,7 +2179,7 @@ fn load_recent_run_events(
     snapshot: Option<&RunStatusSnapshot>,
     run_id: Option<&str>,
     limit: usize,
-) -> Vec<String> {
+) -> Vec<WatchEvent> {
     let Some(events_path) = snapshot
         .map(|snapshot| run_events_path(output_root, &snapshot.run_id))
         .or_else(|| run_id.map(|run_id| run_events_path(output_root, run_id)))
@@ -1914,95 +2189,221 @@ fn load_recent_run_events(
     let Ok(bytes) = fs::read_to_string(&events_path) else {
         return Vec::new();
     };
-    let mut lines = bytes.lines().map(String::from).collect::<Vec<_>>();
-    if lines.len() > limit {
-        lines.drain(..lines.len().saturating_sub(limit));
+    let mut events = bytes
+        .lines()
+        .filter_map(|line| parse_watch_event_line(line).ok())
+        .collect::<Vec<_>>();
+    if events.len() > limit {
+        events.drain(..events.len().saturating_sub(limit));
     }
-    lines
+    events
 }
 
 fn render_kubevirt_watch(
     status_path: &Path,
     snapshot: Option<&RunStatusSnapshot>,
     replicas: &[ReplicaWatchSnapshot],
-    recent_events: &[String],
+    recent_events: &[WatchEvent],
     refresh_millis: u64,
+    follow: bool,
 ) -> Result<(), String> {
+    let color = watch_color_enabled();
+    let spinner = watch_spinner_frame(snapshot, refresh_millis);
+    let pulse = watch_pulse_frame(snapshot);
     print!("\x1B[2J\x1B[H");
-    println!("AllocDB Jepsen KubeVirt Watch");
-    println!("status_file={}", status_path.display());
-    println!("refresh_millis={refresh_millis}");
-    render_run_summary(snapshot);
+    println!(
+        "{}",
+        watch_style(
+            color,
+            &[ANSI_BOLD, ANSI_CYAN],
+            &format!("{spinner} AllocDB Jepsen KubeVirt Watch {pulse}"),
+        )
+    );
+    println!(
+        "{}",
+        watch_style(
+            color,
+            &[ANSI_DIM],
+            &format!(
+                "status_file={}   refresh={}ms   mode={}",
+                status_path.display(),
+                refresh_millis,
+                if follow { "follow" } else { "one-shot" }
+            ),
+        )
+    );
+    println!("{}", watch_rule(color));
+    render_run_summary(snapshot, color);
     println!();
-    render_replica_watch_rows(replicas);
+    render_replica_watch_rows(replicas, color);
     println!();
-    render_recent_events(recent_events);
+    render_recent_events(snapshot, recent_events, color);
     std::io::stdout()
         .flush()
         .map_err(|error| format!("failed to flush watcher output: {error}"))
 }
 
-fn render_run_summary(snapshot: Option<&RunStatusSnapshot>) {
-    match snapshot {
-        Some(snapshot) => {
-            println!(
-                "run_id={} state={} phase={} elapsed={}s minimum_fault_window={} detail={}",
-                snapshot.run_id,
-                snapshot.state.as_str(),
-                snapshot.phase.as_str(),
-                snapshot.elapsed_secs,
-                snapshot
-                    .minimum_fault_window_secs
-                    .map_or_else(|| String::from("none"), |value| value.to_string()),
-                snapshot.detail
+fn render_kubevirt_fleet_watch(
+    lanes: &[KubevirtWatchLaneSnapshot],
+    refresh_millis: u64,
+    follow: bool,
+) -> Result<(), String> {
+    let color = watch_color_enabled();
+    let anchor = lanes
+        .iter()
+        .find_map(|lane| {
+            lane.snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.state == RunTrackerState::Running)
+        })
+        .or_else(|| lanes.iter().find_map(|lane| lane.snapshot.as_ref()));
+    let spinner = watch_spinner_frame(anchor, refresh_millis);
+    let pulse = watch_pulse_frame(anchor);
+    print!("\x1B[2J\x1B[H");
+    println!(
+        "{}",
+        watch_style(
+            color,
+            &[ANSI_BOLD, ANSI_CYAN],
+            &format!("{spinner} AllocDB Jepsen KubeVirt Fleet Watch {pulse}"),
+        )
+    );
+    println!(
+        "{}",
+        watch_style(
+            color,
+            &[ANSI_DIM],
+            &format!(
+                "lanes={}   refresh={}ms   mode={}   use one output root per lane",
+                lanes.len(),
+                refresh_millis,
+                if follow { "follow" } else { "one-shot" }
+            ),
+        )
+    );
+    println!("{}", watch_rule(color));
+    render_kubevirt_fleet_lane_rows(lanes, color);
+    println!();
+    render_kubevirt_fleet_replica_rows(lanes, color);
+    println!();
+    render_kubevirt_fleet_recent_events(lanes, color);
+    std::io::stdout()
+        .flush()
+        .map_err(|error| format!("failed to flush fleet watcher output: {error}"))
+}
+
+fn render_run_summary(snapshot: Option<&RunStatusSnapshot>, color: bool) {
+    println!(
+        "{}",
+        watch_style(color, &[ANSI_BOLD, ANSI_BLUE], "Run Summary")
+    );
+    if let Some(snapshot) = snapshot {
+        render_summary_row(
+            color,
+            "Run",
+            &watch_style(color, &[ANSI_BOLD, ANSI_WHITE], &snapshot.run_id),
+        );
+        render_summary_row(color, "State", &run_state_badge(snapshot, color));
+        render_summary_row(color, "Phase", &run_phase_badge(snapshot.phase, color));
+        render_summary_row(
+            color,
+            "Elapsed",
+            &format_human_duration(snapshot.elapsed_secs),
+        );
+        render_summary_row(
+            color,
+            "Window",
+            &format_fault_window_summary(snapshot, color),
+        );
+        render_summary_row(
+            color,
+            "History",
+            &format!(
+                "📜 {} {}",
+                compact_counter(snapshot.history_events),
+                pluralize(snapshot.history_events, "event", "events")
+            ),
+        );
+        render_summary_row(color, "Gate", &format_release_gate_status(snapshot, color));
+        render_summary_row(
+            color,
+            "Blockers",
+            &format_blocker_count(snapshot.blockers, color),
+        );
+        render_summary_row(color, "Detail", &snapshot.detail);
+        if let Some(error) = &snapshot.last_error {
+            render_summary_row(
+                color,
+                "Last Error",
+                &watch_style(
+                    color,
+                    &[ANSI_RED],
+                    &truncate_for_watch(error, WATCH_RULE_WIDTH.saturating_sub(18)),
+                ),
             );
-            println!(
-                "history_events={} blockers={} release_gate_passed={}",
-                snapshot.history_events,
-                snapshot
-                    .blockers
-                    .map_or_else(|| String::from("none"), |value| value.to_string()),
-                snapshot.release_gate_passed.map_or_else(
-                    || String::from("none"),
-                    |value| if value {
-                        String::from("true")
-                    } else {
-                        String::from("false")
-                    }
-                )
-            );
-            if let Some(error) = &snapshot.last_error {
-                println!("last_error={error}");
-            }
         }
-        None => {
-            println!("run_id=waiting state=none phase=waiting detail=waiting for run status file");
-        }
+    } else {
+        render_summary_row(
+            color,
+            "Run",
+            &watch_style(
+                color,
+                &[ANSI_YELLOW],
+                "💤 waiting for first run status file",
+            ),
+        );
+        render_summary_row(
+            color,
+            "Hint",
+            "start `run-kubevirt` in another terminal and this view will lock on",
+        );
     }
 }
 
-fn render_replica_watch_rows(replicas: &[ReplicaWatchSnapshot]) {
-    println!("Replicas");
-    println!("id  state   role      view  commit_lsn  writes  queue  lag  backlog  error");
+fn render_replica_watch_rows(replicas: &[ReplicaWatchSnapshot], color: bool) {
+    println!(
+        "{}",
+        watch_style(color, &[ANSI_BOLD, ANSI_BLUE], "Replica Vibes")
+    );
+    println!(
+        "{}",
+        watch_style(
+            color,
+            &[ANSI_DIM],
+            "id  health   role       view   commit    wr   queue     lag       due   note"
+        )
+    );
     for replica in replicas {
-        println!("{}", format_replica_watch_row(replica));
+        println!("{}", format_replica_watch_row(replica, color));
     }
 }
 
-fn format_replica_watch_row(replica: &ReplicaWatchSnapshot) -> String {
-    let state = replica.status.as_ref().map_or("down", |status| {
+fn render_kubevirt_fleet_lane_rows(lanes: &[KubevirtWatchLaneSnapshot], color: bool) {
+    println!(
+        "{}",
+        watch_style(color, &[ANSI_BOLD, ANSI_BLUE], "Lane Pulse")
+    );
+    println!(
+        "{}",
+        watch_style(
+            color,
+            &[ANSI_DIM],
+            "lane  run                              state      phase        elapsed  window             hist   lead  note"
+        )
+    );
+    for (index, lane) in lanes.iter().enumerate() {
+        println!("{}", format_kubevirt_fleet_lane_row(index, lane, color));
+    }
+}
+
+fn format_replica_watch_row(replica: &ReplicaWatchSnapshot, color: bool) -> String {
+    let health = replica.status.as_ref().map_or("down", |status| {
         if status.state == ReplicaRuntimeState::Active {
             "up"
         } else {
-            "degraded"
+            "faulted"
         }
     });
-    let role = replica
-        .status
-        .as_ref()
-        .map_or(String::from("unknown"), |status| {
-            format!("{:?}", status.role).to_lowercase()
-        });
     let view = replica
         .status
         .as_ref()
@@ -2012,55 +2413,716 @@ fn format_replica_watch_row(replica: &ReplicaWatchSnapshot) -> String {
         |status| {
             status
                 .commit_lsn
-                .map_or_else(|| String::from("-"), |value| value.get().to_string())
+                .map_or_else(|| String::from("-"), |value| compact_counter(value.get()))
         },
     );
     let writes = replica.accepting_writes.map_or(String::from("-"), |value| {
         if value {
-            String::from("yes")
+            String::from("on")
         } else {
-            String::from("no")
+            String::from("off")
         }
     });
     let queue = replica
         .queue_depth
-        .map_or_else(|| String::from("-"), |value| value.to_string());
+        .map_or_else(|| String::from("-"), compact_counter);
     let lag = replica
         .logical_slot_lag
-        .map_or_else(|| String::from("-"), |value| value.to_string());
+        .map_or_else(|| String::from("-"), compact_counter);
     let backlog = replica
         .expiration_backlog
-        .map_or_else(|| String::from("-"), |value| value.to_string());
-    let error = replica.error.as_deref().unwrap_or("-");
+        .map_or_else(|| String::from("-"), compact_counter);
+    let note = truncate_for_watch(&replica_watch_note(replica), 46);
+    let health_cell = pad_watch_cell(health, 8);
+    let role_cell = pad_watch_cell(&role_label(replica), 10);
+    let view_cell = pad_watch_cell_right(&view, 6);
+    let commit_cell = pad_watch_cell_right(&commit_lsn, 9);
+    let writes_cell = pad_watch_cell(&writes, 4);
+    let queue_cell = pad_watch_cell_right(&queue, 9);
+    let lag_cell = pad_watch_cell_right(&lag, 9);
+    let backlog_cell = pad_watch_cell_right(&backlog, 5);
+
     format!(
-        "{:<3} {:<7} {:<9} {:<5} {:<11} {:<6} {:<6} {:<4} {:<8} {}",
-        replica.replica_id.get(),
-        state,
-        role,
-        view,
-        commit_lsn,
-        writes,
-        queue,
-        lag,
-        backlog,
-        error
+        "{} {} {} {} {} {} {} {} {} {}",
+        watch_style(
+            color,
+            &[ANSI_BOLD, ANSI_WHITE],
+            &pad_watch_cell_right(&replica.replica_id.get().to_string(), 2)
+        ),
+        style_health_cell(color, health, &health_cell),
+        style_role_cell(color, replica, &role_cell),
+        watch_style(color, &[ANSI_WHITE], &view_cell),
+        watch_style(color, &[ANSI_WHITE], &commit_cell),
+        style_writes_cell(color, &writes, &writes_cell),
+        watch_style(color, &[ANSI_WHITE], &queue_cell),
+        watch_style(color, &[ANSI_WHITE], &lag_cell),
+        style_backlog_cell(color, replica.expiration_backlog, &backlog_cell),
+        style_note_cell(color, replica, &note)
     )
 }
 
-fn render_recent_events(recent_events: &[String]) {
-    println!("Recent Events");
+fn format_kubevirt_fleet_lane_row(
+    lane_index: usize,
+    lane: &KubevirtWatchLaneSnapshot,
+    color: bool,
+) -> String {
+    let lane_cell = pad_watch_cell(&lane.name, 5);
+    let run = lane.snapshot.as_ref().map_or_else(
+        || String::from("<waiting>"),
+        |snapshot| truncate_for_watch(&snapshot.run_id, 32),
+    );
+    let run_cell = pad_watch_cell(&run, 32);
+    let state_cell = lane.snapshot.as_ref().map_or_else(
+        || watch_style(color, &[ANSI_DIM], &pad_watch_cell("waiting", 10)),
+        |snapshot| run_state_badge(snapshot, color),
+    );
+    let phase_cell = lane.snapshot.as_ref().map_or_else(
+        || watch_style(color, &[ANSI_DIM], &pad_watch_cell("waiting", 12)),
+        |snapshot| run_phase_badge(snapshot.phase, color),
+    );
+    let elapsed_cell = pad_watch_cell_right(
+        &lane.snapshot.as_ref().map_or_else(
+            || String::from("-"),
+            |snapshot| format_human_duration(snapshot.elapsed_secs),
+        ),
+        7,
+    );
+    let window_cell = pad_watch_cell(
+        &lane
+            .snapshot
+            .as_ref()
+            .map_or_else(|| String::from("warming up"), compact_fault_window_progress),
+        18,
+    );
+    let history_cell = pad_watch_cell_right(
+        &lane.snapshot.as_ref().map_or_else(
+            || String::from("-"),
+            |snapshot| compact_counter(snapshot.history_events),
+        ),
+        6,
+    );
+    let lead_cell = pad_watch_cell(&fleet_primary_label(&lane.replicas), 5);
+    let note = truncate_for_watch(
+        &lane.snapshot.as_ref().map_or_else(
+            || {
+                lane.lane_error
+                    .clone()
+                    .unwrap_or_else(|| String::from("waiting for first run status file"))
+            },
+            |snapshot| {
+                snapshot
+                    .last_error
+                    .clone()
+                    .filter(|error| error != "none")
+                    .unwrap_or_else(|| snapshot.detail.clone())
+            },
+        ),
+        28,
+    );
+    let note_cell = pad_watch_cell(&note, 28);
+
+    format!(
+        "{} {} {} {} {} {} {} {} {}",
+        style_lane_name_cell(color, lane_index, &lane_cell),
+        watch_style(color, &[ANSI_WHITE], &run_cell),
+        state_cell,
+        phase_cell,
+        watch_style(color, &[ANSI_WHITE], &elapsed_cell),
+        watch_style(color, &[ANSI_WHITE], &window_cell),
+        watch_style(color, &[ANSI_WHITE], &history_cell),
+        watch_style(color, &[ANSI_WHITE], &lead_cell),
+        style_lane_note_cell(color, lane, &note_cell)
+    )
+}
+
+fn render_kubevirt_fleet_replica_rows(lanes: &[KubevirtWatchLaneSnapshot], color: bool) {
+    println!(
+        "{}",
+        watch_style(color, &[ANSI_BOLD, ANSI_BLUE], "Replica Vibes")
+    );
+    println!(
+        "{}",
+        watch_style(
+            color,
+            &[ANSI_DIM],
+            "lane  id  health   role       view   commit    wr   queue     lag       due   note"
+        )
+    );
+    for (index, lane) in lanes.iter().enumerate() {
+        for replica in &lane.replicas {
+            println!(
+                "{}",
+                format_kubevirt_fleet_replica_row(index, &lane.name, replica, color)
+            );
+        }
+    }
+}
+
+fn format_kubevirt_fleet_replica_row(
+    lane_index: usize,
+    lane_name: &str,
+    replica: &ReplicaWatchSnapshot,
+    color: bool,
+) -> String {
+    let health = replica.status.as_ref().map_or("down", |status| {
+        if status.state == ReplicaRuntimeState::Active {
+            "up"
+        } else {
+            "faulted"
+        }
+    });
+    let view = replica
+        .status
+        .as_ref()
+        .map_or(String::from("-"), |status| status.current_view.to_string());
+    let commit_lsn = replica.status.as_ref().map_or_else(
+        || String::from("-"),
+        |status| {
+            status
+                .commit_lsn
+                .map_or_else(|| String::from("-"), |value| compact_counter(value.get()))
+        },
+    );
+    let writes = replica.accepting_writes.map_or(String::from("-"), |value| {
+        if value {
+            String::from("on")
+        } else {
+            String::from("off")
+        }
+    });
+    let queue = replica
+        .queue_depth
+        .map_or_else(|| String::from("-"), compact_counter);
+    let lag = replica
+        .logical_slot_lag
+        .map_or_else(|| String::from("-"), compact_counter);
+    let backlog = replica
+        .expiration_backlog
+        .map_or_else(|| String::from("-"), compact_counter);
+    let note = truncate_for_watch(&replica_watch_note(replica), 40);
+    let health_cell = pad_watch_cell(health, 8);
+    let role_cell = pad_watch_cell(&role_label(replica), 10);
+    let view_cell = pad_watch_cell_right(&view, 6);
+    let commit_cell = pad_watch_cell_right(&commit_lsn, 9);
+    let writes_cell = pad_watch_cell(&writes, 4);
+    let queue_cell = pad_watch_cell_right(&queue, 9);
+    let lag_cell = pad_watch_cell_right(&lag, 9);
+    let backlog_cell = pad_watch_cell_right(&backlog, 5);
+
+    format!(
+        "{} {} {} {} {} {} {} {} {} {} {}",
+        style_lane_name_cell(color, lane_index, &pad_watch_cell(lane_name, 5)),
+        watch_style(
+            color,
+            &[ANSI_BOLD, ANSI_WHITE],
+            &pad_watch_cell_right(&replica.replica_id.get().to_string(), 2)
+        ),
+        style_health_cell(color, health, &health_cell),
+        style_role_cell(color, replica, &role_cell),
+        watch_style(color, &[ANSI_WHITE], &view_cell),
+        watch_style(color, &[ANSI_WHITE], &commit_cell),
+        style_writes_cell(color, &writes, &writes_cell),
+        watch_style(color, &[ANSI_WHITE], &queue_cell),
+        watch_style(color, &[ANSI_WHITE], &lag_cell),
+        style_backlog_cell(color, replica.expiration_backlog, &backlog_cell),
+        style_note_cell(color, replica, &note)
+    )
+}
+
+fn render_recent_events(
+    snapshot: Option<&RunStatusSnapshot>,
+    recent_events: &[WatchEvent],
+    color: bool,
+) {
+    println!(
+        "{}",
+        watch_style(color, &[ANSI_BOLD, ANSI_BLUE], "Recent Events")
+    );
     if recent_events.is_empty() {
-        println!("<none>");
+        println!("{}", watch_style(color, &[ANSI_DIM], "  <none yet>"));
         return;
     }
-    for line in recent_events {
-        println!("{line}");
+    let base_time = snapshot
+        .map(|snapshot| snapshot.started_at_millis)
+        .or_else(|| recent_events.first().map(|event| event.time_millis))
+        .unwrap_or(0);
+    for event in recent_events {
+        let offset = event.time_millis.saturating_sub(base_time);
+        let icon = event_icon(&event.detail);
+        let elapsed = format_relative_millis(offset);
+        println!(
+            "  {} {} {}",
+            icon,
+            watch_style(color, &[ANSI_DIM], &pad_watch_cell(&elapsed, 8)),
+            style_event_detail(color, &event.detail)
+        );
     }
+}
+
+fn render_kubevirt_fleet_recent_events(lanes: &[KubevirtWatchLaneSnapshot], color: bool) {
+    println!(
+        "{}",
+        watch_style(color, &[ANSI_BOLD, ANSI_BLUE], "Lane Feed")
+    );
+    for (index, lane) in lanes.iter().enumerate() {
+        println!(
+            "  {} {}",
+            style_lane_name_cell(color, index, &pad_watch_cell(&lane.name, 5)),
+            watch_style(
+                color,
+                &[ANSI_DIM],
+                lane.snapshot
+                    .as_ref()
+                    .map_or("<waiting>", |snapshot| snapshot.run_id.as_str())
+            )
+        );
+        if lane.recent_events.is_empty() {
+            println!("{}", watch_style(color, &[ANSI_DIM], "    <none yet>"));
+            continue;
+        }
+        let base_time = lane
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.started_at_millis)
+            .or_else(|| lane.recent_events.first().map(|event| event.time_millis))
+            .unwrap_or(0);
+        for event in &lane.recent_events {
+            let offset = event.time_millis.saturating_sub(base_time);
+            let icon = event_icon(&event.detail);
+            let elapsed = format_relative_millis(offset);
+            println!(
+                "    {} {} {}",
+                icon,
+                watch_style(color, &[ANSI_DIM], &pad_watch_cell(&elapsed, 8)),
+                style_event_detail(color, &truncate_for_watch(&event.detail, 72))
+            );
+        }
+    }
+}
+
+fn compact_fault_window_progress(snapshot: &RunStatusSnapshot) -> String {
+    match snapshot.minimum_fault_window_secs {
+        None => String::from("ctrl"),
+        Some(total) => {
+            let current = snapshot.elapsed_secs.min(total);
+            let percent = if total == 0 {
+                100
+            } else {
+                current.saturating_mul(100) / total
+            };
+            format!("{} {:>3}%", progress_bar(current, total, 8), percent)
+        }
+    }
+}
+
+fn fleet_primary_label(replicas: &[ReplicaWatchSnapshot]) -> String {
+    replicas
+        .iter()
+        .find(|replica| {
+            replica.status.as_ref().is_some_and(|status| {
+                status.state == ReplicaRuntimeState::Active && status.role == ReplicaRole::Primary
+            })
+        })
+        .map_or_else(
+            || String::from("-"),
+            |replica| format!("r{}", replica.replica_id.get()),
+        )
+}
+
+fn lane_style_codes(lane_index: usize) -> &'static [&'static str] {
+    match lane_index % 3 {
+        0 => &[ANSI_BOLD, ANSI_MAGENTA],
+        1 => &[ANSI_BOLD, ANSI_CYAN],
+        _ => &[ANSI_BOLD, ANSI_GREEN],
+    }
+}
+
+fn style_lane_name_cell(color: bool, lane_index: usize, cell: &str) -> String {
+    watch_style(color, lane_style_codes(lane_index), cell)
+}
+
+fn style_lane_note_cell(color: bool, lane: &KubevirtWatchLaneSnapshot, cell: &str) -> String {
+    match lane.snapshot.as_ref() {
+        Some(snapshot)
+            if snapshot
+                .last_error
+                .as_ref()
+                .is_some_and(|error| error != "none") =>
+        {
+            watch_style(color, &[ANSI_RED], cell)
+        }
+        Some(snapshot) if snapshot.state == RunTrackerState::Passed => {
+            watch_style(color, &[ANSI_GREEN], cell)
+        }
+        Some(snapshot) if snapshot.state == RunTrackerState::Failed => {
+            watch_style(color, &[ANSI_RED], cell)
+        }
+        None if lane.lane_error.is_some() => watch_style(color, &[ANSI_ORANGE], cell),
+        Some(_) | None => watch_style(color, &[ANSI_DIM], cell),
+    }
+}
+
+fn parse_watch_event_line(line: &str) -> Result<WatchEvent, String> {
+    let (time_prefix, detail) = line
+        .split_once(" detail=")
+        .ok_or_else(|| format!("invalid watch event line `{line}`"))?;
+    let time_millis = time_prefix
+        .strip_prefix("time_millis=")
+        .ok_or_else(|| format!("invalid watch event timestamp `{line}`"))?
+        .parse::<u128>()
+        .map_err(|error| format!("invalid watch event timestamp `{line}`: {error}"))?;
+    Ok(WatchEvent {
+        time_millis,
+        detail: String::from(detail),
+    })
+}
+
+fn watch_color_enabled() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn watch_style(color: bool, codes: &[&str], text: &str) -> String {
+    if !color {
+        return String::from(text);
+    }
+    let mut styled = String::new();
+    for code in codes {
+        styled.push_str(code);
+    }
+    styled.push_str(text);
+    styled.push_str(ANSI_RESET);
+    styled
+}
+
+fn watch_rule(color: bool) -> String {
+    watch_style(color, &[ANSI_DIM], &"━".repeat(WATCH_RULE_WIDTH))
+}
+
+fn watch_spinner_frame(snapshot: Option<&RunStatusSnapshot>, refresh_millis: u64) -> &'static str {
+    let frame_seed = snapshot
+        .map_or_else(current_time_millis, |snapshot| snapshot.updated_at_millis)
+        / u128::from((refresh_millis.max(250) / 2).max(1));
+    WATCH_SPINNER_FRAMES[(usize::try_from(frame_seed).unwrap_or(0)) % WATCH_SPINNER_FRAMES.len()]
+}
+
+fn watch_pulse_frame(snapshot: Option<&RunStatusSnapshot>) -> &'static str {
+    let pulse_seed = snapshot.map_or(0, |snapshot| {
+        usize::try_from(snapshot.elapsed_secs).unwrap_or(usize::MAX)
+    });
+    WATCH_PULSE_FRAMES[pulse_seed % WATCH_PULSE_FRAMES.len()]
+}
+
+fn render_summary_row(color: bool, label: &str, value: &str) {
+    let label = pad_watch_cell(label, 10);
+    println!("  {} {}", watch_style(color, &[ANSI_DIM], &label), value);
+}
+
+fn run_state_badge(snapshot: &RunStatusSnapshot, color: bool) -> String {
+    match snapshot.state {
+        RunTrackerState::Running => watch_style(color, &[ANSI_BOLD, ANSI_GREEN], "🟢 RUNNING"),
+        RunTrackerState::Passed => watch_style(color, &[ANSI_BOLD, ANSI_GREEN], "✅ PASSED"),
+        RunTrackerState::Failed => watch_style(color, &[ANSI_BOLD, ANSI_RED], "💥 FAILED"),
+    }
+}
+
+fn run_phase_badge(phase: RunTrackerPhase, color: bool) -> String {
+    let (icon, label, codes): (&str, &str, &[&str]) = match phase {
+        RunTrackerPhase::Waiting => ("💤", "waiting", &[ANSI_DIM]),
+        RunTrackerPhase::VerifyingSurface => ("🛰", "verifying", &[ANSI_BOLD, ANSI_CYAN]),
+        RunTrackerPhase::Executing => ("⚙", "executing", &[ANSI_BOLD, ANSI_YELLOW]),
+        RunTrackerPhase::Analyzing => ("🔎", "analyzing", &[ANSI_BOLD, ANSI_MAGENTA]),
+        RunTrackerPhase::Archiving => ("📦", "archiving", &[ANSI_BOLD, ANSI_BLUE]),
+        RunTrackerPhase::Completed => ("🏁", "completed", &[ANSI_BOLD, ANSI_GREEN]),
+        RunTrackerPhase::Failed => ("🔥", "failed", &[ANSI_BOLD, ANSI_RED]),
+    };
+    watch_style(color, codes, &format!("{icon} {label}"))
+}
+
+fn format_fault_window_summary(snapshot: &RunStatusSnapshot, color: bool) -> String {
+    match snapshot.minimum_fault_window_secs {
+        Some(target_secs) => {
+            let progress = progress_bar(snapshot.elapsed_secs, target_secs, 18);
+            let percent_tenths = fault_window_percent_tenths(snapshot.elapsed_secs, target_secs);
+            format!(
+                "{} {} / {} ({}.{:01}%)",
+                watch_style(color, &[ANSI_CYAN], &progress),
+                format_human_duration(snapshot.elapsed_secs),
+                format_human_duration(target_secs),
+                percent_tenths / 10,
+                percent_tenths % 10,
+            )
+        }
+        None => watch_style(
+            color,
+            &[ANSI_GREEN],
+            "🎮 control run • no minimum fault window",
+        ),
+    }
+}
+
+fn format_release_gate_status(snapshot: &RunStatusSnapshot, color: bool) -> String {
+    match snapshot.release_gate_passed {
+        Some(true) => watch_style(color, &[ANSI_BOLD, ANSI_GREEN], "🟢 clear"),
+        Some(false) => watch_style(color, &[ANSI_BOLD, ANSI_RED], "⛔ blocked"),
+        None => watch_style(color, &[ANSI_YELLOW], "🫧 pending"),
+    }
+}
+
+fn format_blocker_count(blockers: Option<usize>, color: bool) -> String {
+    match blockers {
+        Some(0) => watch_style(color, &[ANSI_GREEN], "0"),
+        Some(value) => watch_style(color, &[ANSI_RED], &value.to_string()),
+        None => watch_style(color, &[ANSI_DIM], "none"),
+    }
+}
+
+fn progress_bar(current: u64, total: u64, width: usize) -> String {
+    if total == 0 {
+        return "█".repeat(width.max(1));
+    }
+    let width = width.max(1);
+    let clamped = current.min(total);
+    let filled = usize::try_from(
+        (u128::from(clamped) * u128::try_from(width).unwrap_or(0)) / u128::from(total),
+    )
+    .unwrap_or(width)
+    .min(width);
+    format!(
+        "{}{}",
+        "█".repeat(filled),
+        "░".repeat(width.saturating_sub(filled))
+    )
+}
+
+fn fault_window_percent_tenths(current: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 1_000;
+    }
+    u64::try_from((u128::from(current.min(total)) * 1_000) / u128::from(total)).unwrap_or(1_000)
+}
+
+fn format_human_duration(secs: u64) -> String {
+    let hours = secs / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    let seconds = secs % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn format_relative_millis(millis: u128) -> String {
+    if millis >= 60_000 {
+        let secs = u64::try_from(millis / 1_000).unwrap_or(u64::MAX);
+        format!("+{}", format_human_duration(secs))
+    } else {
+        let tenths = millis / 100;
+        let whole = tenths / 10;
+        let frac = tenths % 10;
+        format!("+{whole}.{frac}s")
+    }
+}
+
+fn compact_counter(value: u64) -> String {
+    match value {
+        0..=999 => value.to_string(),
+        1_000..=999_999 => format_compact_decimal(value, 1_000, "K"),
+        1_000_000..=999_999_999 => format_compact_decimal(value, 1_000_000, "M"),
+        1_000_000_000..=999_999_999_999 => format_compact_decimal(value, 1_000_000_000, "B"),
+        _ => format_compact_decimal(value, 1_000_000_000_000, "T"),
+    }
+}
+
+fn format_compact_decimal(value: u64, divisor: u64, suffix: &str) -> String {
+    let whole = value / divisor;
+    if whole >= 100 {
+        return format!("{whole}{suffix}");
+    }
+    let tenth = ((value % divisor) * 10) / divisor;
+    format!("{whole}.{tenth}{suffix}")
+}
+
+fn pluralize<'a>(count: u64, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
+}
+
+fn pad_watch_cell(text: &str, width: usize) -> String {
+    format!("{text:<width$}")
+}
+
+fn pad_watch_cell_right(text: &str, width: usize) -> String {
+    format!("{text:>width$}")
+}
+
+fn truncate_for_watch(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return String::from(text);
+    }
+    let keep = max_chars.saturating_sub(1);
+    let prefix = text.chars().take(keep).collect::<String>();
+    format!("{prefix}…")
+}
+
+fn replica_watch_note(replica: &ReplicaWatchSnapshot) -> String {
+    if let Some(error) = &replica.error {
+        return error.clone();
+    }
+    let Some(status) = &replica.status else {
+        return String::from("☠ control link unavailable");
+    };
+    if status.state == ReplicaRuntimeState::Faulted {
+        return status.fault_reason.clone().map_or_else(
+            || String::from("💥 replica faulted"),
+            |reason| format!("💥 {reason}"),
+        );
+    }
+    if replica.accepting_writes == Some(false) {
+        return String::from("🧯 writes paused");
+    }
+    if let Some(backlog) = replica.expiration_backlog.filter(|value| *value > 0) {
+        return format!(
+            "⏰ {} due expiration {}",
+            compact_counter(backlog),
+            pluralize(backlog, "tick", "ticks")
+        );
+    }
+    if let Some(queue_depth) = replica.queue_depth.filter(|value| *value > 0) {
+        return format!("📥 {} queued ops", compact_counter(queue_depth));
+    }
+    match status.role {
+        ReplicaRole::Primary => String::from("👑 serving traffic"),
+        ReplicaRole::Backup => String::from("🛡 hot standby"),
+        ReplicaRole::ViewUncertain => String::from("🫥 view uncertain"),
+        ReplicaRole::Recovering => String::from("🩹 recovering"),
+        ReplicaRole::Faulted => String::from("💥 faulted"),
+    }
+}
+
+fn replica_role_label(role: ReplicaRole) -> &'static str {
+    match role {
+        ReplicaRole::Primary => "primary",
+        ReplicaRole::Backup => "backup",
+        ReplicaRole::ViewUncertain => "uncertain",
+        ReplicaRole::Recovering => "recover",
+        ReplicaRole::Faulted => "faulted",
+    }
+}
+
+fn role_label(replica: &ReplicaWatchSnapshot) -> String {
+    match replica.status.as_ref().map(|status| status.role) {
+        Some(role) => String::from(replica_role_label(role)),
+        None => String::from("down"),
+    }
+}
+
+fn style_health_cell(color: bool, health: &str, cell: &str) -> String {
+    let codes = match health {
+        "up" => &[ANSI_GREEN][..],
+        "faulted" => &[ANSI_RED][..],
+        _ => &[ANSI_ORANGE][..],
+    };
+    watch_style(color, codes, cell)
+}
+
+fn style_role_cell(color: bool, replica: &ReplicaWatchSnapshot, cell: &str) -> String {
+    let codes = match replica.status.as_ref().map(|status| status.role) {
+        Some(ReplicaRole::Primary) => &[ANSI_BOLD, ANSI_YELLOW][..],
+        Some(ReplicaRole::Backup) => &[ANSI_CYAN][..],
+        Some(ReplicaRole::ViewUncertain) => &[ANSI_ORANGE][..],
+        Some(ReplicaRole::Recovering) => &[ANSI_MAGENTA][..],
+        Some(ReplicaRole::Faulted) => &[ANSI_RED][..],
+        None => &[ANSI_DIM][..],
+    };
+    watch_style(color, codes, cell)
+}
+
+fn style_writes_cell(color: bool, writes: &str, cell: &str) -> String {
+    let codes = match writes {
+        "on" => &[ANSI_GREEN][..],
+        "off" => &[ANSI_YELLOW][..],
+        _ => &[ANSI_DIM][..],
+    };
+    watch_style(color, codes, cell)
+}
+
+fn style_backlog_cell(color: bool, backlog: Option<u64>, cell: &str) -> String {
+    let codes = match backlog {
+        Some(0) => &[ANSI_GREEN][..],
+        Some(_) => &[ANSI_ORANGE][..],
+        None => &[ANSI_DIM][..],
+    };
+    watch_style(color, codes, cell)
+}
+
+fn style_note_cell(color: bool, replica: &ReplicaWatchSnapshot, note: &str) -> String {
+    if replica.error.is_some() {
+        return watch_style(color, &[ANSI_RED], note);
+    }
+    if replica
+        .status
+        .as_ref()
+        .is_some_and(|status| status.role == ReplicaRole::Primary)
+    {
+        return watch_style(color, &[ANSI_BOLD, ANSI_YELLOW], note);
+    }
+    watch_style(color, &[ANSI_DIM], note)
+}
+
+fn event_icon(detail: &str) -> &'static str {
+    if detail.starts_with("run initialized") {
+        "🌱"
+    } else if detail.starts_with("verifying external surface") {
+        "🛰"
+    } else if detail.starts_with("executing Jepsen scenario") {
+        "⚙"
+    } else if detail.starts_with("history sequence=") {
+        "📜"
+    } else if detail.starts_with("analyzing Jepsen history") {
+        "🔎"
+    } else if detail.starts_with("collecting logs and artifacts") {
+        "📦"
+    } else if detail.starts_with("run completed") {
+        "🏁"
+    } else if detail.starts_with("error:") {
+        "💥"
+    } else {
+        "•"
+    }
+}
+
+fn style_event_detail(color: bool, detail: &str) -> String {
+    if detail.starts_with("error:") {
+        return watch_style(color, &[ANSI_RED], detail);
+    }
+    if detail.starts_with("run completed") {
+        return watch_style(color, &[ANSI_GREEN], detail);
+    }
+    if detail.starts_with("history sequence=") {
+        return watch_style(color, &[ANSI_CYAN], detail);
+    }
+    watch_style(color, &[ANSI_WHITE], detail)
 }
 
 enum RemoteApiOutcome {
     Api(ApiResponse),
     Text(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResourceReadObservation {
+    Available,
+    Held {
+        state: allocdb_core::ResourceState,
+        current_reservation_id: Option<ReservationId>,
+        version: u64,
+    },
+    NotFound,
+    FenceNotApplied,
+    EngineHalted,
+    NotPrimary,
 }
 
 struct ReserveCommit {
@@ -2084,8 +3146,13 @@ struct StagedReplicaWorkspace {
 }
 
 impl StagedReplicaWorkspace {
-    fn new(replica_id: ReplicaId) -> Result<Self, String> {
-        let root = temp_staging_dir(&format!("qemu-replica-{}", replica_id.get()))?;
+    fn new<T: ExternalTestbed>(layout: &T, replica_id: ReplicaId) -> Result<Self, String> {
+        let root = temp_staging_dir(&format!(
+            "staged-{}-{}-replica-{}",
+            layout.backend_name(),
+            sanitized_workspace_label(layout.workspace_root()),
+            replica_id.get()
+        ))?;
         let workspace_dir = root.join(format!("replica-{}", replica_id.get()));
         fs::create_dir_all(&workspace_dir).map_err(|error| {
             format!(
@@ -2106,7 +3173,7 @@ impl StagedReplicaWorkspace {
     }
 
     fn from_export<T: ExternalTestbed>(layout: &T, replica_id: ReplicaId) -> Result<Self, String> {
-        let staged = Self::new(replica_id)?;
+        let staged = Self::new(layout, replica_id)?;
         let archive = run_remote_control_command(
             layout,
             &[String::from("export-replica"), replica_id.get().to_string()],
@@ -2142,7 +3209,10 @@ fn temp_staging_dir(prefix: &str) -> Result<PathBuf, String> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let root = std::env::temp_dir().join(format!("allocdb-{prefix}-{millis}"));
+    let pid = std::process::id();
+    let sequence = NEXT_STAGING_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
+    let root =
+        std::env::temp_dir().join(format!("allocdb-{prefix}-pid{pid}-seq{sequence}-{millis}"));
     fs::create_dir_all(&root).map_err(|error| {
         format!(
             "failed to create temp staging dir {}: {error}",
@@ -2165,8 +3235,17 @@ fn run_remote_control_command<T: ExternalTestbed>(
     layout.run_remote_host_command(&remote_command, stdin_bytes)
 }
 
+fn disable_local_tar_copyfile_metadata(command: &mut Command) {
+    #[cfg(target_os = "macos")]
+    {
+        command.env("COPYFILE_DISABLE", "1");
+    }
+}
+
 fn run_local_tar_extract(destination_root: &Path, archive: &[u8]) -> Result<(), String> {
-    let mut child = Command::new("tar")
+    let mut command = Command::new("tar");
+    disable_local_tar_copyfile_metadata(&mut command);
+    let mut child = command
         .arg("xzf")
         .arg("-")
         .arg("-C")
@@ -2198,7 +3277,9 @@ fn run_local_tar_extract(destination_root: &Path, archive: &[u8]) -> Result<(), 
 }
 
 fn run_local_tar_archive(root: &Path, entry_name: &str) -> Result<Vec<u8>, String> {
-    let output = Command::new("tar")
+    let mut command = Command::new("tar");
+    disable_local_tar_copyfile_metadata(&mut command);
+    let output = command
         .arg("czf")
         .arg("-")
         .arg("-C")
@@ -2216,6 +3297,15 @@ fn run_local_tar_archive(root: &Path, entry_name: &str) -> Result<Vec<u8>, Strin
             String::from_utf8_lossy(&output.stderr)
         ))
     }
+}
+
+fn sanitized_workspace_label(path: &Path) -> String {
+    sanitize_run_id(
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("workspace"),
+    )
 }
 
 fn prepare_log_path_for(metadata_path: &Path) -> PathBuf {
@@ -2431,57 +3521,214 @@ fn request_remote_control_status<T: ExternalTestbed>(
     })
 }
 
-fn runtime_replica_configs<T: ExternalTestbed>(
-    layout: &T,
-) -> Result<Vec<LocalClusterReplicaConfig>, String> {
-    let mut replicas = layout.replica_layout().replicas.clone();
-    for replica in &mut replicas {
-        let status = request_remote_control_status(layout, replica)?;
-        replica.role = status.role;
+fn runtime_replica_probes<T: ExternalTestbed>(layout: &T) -> Vec<RuntimeReplicaProbe> {
+    layout
+        .replica_layout()
+        .replicas
+        .iter()
+        .cloned()
+        .map(|mut replica| {
+            let status = request_remote_control_status(layout, &replica);
+            if let Ok(status) = status.as_ref() {
+                replica.role = status.role;
+            }
+            RuntimeReplicaProbe { replica, status }
+        })
+        .collect()
+}
+
+fn runtime_probe_is_active(probe: &RuntimeReplicaProbe) -> bool {
+    matches!(
+        probe.status.as_ref(),
+        Ok(status) if status.state == ReplicaRuntimeState::Active
+    )
+}
+
+fn summarize_runtime_probes(probes: &[RuntimeReplicaProbe]) -> RuntimeReplicaTopology {
+    let mut topology = RuntimeReplicaTopology {
+        active: 0,
+        primaries: 0,
+        backups: 0,
+    };
+    for probe in probes {
+        let Ok(status) = probe.status.as_ref() else {
+            continue;
+        };
+        if status.state != ReplicaRuntimeState::Active {
+            continue;
+        }
+        topology.active += 1;
+        match status.role {
+            ReplicaRole::Primary => topology.primaries += 1,
+            ReplicaRole::Backup => topology.backups += 1,
+            ReplicaRole::Faulted | ReplicaRole::ViewUncertain | ReplicaRole::Recovering => {}
+        }
     }
-    Ok(replicas)
+    topology
+}
+
+fn live_runtime_replica_matching<F>(
+    probes: &[RuntimeReplicaProbe],
+    mut predicate: F,
+) -> Option<LocalClusterReplicaConfig>
+where
+    F: FnMut(&LocalClusterReplicaConfig) -> bool,
+{
+    probes
+        .iter()
+        .filter(|probe| runtime_probe_is_active(probe))
+        .map(|probe| probe.replica.clone())
+        .find(|replica| predicate(replica))
+}
+
+fn render_runtime_probe_summary(probes: &[RuntimeReplicaProbe]) -> String {
+    probes
+        .iter()
+        .map(|probe| match &probe.status {
+            Ok(status) if status.state == ReplicaRuntimeState::Active => format!(
+                "{}:{}@view{}",
+                probe.replica.replica_id.get(),
+                replica_role_label(status.role),
+                status.current_view
+            ),
+            Ok(status) => format!(
+                "{}:faulted({})",
+                probe.replica.replica_id.get(),
+                status
+                    .fault_reason
+                    .as_deref()
+                    .unwrap_or("replica faulted")
+                    .lines()
+                    .next()
+                    .unwrap_or("replica faulted")
+                    .trim()
+            ),
+            Err(error) => format!(
+                "{}:down({})",
+                probe.replica.replica_id.get(),
+                error.lines().next().unwrap_or(error).trim()
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn wait_for_runtime_replica_role<T: ExternalTestbed>(
+    layout: &T,
+    replica_id: ReplicaId,
+    role: ReplicaRole,
+) -> Result<LocalClusterReplicaConfig, String> {
+    wait_for_live_runtime_replica(
+        layout,
+        &format!(
+            "replica {} as {}",
+            replica_id.get(),
+            replica_role_label(role)
+        ),
+        |replica| replica.replica_id == replica_id && replica.role == role,
+    )
+}
+
+fn ensure_runtime_cluster_ready<T: ExternalTestbed>(layout: &T) -> Result<(), String> {
+    for replica in &layout.replica_layout().replicas {
+        let _ = heal_replica(layout, replica.replica_id);
+    }
+
+    let expected_replica_count = layout.replica_layout().replicas.len();
+    let started_at = Instant::now();
+    loop {
+        let probes = runtime_replica_probes(layout);
+        let topology = summarize_runtime_probes(&probes);
+        if topology.active == expected_replica_count
+            && topology.primaries == 1
+            && topology.backups == expected_replica_count.saturating_sub(1)
+        {
+            return Ok(());
+        }
+
+        for probe in &probes {
+            if !runtime_probe_is_active(probe) {
+                let _ = restart_replica(layout, probe.replica.replica_id);
+            }
+        }
+
+        if started_at.elapsed() >= EXTERNAL_RUNTIME_DISCOVERY_TIMEOUT {
+            return Err(format!(
+                "{} cluster did not converge to a healthy {}-replica topology within {}s; last_probe={}",
+                layout.backend_name(),
+                expected_replica_count,
+                EXTERNAL_RUNTIME_DISCOVERY_TIMEOUT.as_secs(),
+                render_runtime_probe_summary(&probes)
+            ));
+        }
+        thread::sleep(EXTERNAL_RUNTIME_DISCOVERY_RETRY_DELAY);
+    }
+}
+
+fn wait_for_live_runtime_replica<T, F>(
+    layout: &T,
+    description: &str,
+    predicate: F,
+) -> Result<LocalClusterReplicaConfig, String>
+where
+    T: ExternalTestbed,
+    F: Fn(&LocalClusterReplicaConfig) -> bool,
+{
+    let started_at = Instant::now();
+    loop {
+        let probes = runtime_replica_probes(layout);
+        if let Some(replica) = live_runtime_replica_matching(&probes, &predicate) {
+            return Ok(replica);
+        }
+        if started_at.elapsed() >= EXTERNAL_RUNTIME_DISCOVERY_TIMEOUT {
+            return Err(format!(
+                "{} cluster did not surface {description} within {}s; last_probe={}",
+                layout.backend_name(),
+                EXTERNAL_RUNTIME_DISCOVERY_TIMEOUT.as_secs(),
+                render_runtime_probe_summary(&probes)
+            ));
+        }
+        thread::sleep(EXTERNAL_RUNTIME_DISCOVERY_RETRY_DELAY);
+    }
 }
 
 fn primary_replica<T: ExternalTestbed>(layout: &T) -> Result<LocalClusterReplicaConfig, String> {
-    runtime_replica_configs(layout)?
-        .into_iter()
-        .find(|replica| replica.role == ReplicaRole::Primary)
-        .ok_or_else(|| format!("{} cluster has no live primary", layout.backend_name()))
+    wait_for_live_runtime_replica(layout, "a live primary", |replica| {
+        replica.role == ReplicaRole::Primary
+    })
 }
 
 fn first_backup_replica<T: ExternalTestbed>(
     layout: &T,
     exclude: Option<ReplicaId>,
 ) -> Result<LocalClusterReplicaConfig, String> {
-    runtime_replica_configs(layout)?
-        .into_iter()
-        .find(|replica| {
-            replica.role == ReplicaRole::Backup
-                && exclude.is_none_or(|excluded| replica.replica_id != excluded)
-        })
-        .ok_or_else(|| format!("{} cluster has no live backup", layout.backend_name()))
+    wait_for_live_runtime_replica(layout, "a live backup", |replica| {
+        replica.role == ReplicaRole::Backup
+            && exclude.is_none_or(|excluded| replica.replica_id != excluded)
+    })
 }
 
 fn runtime_replica_by_id<T: ExternalTestbed>(
     layout: &T,
     replica_id: ReplicaId,
 ) -> Result<LocalClusterReplicaConfig, String> {
-    runtime_replica_configs(layout)?
-        .into_iter()
-        .find(|replica| replica.replica_id == replica_id)
-        .ok_or_else(|| {
-            format!(
-                "{} cluster has no replica {}",
-                layout.backend_name(),
-                replica_id.get()
-            )
-        })
+    wait_for_live_runtime_replica(
+        layout,
+        &format!("replica {}", replica_id.get()),
+        |replica| replica.replica_id == replica_id,
+    )
 }
 
 fn maybe_crash_replica<T: ExternalTestbed>(
     layout: &T,
     replica_id: ReplicaId,
 ) -> Result<(), String> {
+    eprintln!(
+        "backend={} event=crash_replica workspace={} replica={}",
+        layout.backend_name(),
+        layout.workspace_root().display(),
+        replica_id.get()
+    );
     match run_remote_control_command(
         layout,
         &[String::from("crash"), replica_id.get().to_string()],
@@ -2494,6 +3741,12 @@ fn maybe_crash_replica<T: ExternalTestbed>(
 }
 
 fn restart_replica<T: ExternalTestbed>(layout: &T, replica_id: ReplicaId) -> Result<(), String> {
+    eprintln!(
+        "backend={} event=restart_replica workspace={} replica={}",
+        layout.backend_name(),
+        layout.workspace_root().display(),
+        replica_id.get()
+    );
     let _ = run_remote_control_command(
         layout,
         &[String::from("restart"), replica_id.get().to_string()],
@@ -2503,6 +3756,12 @@ fn restart_replica<T: ExternalTestbed>(layout: &T, replica_id: ReplicaId) -> Res
 }
 
 fn isolate_replica<T: ExternalTestbed>(layout: &T, replica_id: ReplicaId) -> Result<(), String> {
+    eprintln!(
+        "backend={} event=isolate_replica workspace={} replica={}",
+        layout.backend_name(),
+        layout.workspace_root().display(),
+        replica_id.get()
+    );
     let _ = run_remote_control_command(
         layout,
         &[String::from("isolate"), replica_id.get().to_string()],
@@ -2512,6 +3771,12 @@ fn isolate_replica<T: ExternalTestbed>(layout: &T, replica_id: ReplicaId) -> Res
 }
 
 fn heal_replica<T: ExternalTestbed>(layout: &T, replica_id: ReplicaId) -> Result<(), String> {
+    eprintln!(
+        "backend={} event=heal_replica workspace={} replica={}",
+        layout.backend_name(),
+        layout.workspace_root().display(),
+        replica_id.get()
+    );
     let _ = run_remote_control_command(
         layout,
         &[String::from("heal"), replica_id.get().to_string()],
@@ -2546,14 +3811,27 @@ fn staged_replica_summary<T: ExternalTestbed>(
     ))
 }
 
-fn rewrite_replica_from_source<T: ExternalTestbed>(
+fn format_staged_summary(summary: (u64, Option<Lsn>, Option<Lsn>)) -> String {
+    format!(
+        "view={} commit_lsn={} highest_prepared_lsn={}",
+        summary.0,
+        summary
+            .1
+            .map_or_else(|| String::from("none"), |lsn| lsn.get().to_string()),
+        summary
+            .2
+            .map_or_else(|| String::from("none"), |lsn| lsn.get().to_string())
+    )
+}
+
+fn format_optional_lsn(value: Option<Lsn>) -> String {
+    value.map_or_else(|| String::from("none"), |lsn| lsn.get().to_string())
+}
+
+fn load_staged_source_metadata<T: ExternalTestbed>(
     layout: &T,
     source: &StagedReplicaWorkspace,
-    target: &StagedReplicaWorkspace,
-    target_commit_lsn: Option<Lsn>,
-    new_view: u64,
-    new_role: ReplicaRole,
-) -> Result<(), String> {
+) -> Result<(ReplicaMetadata, PathBuf), String> {
     let source_node = ReplicaNode::recover(
         layout.replica_layout().core_config.clone(),
         layout.replica_layout().engine_config,
@@ -2571,7 +3849,70 @@ fn rewrite_replica_from_source<T: ExternalTestbed>(
     })?;
     let source_metadata = *source_node.metadata();
     let source_prepare_log_path = source_node.prepare_log_path().to_path_buf();
-    drop(source_node);
+    Ok((source_metadata, source_prepare_log_path))
+}
+
+fn log_rewrite_replica_begin<T: ExternalTestbed>(
+    layout: &T,
+    source: &StagedReplicaWorkspace,
+    target: &StagedReplicaWorkspace,
+    source_metadata: ReplicaMetadata,
+    target_commit_lsn: Option<Lsn>,
+    new_view: u64,
+    new_role: ReplicaRole,
+) {
+    eprintln!(
+        "backend={} event=rewrite_replica_from_source workspace={} source_replica={} target_replica={} source_role={:?} source_view={} source_commit_lsn={} source_snapshot_lsn={} target_commit_lsn={} new_view={} new_role={:?}",
+        layout.backend_name(),
+        layout.workspace_root().display(),
+        source.replica_id.get(),
+        target.replica_id.get(),
+        source_metadata.role,
+        source_metadata.current_view,
+        format_optional_lsn(source_metadata.commit_lsn),
+        format_optional_lsn(source_metadata.active_snapshot_lsn),
+        format_optional_lsn(target_commit_lsn),
+        new_view,
+        new_role
+    );
+}
+
+fn log_rewrite_replica_complete<T: ExternalTestbed>(
+    layout: &T,
+    target: &StagedReplicaWorkspace,
+    target_node: &ReplicaNode,
+) {
+    eprintln!(
+        "backend={} event=rewrite_replica_complete workspace={} target_replica={} final_role={:?} final_view={} final_commit_lsn={} final_snapshot_lsn={} final_highest_prepared_lsn={}",
+        layout.backend_name(),
+        layout.workspace_root().display(),
+        target.replica_id.get(),
+        target_node.metadata().role,
+        target_node.metadata().current_view,
+        format_optional_lsn(target_node.metadata().commit_lsn),
+        format_optional_lsn(target_node.metadata().active_snapshot_lsn),
+        format_optional_lsn(target_node.highest_prepared_lsn())
+    );
+}
+
+fn rewrite_replica_from_source<T: ExternalTestbed>(
+    layout: &T,
+    source: &StagedReplicaWorkspace,
+    target: &StagedReplicaWorkspace,
+    target_commit_lsn: Option<Lsn>,
+    new_view: u64,
+    new_role: ReplicaRole,
+) -> Result<(), String> {
+    let (source_metadata, source_prepare_log_path) = load_staged_source_metadata(layout, source)?;
+    log_rewrite_replica_begin(
+        layout,
+        source,
+        target,
+        source_metadata,
+        target_commit_lsn,
+        new_view,
+        new_role,
+    );
 
     if source.replica_id != target.replica_id {
         copy_file_or_remove(&source.paths.snapshot_path, &target.paths.snapshot_path)?;
@@ -2635,6 +3976,7 @@ fn rewrite_replica_from_source<T: ExternalTestbed>(
     target_node
         .configure_normal_role(new_view, new_role)
         .map_err(|error| format!("failed to configure staged role: {error:?}"))?;
+    log_rewrite_replica_complete(layout, target, &target_node);
     Ok(())
 }
 
@@ -2644,6 +3986,14 @@ fn perform_failover<T: ExternalTestbed>(
     new_primary: ReplicaId,
     supporting_backup: ReplicaId,
 ) -> Result<(), String> {
+    eprintln!(
+        "backend={} event=perform_failover_begin workspace={} old_primary={} new_primary={} supporting_backup={}",
+        layout.backend_name(),
+        layout.workspace_root().display(),
+        old_primary.get(),
+        new_primary.get(),
+        supporting_backup.get()
+    );
     maybe_crash_replica(layout, old_primary)?;
     maybe_crash_replica(layout, new_primary)?;
     maybe_crash_replica(layout, supporting_backup)?;
@@ -2672,6 +4022,19 @@ fn perform_failover<T: ExternalTestbed>(
     } else {
         &new_primary_stage
     };
+    eprintln!(
+        "backend={} event=perform_failover_plan workspace={} old_primary={} new_primary={} supporting_backup={} new_primary_summary=\"{}\" supporting_summary=\"{}\" chosen_source={} target_commit_lsn={} new_view={}",
+        layout.backend_name(),
+        layout.workspace_root().display(),
+        old_primary.get(),
+        new_primary.get(),
+        supporting_backup.get(),
+        format_staged_summary(new_primary_summary),
+        format_staged_summary(supporting_summary),
+        source.replica_id.get(),
+        target_commit_lsn.map_or_else(|| String::from("none"), |lsn| lsn.get().to_string()),
+        new_view
+    );
 
     rewrite_replica_from_source(
         layout,
@@ -2694,6 +4057,18 @@ fn perform_failover<T: ExternalTestbed>(
     new_primary_stage.import_to_remote(layout)?;
     restart_replica(layout, supporting_backup)?;
     restart_replica(layout, new_primary)?;
+    wait_for_runtime_replica_role(layout, new_primary, ReplicaRole::Primary)?;
+    wait_for_runtime_replica_role(layout, supporting_backup, ReplicaRole::Backup)?;
+    eprintln!(
+        "backend={} event=perform_failover_complete workspace={} old_primary={} new_primary={} supporting_backup={} new_view={} target_commit_lsn={}",
+        layout.backend_name(),
+        layout.workspace_root().display(),
+        old_primary.get(),
+        new_primary.get(),
+        supporting_backup.get(),
+        new_view,
+        target_commit_lsn.map_or_else(|| String::from("none"), |lsn| lsn.get().to_string())
+    );
     Ok(())
 }
 
@@ -2702,10 +4077,25 @@ fn perform_rejoin<T: ExternalTestbed>(
     current_primary: ReplicaId,
     target_replica: ReplicaId,
 ) -> Result<(), String> {
+    eprintln!(
+        "backend={} event=perform_rejoin_begin workspace={} current_primary={} target_replica={}",
+        layout.backend_name(),
+        layout.workspace_root().display(),
+        current_primary.get(),
+        target_replica.get()
+    );
     maybe_crash_replica(layout, target_replica)?;
     let source_stage = StagedReplicaWorkspace::from_export(layout, current_primary)?;
     let source_summary = staged_replica_summary(layout, &source_stage)?;
-    let target_stage = StagedReplicaWorkspace::new(target_replica)?;
+    let target_stage = StagedReplicaWorkspace::new(layout, target_replica)?;
+    eprintln!(
+        "backend={} event=perform_rejoin_plan workspace={} current_primary={} target_replica={} source_summary=\"{}\"",
+        layout.backend_name(),
+        layout.workspace_root().display(),
+        current_primary.get(),
+        target_replica.get(),
+        format_staged_summary(source_summary)
+    );
     rewrite_replica_from_source(
         layout,
         &source_stage,
@@ -2716,6 +4106,18 @@ fn perform_rejoin<T: ExternalTestbed>(
     )?;
     target_stage.import_to_remote(layout)?;
     restart_replica(layout, target_replica)?;
+    wait_for_runtime_replica_role(layout, target_replica, ReplicaRole::Backup)?;
+    eprintln!(
+        "backend={} event=perform_rejoin_complete workspace={} current_primary={} target_replica={} target_view={} target_commit_lsn={}",
+        layout.backend_name(),
+        layout.workspace_root().display(),
+        current_primary.get(),
+        target_replica.get(),
+        source_summary.0,
+        source_summary
+            .1
+            .map_or_else(|| String::from("none"), |lsn| lsn.get().to_string())
+    );
     Ok(())
 }
 
@@ -2745,7 +4147,10 @@ fn run_crash_restart_reservation_contention<T: ExternalTestbed>(
     )?;
 
     let current_primary = primary_replica(layout)?;
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let first = reserve_event(
         layout,
         &current_primary,
@@ -2798,8 +4203,10 @@ fn run_crash_restart_ambiguous_retry<T: ExternalTestbed>(
 
     maybe_crash_replica(layout, failover_target.replica_id)?;
     maybe_crash_replica(layout, supporting_backup.replica_id)?;
-
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let first = reserve_event(
         layout,
         primary,
@@ -2858,7 +4265,10 @@ fn run_crash_restart_failover_reads<T: ExternalTestbed>(
         OperationId(base_id + 102),
     )?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
         layout,
         primary,
@@ -2938,7 +4348,10 @@ fn run_crash_restart_expiration_recovery<T: ExternalTestbed>(
         OperationId(base_id + 103),
     )?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
         layout,
         primary,
@@ -2986,21 +4399,31 @@ fn run_crash_restart_expiration_recovery<T: ExternalTestbed>(
         String::from("crash-restart expiration_and_recovery expected one committed expiration tick")
     })?;
     history.push(primary_process_name(&current_primary), tick.0, tick.1);
-
-    let resource_read =
-        resource_available_event(layout, &current_primary, resource_id, Some(tick_lsn))?;
-    history.push(
-        primary_process_name(&current_primary),
-        resource_read.0,
-        resource_read.1,
-    );
+    let settled_tick_lsn = record_resource_available_after_expiration(
+        layout,
+        &current_primary,
+        context,
+        &mut history,
+        ExpirationDrainPlan {
+            resource_id,
+            expired: &[JepsenExpiredReservation {
+                resource_id,
+                holder_id: 505,
+                reservation_id: reserve_commit.reservation_id.get(),
+                released_lsn: None,
+            }],
+            required_lsn: tick_lsn,
+            operation_id_base: base_id + 32,
+            slot_base: 43,
+        },
+    )?;
     let reservation_read = reservation_read_event(
         layout,
         &current_primary,
         context,
         reserve_commit.reservation_id,
         Slot(42),
-        Some(tick_lsn),
+        Some(settled_tick_lsn),
     )?;
     history.push(
         primary_process_name(&current_primary),
@@ -3029,11 +4452,13 @@ fn run_partition_heal_reservation_contention<T: ExternalTestbed>(
         resource_id,
         OperationId(base_id + 110),
     )?;
-
     isolate_replica(layout, failover_target.replica_id)?;
     isolate_replica(layout, supporting_backup.replica_id)?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let first = reserve_event(
         layout,
         primary,
@@ -3047,7 +4472,6 @@ fn run_partition_heal_reservation_contention<T: ExternalTestbed>(
         },
     )?;
     history.push(primary_process_name(primary), first.0, first.1);
-
     heal_replica(layout, failover_target.replica_id)?;
     heal_replica(layout, supporting_backup.replica_id)?;
     maybe_crash_replica(layout, primary.replica_id)?;
@@ -3057,7 +4481,6 @@ fn run_partition_heal_reservation_contention<T: ExternalTestbed>(
         failover_target.replica_id,
         supporting_backup.replica_id,
     )?;
-
     let current_primary = primary_replica(layout)?;
     let retry = reserve_event(
         layout,
@@ -3111,7 +4534,10 @@ fn run_partition_heal_ambiguous_retry<T: ExternalTestbed>(
     isolate_replica(layout, failover_target.replica_id)?;
     isolate_replica(layout, supporting_backup.replica_id)?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let first = reserve_event(
         layout,
         primary,
@@ -3163,6 +4589,7 @@ fn run_partition_heal_failover_reads<T: ExternalTestbed>(
     context: &RunExecutionContext,
 ) -> Result<Vec<JepsenHistoryEvent>, String> {
     let resource_id = ResourceId(base_id + 12);
+    let minority_operation_id = OperationId(base_id + 22);
     create_qemu_resource(
         layout,
         primary,
@@ -3171,7 +4598,10 @@ fn run_partition_heal_failover_reads<T: ExternalTestbed>(
         OperationId(base_id + 130),
     )?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
         layout,
         primary,
@@ -3200,7 +4630,7 @@ fn run_partition_heal_failover_reads<T: ExternalTestbed>(
         primary,
         context,
         ReserveEventSpec {
-            operation_id: OperationId(base_id + 22),
+            operation_id: minority_operation_id,
             resource_id,
             holder_id: HolderId(605),
             request_slot: Slot(54),
@@ -3237,6 +4667,16 @@ fn run_partition_heal_failover_reads<T: ExternalTestbed>(
         primary_read.0,
         primary_read.1,
     );
+
+    retry_partition_heal_failover_minority_write(
+        layout,
+        &current_primary,
+        context,
+        &mut history,
+        minority_operation_id,
+        resource_id,
+    )?;
+
     perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
     let old_primary = runtime_replica_by_id(layout, primary.replica_id)?;
     let stale_read = reservation_read_event(
@@ -3253,6 +4693,30 @@ fn run_partition_heal_failover_reads<T: ExternalTestbed>(
         stale_read.1,
     );
     Ok(history.finish())
+}
+
+fn retry_partition_heal_failover_minority_write<T: ExternalTestbed>(
+    layout: &T,
+    primary: &LocalClusterReplicaConfig,
+    context: &RunExecutionContext,
+    history: &mut HistoryBuilder,
+    operation_id: OperationId,
+    resource_id: ResourceId,
+) -> Result<(), String> {
+    let retry = reserve_event(
+        layout,
+        primary,
+        context,
+        ReserveEventSpec {
+            operation_id,
+            resource_id,
+            holder_id: HolderId(605),
+            request_slot: Slot(54),
+            ttl_slots: 2,
+        },
+    )?;
+    history.push(primary_process_name(primary), retry.0, retry.1);
+    Ok(())
 }
 
 fn run_partition_heal_expiration_recovery<T: ExternalTestbed>(
@@ -3272,7 +4736,10 @@ fn run_partition_heal_expiration_recovery<T: ExternalTestbed>(
         OperationId(base_id + 140),
     )?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
         layout,
         primary,
@@ -3293,6 +4760,12 @@ fn run_partition_heal_expiration_recovery<T: ExternalTestbed>(
         reserve_operation,
         reserve_outcome,
     );
+    let expired_reservation = JepsenExpiredReservation {
+        resource_id,
+        holder_id: 606,
+        reservation_id: reserve_commit.reservation_id.get(),
+        released_lsn: None,
+    };
 
     isolate_replica(layout, failover_target.replica_id)?;
     isolate_replica(layout, supporting_backup.replica_id)?;
@@ -3302,12 +4775,7 @@ fn run_partition_heal_expiration_recovery<T: ExternalTestbed>(
         context,
         OperationId(base_id + 24),
         Slot(57),
-        &[JepsenExpiredReservation {
-            resource_id,
-            holder_id: 606,
-            reservation_id: reserve_commit.reservation_id.get(),
-            released_lsn: None,
-        }],
+        &[expired_reservation],
     )?;
     history.push(primary_process_name(primary), failed_tick.0, failed_tick.1);
 
@@ -3328,12 +4796,7 @@ fn run_partition_heal_expiration_recovery<T: ExternalTestbed>(
         context,
         OperationId(base_id + 24),
         Slot(57),
-        &[JepsenExpiredReservation {
-            resource_id,
-            holder_id: 606,
-            reservation_id: reserve_commit.reservation_id.get(),
-            released_lsn: None,
-        }],
+        &[expired_reservation],
     )?;
     let tick_lsn = successful_tick.2.ok_or_else(|| {
         String::from(
@@ -3345,13 +4808,19 @@ fn run_partition_heal_expiration_recovery<T: ExternalTestbed>(
         successful_tick.0,
         successful_tick.1,
     );
-    let resource_read =
-        resource_available_event(layout, &current_primary, resource_id, Some(tick_lsn))?;
-    history.push(
-        primary_process_name(&current_primary),
-        resource_read.0,
-        resource_read.1,
-    );
+    let _settled_tick_lsn = record_resource_available_after_expiration(
+        layout,
+        &current_primary,
+        context,
+        &mut history,
+        ExpirationDrainPlan {
+            resource_id,
+            expired: &[expired_reservation],
+            required_lsn: tick_lsn,
+            operation_id_base: base_id + 25,
+            slot_base: 58,
+        },
+    )?;
     perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
     Ok(history.finish())
 }
@@ -3377,7 +4846,10 @@ fn run_mixed_failover_ambiguous_retry<T: ExternalTestbed>(
     maybe_crash_replica(layout, failover_target.replica_id)?;
     isolate_replica(layout, supporting_backup.replica_id)?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let first = reserve_event(
         layout,
         primary,
@@ -3436,7 +4908,10 @@ fn run_mixed_failover_reads<T: ExternalTestbed>(
         OperationId(base_id + 160),
     )?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
         layout,
         primary,
@@ -3516,7 +4991,10 @@ fn run_mixed_failover_expiration_recovery<T: ExternalTestbed>(
         OperationId(base_id + 170),
     )?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
         layout,
         primary,
@@ -3568,13 +5046,24 @@ fn run_mixed_failover_expiration_recovery<T: ExternalTestbed>(
         )
     })?;
     history.push(primary_process_name(&current_primary), tick.0, tick.1);
-    let resource_read =
-        resource_available_event(layout, &current_primary, resource_id, Some(tick_lsn))?;
-    history.push(
-        primary_process_name(&current_primary),
-        resource_read.0,
-        resource_read.1,
-    );
+    let _settled_tick_lsn = record_resource_available_after_expiration(
+        layout,
+        &current_primary,
+        context,
+        &mut history,
+        ExpirationDrainPlan {
+            resource_id,
+            expired: &[JepsenExpiredReservation {
+                resource_id,
+                holder_id: 703,
+                reservation_id: reserve_commit.reservation_id.get(),
+                released_lsn: None,
+            }],
+            required_lsn: tick_lsn,
+            operation_id_base: base_id + 34,
+            slot_base: 65,
+        },
+    )?;
     perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
     Ok(history.finish())
 }
@@ -3594,7 +5083,10 @@ fn run_reservation_contention<T: ExternalTestbed>(
         OperationId(base_id + 100),
     )?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let first = reserve_event(
         layout,
         primary,
@@ -3641,7 +5133,10 @@ fn run_ambiguous_write_retry<T: ExternalTestbed>(
         OperationId(base_id + 101),
     )?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let first = reserve_event(
         layout,
         primary,
@@ -3688,7 +5183,10 @@ fn run_failover_read_fences<T: ExternalTestbed>(
         OperationId(base_id + 102),
     )?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
         layout,
         primary,
@@ -3751,7 +5249,10 @@ fn run_expiration_and_recovery<T: ExternalTestbed>(
         OperationId(base_id + 103),
     )?;
 
-    let mut history = HistoryBuilder::new(Some(context.tracker.clone()));
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
     let (reserve_operation, reserve_outcome, reserve_commit) = reserve_event(
         layout,
         primary,
@@ -3790,13 +5291,24 @@ fn run_expiration_and_recovery<T: ExternalTestbed>(
         String::from("expiration_and_recovery control run expected one committed expiration tick")
     })?;
     history.push(primary_process_name(primary), tick.0, tick.1);
-
-    let resource_read = resource_available_event(layout, primary, resource_id, Some(tick_lsn))?;
-    history.push(
-        primary_process_name(primary),
-        resource_read.0,
-        resource_read.1,
-    );
+    let settled_tick_lsn = record_resource_available_after_expiration(
+        layout,
+        primary,
+        context,
+        &mut history,
+        ExpirationDrainPlan {
+            resource_id,
+            expired: &[JepsenExpiredReservation {
+                resource_id,
+                holder_id: 505,
+                reservation_id: reserve_commit.reservation_id.get(),
+                released_lsn: None,
+            }],
+            required_lsn: tick_lsn,
+            operation_id_base: base_id + 32,
+            slot_base: 43,
+        },
+    )?;
 
     let reservation_read = reservation_read_event(
         layout,
@@ -3804,7 +5316,7 @@ fn run_expiration_and_recovery<T: ExternalTestbed>(
         context,
         reserve_commit.reservation_id,
         Slot(42),
-        Some(tick_lsn),
+        Some(settled_tick_lsn),
     )?;
     history.push(
         primary_process_name(primary),
@@ -4013,6 +5525,163 @@ fn tick_expirations_event<T: ExternalTestbed>(
     }
 }
 
+const MAX_EXPIRATION_RECOVERY_DRAIN_TICKS: u64 = 16;
+
+#[derive(Clone, Copy)]
+struct ExpirationDrainPlan<'a> {
+    resource_id: ResourceId,
+    expired: &'a [JepsenExpiredReservation],
+    required_lsn: Lsn,
+    operation_id_base: u128,
+    slot_base: u64,
+}
+
+fn classify_resource_read_outcome(
+    resource_id: ResourceId,
+    outcome: RemoteApiOutcome,
+) -> Result<ResourceReadObservation, String> {
+    match outcome {
+        RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::Found(resource))) => {
+            if matches!(resource.state, allocdb_core::ResourceState::Available) {
+                Ok(ResourceReadObservation::Available)
+            } else {
+                Ok(ResourceReadObservation::Held {
+                    state: resource.state,
+                    current_reservation_id: resource.current_reservation_id,
+                    version: resource.version,
+                })
+            }
+        }
+        RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::NotFound)) => {
+            Ok(ResourceReadObservation::NotFound)
+        }
+        RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::FenceNotApplied {
+            ..
+        })) => Ok(ResourceReadObservation::FenceNotApplied),
+        RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::EngineHalted)) => {
+            Ok(ResourceReadObservation::EngineHalted)
+        }
+        RemoteApiOutcome::Api(other) => Err(format!(
+            "resource read for {} returned unexpected response {other:?}",
+            resource_id.get()
+        )),
+        RemoteApiOutcome::Text(text) if response_text_is_not_primary(&text) => {
+            Ok(ResourceReadObservation::NotPrimary)
+        }
+        RemoteApiOutcome::Text(text) => Err(format!(
+            "resource read for {} returned undecodable response {text}",
+            resource_id.get()
+        )),
+    }
+}
+
+fn observe_resource_read<T: ExternalTestbed>(
+    layout: &T,
+    replica: &LocalClusterReplicaConfig,
+    resource_id: ResourceId,
+    required_lsn: Option<Lsn>,
+) -> Result<ResourceReadObservation, String> {
+    let request = ApiRequest::GetResource(ResourceRequest {
+        resource_id,
+        required_lsn,
+    });
+    classify_resource_read_outcome(
+        resource_id,
+        send_replica_api_request(layout, replica, &request)?,
+    )
+}
+
+fn drain_expiration_until_resource_available<T: ExternalTestbed>(
+    layout: &T,
+    replica: &LocalClusterReplicaConfig,
+    context: &RunExecutionContext,
+    history: &mut HistoryBuilder,
+    mut plan: ExpirationDrainPlan<'_>,
+) -> Result<Lsn, String> {
+    for attempt in 0..=MAX_EXPIRATION_RECOVERY_DRAIN_TICKS {
+        match observe_resource_read(layout, replica, plan.resource_id, Some(plan.required_lsn))? {
+            ResourceReadObservation::Available => return Ok(plan.required_lsn),
+            ResourceReadObservation::Held {
+                state,
+                current_reservation_id,
+                version,
+            } => {
+                if attempt == MAX_EXPIRATION_RECOVERY_DRAIN_TICKS {
+                    return Err(format!(
+                        "resource {} remained held after {} follow-up expiration ticks: state={state:?} current_reservation_id={:?} version={} required_lsn={}",
+                        plan.resource_id.get(),
+                        MAX_EXPIRATION_RECOVERY_DRAIN_TICKS,
+                        current_reservation_id,
+                        version,
+                        plan.required_lsn.get(),
+                    ));
+                }
+                let tick = tick_expirations_event(
+                    layout,
+                    replica,
+                    context,
+                    OperationId(plan.operation_id_base + u128::from(attempt)),
+                    Slot(plan.slot_base + attempt),
+                    plan.expired,
+                )?;
+                history.push(primary_process_name(replica), tick.0, tick.1);
+                plan.required_lsn = tick.2.ok_or_else(|| {
+                    format!(
+                        "expiration recovery expected a committed follow-up tick attempt={}",
+                        attempt + 1
+                    )
+                })?;
+            }
+            ResourceReadObservation::NotFound => {
+                return Err(format!(
+                    "resource {} disappeared while waiting for expiration recovery",
+                    plan.resource_id.get()
+                ));
+            }
+            ResourceReadObservation::FenceNotApplied => {
+                return Err(format!(
+                    "resource {} fence was not applied at lsn {} during expiration recovery",
+                    plan.resource_id.get(),
+                    plan.required_lsn.get()
+                ));
+            }
+            ResourceReadObservation::EngineHalted => {
+                return Err(format!(
+                    "resource {} read hit halted engine during expiration recovery",
+                    plan.resource_id.get()
+                ));
+            }
+            ResourceReadObservation::NotPrimary => {
+                return Err(format!(
+                    "resource {} read hit non-primary during expiration recovery",
+                    plan.resource_id.get()
+                ));
+            }
+        }
+    }
+
+    unreachable!("expiration recovery drain loop must return or fail");
+}
+
+fn record_resource_available_after_expiration<T: ExternalTestbed>(
+    layout: &T,
+    replica: &LocalClusterReplicaConfig,
+    context: &RunExecutionContext,
+    history: &mut HistoryBuilder,
+    plan: ExpirationDrainPlan<'_>,
+) -> Result<Lsn, String> {
+    let settled_tick_lsn =
+        drain_expiration_until_resource_available(layout, replica, context, history, plan)?;
+    let resource_read =
+        resource_available_event(layout, replica, plan.resource_id, Some(settled_tick_lsn))?;
+    history.push(
+        primary_process_name(replica),
+        resource_read.0,
+        resource_read.1,
+    );
+    Ok(settled_tick_lsn)
+}
+
 fn resource_available_event<T: ExternalTestbed>(
     layout: &T,
     replica: &LocalClusterReplicaConfig,
@@ -4029,51 +5698,41 @@ fn resource_available_event<T: ExternalTestbed>(
         request_slot: None,
         ttl_slots: None,
     };
-    let request = ApiRequest::GetResource(ResourceRequest {
-        resource_id,
-        required_lsn,
-    });
-    match send_replica_api_request(layout, replica, &request)? {
-        RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::Found(resource)))
-            if matches!(resource.state, allocdb_core::ResourceState::Available) =>
-        {
-            Ok((
-                operation,
-                JepsenEventOutcome::SuccessfulRead(JepsenSuccessfulRead {
-                    target: JepsenReadTarget::Resource,
-                    served_by: replica.replica_id,
-                    served_role: replica.role,
-                    observed_lsn: required_lsn,
-                    state: JepsenReadState::Resource(
-                        allocdb_node::jepsen::JepsenResourceState::Available,
-                    ),
-                }),
-            ))
-        }
-        RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::NotFound)) => Ok((
+    match observe_resource_read(layout, replica, resource_id, required_lsn)? {
+        ResourceReadObservation::Available => Ok((
+            operation,
+            JepsenEventOutcome::SuccessfulRead(JepsenSuccessfulRead {
+                target: JepsenReadTarget::Resource,
+                served_by: replica.replica_id,
+                served_role: replica.role,
+                observed_lsn: required_lsn,
+                state: JepsenReadState::Resource(
+                    allocdb_node::jepsen::JepsenResourceState::Available,
+                ),
+            }),
+        )),
+        ResourceReadObservation::NotFound => Ok((
             operation,
             JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::NotFound),
         )),
-        RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::FenceNotApplied {
-            ..
-        })) => Ok((
+        ResourceReadObservation::FenceNotApplied => Ok((
             operation,
             JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::FenceNotApplied),
         )),
-        RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::EngineHalted)) => Ok((
+        ResourceReadObservation::EngineHalted => Ok((
             operation,
             JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::EngineHalted),
         )),
-        RemoteApiOutcome::Api(other) => Err(format!(
-            "resource read for {} returned unexpected response {other:?}",
-            resource_id.get()
-        )),
-        RemoteApiOutcome::Text(text) if response_text_is_not_primary(&text) => Ok((
+        ResourceReadObservation::NotPrimary => Ok((
             operation,
             JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::NotPrimary),
         )),
-        RemoteApiOutcome::Text(text) => Err(format!(
-            "resource read for {} returned undecodable response {text}",
+        ResourceReadObservation::Held {
+            state,
+            current_reservation_id,
+            version,
+        } => Err(format!(
+            "resource read for {} returned held state={state:?} current_reservation_id={current_reservation_id:?} version={version}",
             resource_id.get()
         )),
     }
@@ -4313,7 +5972,7 @@ fn build_remote_tcp_probe_command(host: &str, port: u16, request_hex: &str) -> S
         request_hex.to_string()
     };
     format!(
-        "python3 - {host} {port} {request_hex} <<'PY'\nimport socket, sys\nhost = sys.argv[1]\nport = int(sys.argv[2])\npayload = b'' if sys.argv[3] == '-' else bytes.fromhex(sys.argv[3])\nwith socket.create_connection((host, port), timeout=2) as stream:\n    if payload:\n        stream.sendall(payload)\n    stream.shutdown(socket.SHUT_WR)\n    chunks = []\n    while True:\n        chunk = stream.recv(4096)\n        if not chunk:\n            break\n        chunks.append(chunk)\n    sys.stdout.buffer.write(b''.join(chunks))\nPY"
+        "python3 - {host} {port} {request_hex} {EXTERNAL_REMOTE_TCP_TIMEOUT_SECS} <<'PY'\nimport socket, sys\nhost = sys.argv[1]\nport = int(sys.argv[2])\npayload = b'' if sys.argv[3] == '-' else bytes.fromhex(sys.argv[3])\ntimeout_secs = float(sys.argv[4])\nwith socket.create_connection((host, port), timeout=timeout_secs) as stream:\n    stream.settimeout(timeout_secs)\n    if payload:\n        stream.sendall(payload)\n    stream.shutdown(socket.SHUT_WR)\n    chunks = []\n    while True:\n        chunk = stream.recv(4096)\n        if not chunk:\n            break\n        chunks.append(chunk)\n    sys.stdout.buffer.write(b''.join(chunks))\nPY"
     )
 }
 
@@ -4363,19 +6022,66 @@ fn validate_probe_read_response(
 }
 
 fn enforce_minimum_fault_window(run_spec: &JepsenRunSpec, elapsed: Duration) -> Result<(), String> {
-    let Some(minimum_secs) = run_spec.minimum_fault_window_secs else {
+    let Some(minimum) = minimum_fault_window_duration(run_spec) else {
         return Ok(());
     };
-    let minimum = Duration::from_secs(minimum_secs);
     if elapsed < minimum {
         return Err(format!(
             "run `{}` finished before minimum fault window (required={}s observed={}s)",
             run_spec.run_id,
-            minimum_secs,
+            minimum.as_secs(),
             elapsed.as_secs()
         ));
     }
     Ok(())
+}
+
+fn minimum_fault_window_duration(run_spec: &JepsenRunSpec) -> Option<Duration> {
+    effective_minimum_fault_window_secs(run_spec).map(Duration::from_secs)
+}
+
+fn effective_minimum_fault_window_secs(run_spec: &JepsenRunSpec) -> Option<u64> {
+    if let Some(override_secs) = debug_fault_window_override_secs() {
+        return Some(override_secs);
+    }
+    run_spec.minimum_fault_window_secs
+}
+
+fn debug_fault_window_override_secs() -> Option<u64> {
+    let raw = std::env::var(FAULT_WINDOW_OVERRIDE_ENV).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<u64>().ok().filter(|secs| *secs > 0)
+}
+
+fn fault_window_complete(minimum_fault_window: Option<Duration>, elapsed: Duration) -> bool {
+    minimum_fault_window.is_none_or(|minimum| elapsed >= minimum)
+}
+
+fn render_fault_window_iteration_event(
+    run_spec: &JepsenRunSpec,
+    iteration: u64,
+    elapsed: Duration,
+    history_events: u64,
+) -> String {
+    match minimum_fault_window_duration(run_spec) {
+        Some(minimum) => {
+            let remaining = minimum.saturating_sub(elapsed);
+            format!(
+                "fault window iteration={} elapsed={}s remaining={}s history_events={history_events}",
+                iteration,
+                elapsed.as_secs(),
+                remaining.as_secs(),
+            )
+        }
+        None => format!(
+            "control iteration={} elapsed={}s history_events={history_events}",
+            iteration,
+            elapsed.as_secs(),
+        ),
+    }
 }
 
 fn decode_external_api_response<T: ExternalTestbed>(
@@ -4617,6 +6323,69 @@ mod tests {
     use allocdb_core::ResourceState;
     use std::fs;
 
+    fn test_replica_config(replica_id: u64, role: ReplicaRole) -> LocalClusterReplicaConfig {
+        let root = PathBuf::from(format!("/tmp/jepsen-test-replica-{replica_id}"));
+        LocalClusterReplicaConfig {
+            replica_id: ReplicaId(replica_id),
+            role,
+            workspace_dir: root.clone(),
+            log_path: root.join("replica.log"),
+            pid_path: root.join("replica.pid"),
+            paths: ReplicaPaths::new(
+                root.join("replica.metadata"),
+                root.join("state.snapshot"),
+                root.join("state.wal"),
+            ),
+            control_addr: format!("127.0.0.1:{}", 17_000 + replica_id)
+                .parse()
+                .unwrap(),
+            client_addr: format!("127.0.0.1:{}", 18_000 + replica_id)
+                .parse()
+                .unwrap(),
+            protocol_addr: format!("127.0.0.1:{}", 19_000 + replica_id)
+                .parse()
+                .unwrap(),
+        }
+    }
+
+    fn test_replica_status(replica: &LocalClusterReplicaConfig) -> ReplicaRuntimeStatus {
+        ReplicaRuntimeStatus {
+            process_id: 42,
+            replica_id: replica.replica_id,
+            state: ReplicaRuntimeState::Active,
+            role: replica.role,
+            current_view: 7,
+            commit_lsn: Some(Lsn(11)),
+            active_snapshot_lsn: Some(Lsn(11)),
+            accepting_writes: Some(replica.role == ReplicaRole::Primary),
+            startup_kind: None,
+            loaded_snapshot_lsn: Some(Lsn(11)),
+            replayed_wal_frame_count: Some(0),
+            replayed_wal_last_lsn: Some(Lsn(11)),
+            fault_reason: None,
+            workspace_dir: replica.workspace_dir.clone(),
+            log_path: replica.log_path.clone(),
+            pid_path: replica.pid_path.clone(),
+            metadata_path: replica.paths.metadata_path.clone(),
+            prepare_log_path: prepare_log_path_for(&replica.paths.metadata_path),
+            snapshot_path: replica.paths.snapshot_path.clone(),
+            wal_path: replica.paths.wal_path.clone(),
+            control_addr: replica.control_addr,
+            client_addr: replica.client_addr,
+            protocol_addr: replica.protocol_addr,
+        }
+    }
+
+    fn test_faulted_replica_status(
+        replica: &LocalClusterReplicaConfig,
+        reason: &str,
+    ) -> ReplicaRuntimeStatus {
+        let mut status = test_replica_status(replica);
+        status.state = ReplicaRuntimeState::Faulted;
+        status.fault_reason = Some(reason.to_string());
+        status
+    }
+
     #[test]
     fn release_gate_plan_includes_faulted_qemu_runs() {
         let runs = release_gate_plan();
@@ -4667,17 +6436,22 @@ mod tests {
     #[test]
     fn remote_tcp_probe_command_places_args_before_heredoc() {
         let command = build_remote_tcp_probe_command("127.0.0.1", 9000, "deadbeef");
-        assert!(command.starts_with("python3 - 127.0.0.1 9000 deadbeef <<'PY'\n"));
+        assert!(command.starts_with(&format!(
+            "python3 - 127.0.0.1 9000 deadbeef {EXTERNAL_REMOTE_TCP_TIMEOUT_SECS} <<'PY'\n"
+        )));
         assert!(
             command.contains("payload = b'' if sys.argv[3] == '-' else bytes.fromhex(sys.argv[3])")
         );
+        assert!(command.contains("timeout_secs = float(sys.argv[4])"));
         assert!(command.ends_with("\nPY"));
     }
 
     #[test]
     fn remote_tcp_probe_command_preserves_empty_payload_argument() {
         let command = build_remote_tcp_probe_command("127.0.0.1", 9000, "");
-        assert!(command.starts_with("python3 - 127.0.0.1 9000 - <<'PY'\n"));
+        assert!(command.starts_with(&format!(
+            "python3 - 127.0.0.1 9000 - {EXTERNAL_REMOTE_TCP_TIMEOUT_SECS} <<'PY'\n"
+        )));
         assert!(command.contains("payload = b'' if sys.argv[3] == '-'"));
     }
 
@@ -4742,6 +6516,54 @@ mod tests {
     }
 
     #[test]
+    fn classify_resource_read_outcome_distinguishes_available_and_held_states() {
+        let available = classify_resource_read_outcome(
+            ResourceId(41),
+            RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::Found(
+                allocdb_node::ResourceView {
+                    resource_id: ResourceId(41),
+                    state: ResourceState::Available,
+                    current_reservation_id: None,
+                    version: 2,
+                },
+            ))),
+        )
+        .unwrap();
+        assert_eq!(available, ResourceReadObservation::Available);
+
+        let held = classify_resource_read_outcome(
+            ResourceId(41),
+            RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::Found(
+                allocdb_node::ResourceView {
+                    resource_id: ResourceId(41),
+                    state: ResourceState::Reserved,
+                    current_reservation_id: Some(ReservationId(7)),
+                    version: 3,
+                },
+            ))),
+        )
+        .unwrap();
+        assert_eq!(
+            held,
+            ResourceReadObservation::Held {
+                state: ResourceState::Reserved,
+                current_reservation_id: Some(ReservationId(7)),
+                version: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_resource_read_outcome_maps_not_primary_text() {
+        let observation = classify_resource_read_outcome(
+            ResourceId(11),
+            RemoteApiOutcome::Text(String::from("not primary: role=backup")),
+        )
+        .unwrap();
+        assert_eq!(observation, ResourceReadObservation::NotPrimary);
+    }
+
+    #[test]
     fn resolve_run_spec_and_minimum_fault_window_are_enforced() {
         let control = resolve_run_spec("reservation_contention-control").unwrap();
         assert!(enforce_minimum_fault_window(&control, Duration::from_secs(0)).is_ok());
@@ -4792,6 +6614,15 @@ mod tests {
     }
 
     #[test]
+    fn temp_staging_dir_uses_unique_paths_for_same_prefix() {
+        let first = temp_staging_dir("replica-1").unwrap();
+        let second = temp_staging_dir("replica-1").unwrap();
+        assert_ne!(first, second);
+        let _ = fs::remove_dir_all(first);
+        let _ = fs::remove_dir_all(second);
+    }
+
+    #[test]
     fn run_status_snapshot_round_trips_through_text_codec() {
         let snapshot = RunStatusSnapshot {
             backend_name: String::from("kubevirt"),
@@ -4815,5 +6646,339 @@ mod tests {
         let encoded = encode_run_status_snapshot(&snapshot);
         let decoded = decode_run_status_snapshot(&encoded).unwrap();
         assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn compact_counter_formats_large_values() {
+        assert_eq!(compact_counter(999), "999");
+        assert_eq!(compact_counter(1_234), "1.2K");
+        assert_eq!(compact_counter(12_500_000), "12.5M");
+        assert_eq!(compact_counter(7_200_000_000), "7.2B");
+    }
+
+    #[test]
+    fn parse_watch_event_line_extracts_timestamp_and_detail() {
+        let event = parse_watch_event_line(
+            "time_millis=1773492183417 detail=collecting logs and artifacts",
+        )
+        .unwrap();
+        assert_eq!(event.time_millis, 1_773_492_183_417);
+        assert_eq!(event.detail, "collecting logs and artifacts");
+    }
+
+    #[test]
+    fn progress_bar_clamps_to_requested_width() {
+        assert_eq!(progress_bar(0, 10, 5), "░░░░░");
+        assert_eq!(progress_bar(5, 10, 5), "██░░░");
+        assert_eq!(progress_bar(15, 10, 5), "█████");
+    }
+
+    #[test]
+    fn fault_window_completion_distinguishes_control_and_long_fault_runs() {
+        assert!(fault_window_complete(None, Duration::from_secs(0)));
+        assert!(!fault_window_complete(
+            Some(Duration::from_secs(1_800)),
+            Duration::from_secs(1_799),
+        ));
+        assert!(fault_window_complete(
+            Some(Duration::from_secs(1_800)),
+            Duration::from_secs(1_800),
+        ));
+    }
+
+    #[test]
+    fn history_builder_preserves_nonzero_sequence_offsets() {
+        let mut history = HistoryBuilder::new(None, 7);
+        history.push(
+            "replica-1",
+            JepsenOperation {
+                kind: JepsenOperationKind::Reserve,
+                operation_id: Some(11),
+                resource_id: Some(ResourceId(21)),
+                reservation_id: None,
+                holder_id: Some(31),
+                required_lsn: None,
+                request_slot: Some(Slot(41)),
+                ttl_slots: Some(5),
+            },
+            JepsenEventOutcome::Ambiguous(JepsenAmbiguousOutcome::Timeout),
+        );
+        history.push(
+            "replica-2",
+            JepsenOperation {
+                kind: JepsenOperationKind::Reserve,
+                operation_id: Some(12),
+                resource_id: Some(ResourceId(22)),
+                reservation_id: None,
+                holder_id: Some(32),
+                required_lsn: None,
+                request_slot: Some(Slot(42)),
+                ttl_slots: Some(5),
+            },
+            JepsenEventOutcome::Ambiguous(JepsenAmbiguousOutcome::Timeout),
+        );
+        let events = history.finish();
+        assert_eq!(events[0].sequence, 8);
+        assert_eq!(events[1].sequence, 9);
+    }
+
+    #[test]
+    fn analyzer_accepts_failover_read_fence_history_once_ambiguity_is_retried() {
+        let reserve_operation_id = 21;
+        let ambiguous_operation_id = 22;
+        let resource_id = ResourceId(101);
+        let reservation_id = ReservationId(55);
+        let committed_lsn = Lsn(44);
+
+        let mut history = HistoryBuilder::new(None, 0);
+        history.push(
+            "primary-1",
+            JepsenOperation {
+                kind: JepsenOperationKind::Reserve,
+                operation_id: Some(reserve_operation_id),
+                resource_id: Some(resource_id),
+                reservation_id: None,
+                holder_id: Some(604),
+                required_lsn: None,
+                request_slot: Some(Slot(53)),
+                ttl_slots: Some(6),
+            },
+            JepsenEventOutcome::CommittedWrite(JepsenCommittedWrite {
+                applied_lsn: committed_lsn,
+                result: JepsenWriteResult::Reserved {
+                    resource_id,
+                    holder_id: 604,
+                    reservation_id: reservation_id.get(),
+                    expires_at_slot: Slot(900),
+                },
+            }),
+        );
+        history.push(
+            "primary-1",
+            JepsenOperation {
+                kind: JepsenOperationKind::Reserve,
+                operation_id: Some(ambiguous_operation_id),
+                resource_id: Some(resource_id),
+                reservation_id: None,
+                holder_id: Some(605),
+                required_lsn: None,
+                request_slot: Some(Slot(54)),
+                ttl_slots: Some(2),
+            },
+            JepsenEventOutcome::Ambiguous(JepsenAmbiguousOutcome::IndefiniteWrite),
+        );
+        history.push(
+            "primary-2",
+            JepsenOperation {
+                kind: JepsenOperationKind::GetReservation,
+                operation_id: None,
+                resource_id: None,
+                reservation_id: Some(reservation_id.get()),
+                holder_id: None,
+                required_lsn: Some(committed_lsn),
+                request_slot: Some(Slot(54)),
+                ttl_slots: None,
+            },
+            JepsenEventOutcome::SuccessfulRead(JepsenSuccessfulRead {
+                target: JepsenReadTarget::Reservation,
+                served_by: ReplicaId(2),
+                served_role: ReplicaRole::Primary,
+                observed_lsn: Some(committed_lsn),
+                state: JepsenReadState::Reservation(JepsenReservationState::Active {
+                    resource_id,
+                    holder_id: 604,
+                    expires_at_slot: Slot(900),
+                    confirmed: false,
+                }),
+            }),
+        );
+        history.push(
+            "primary-2",
+            JepsenOperation {
+                kind: JepsenOperationKind::Reserve,
+                operation_id: Some(ambiguous_operation_id),
+                resource_id: Some(resource_id),
+                reservation_id: None,
+                holder_id: Some(605),
+                required_lsn: None,
+                request_slot: Some(Slot(54)),
+                ttl_slots: Some(2),
+            },
+            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::Conflict),
+        );
+        history.push(
+            "backup-1",
+            JepsenOperation {
+                kind: JepsenOperationKind::GetReservation,
+                operation_id: None,
+                resource_id: None,
+                reservation_id: Some(reservation_id.get()),
+                holder_id: None,
+                required_lsn: Some(committed_lsn),
+                request_slot: Some(Slot(54)),
+                ttl_slots: None,
+            },
+            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::NotPrimary),
+        );
+
+        let report = analyze_history(&history.finish());
+        assert!(report.release_gate_passed());
+        assert!(report.blockers.is_empty());
+    }
+
+    #[test]
+    fn live_runtime_replica_matching_ignores_down_and_faulted_replicas() {
+        let primary = test_replica_config(1, ReplicaRole::Primary);
+        let backup = test_replica_config(2, ReplicaRole::Backup);
+        let down = test_replica_config(3, ReplicaRole::Backup);
+        let faulted = test_replica_config(4, ReplicaRole::Backup);
+        let probes = vec![
+            RuntimeReplicaProbe {
+                replica: down,
+                status: Err(String::from("connection refused")),
+            },
+            RuntimeReplicaProbe {
+                replica: faulted.clone(),
+                status: Ok(test_faulted_replica_status(&faulted, "stale metadata")),
+            },
+            RuntimeReplicaProbe {
+                replica: backup.clone(),
+                status: Ok(test_replica_status(&backup)),
+            },
+            RuntimeReplicaProbe {
+                replica: primary.clone(),
+                status: Ok(test_replica_status(&primary)),
+            },
+        ];
+
+        let discovered =
+            live_runtime_replica_matching(&probes, |replica| replica.role == ReplicaRole::Primary)
+                .unwrap();
+
+        assert_eq!(discovered.replica_id, primary.replica_id);
+    }
+
+    #[test]
+    fn render_runtime_probe_summary_marks_live_faulted_and_down_replicas() {
+        let primary = test_replica_config(1, ReplicaRole::Primary);
+        let backup = test_replica_config(2, ReplicaRole::Backup);
+        let faulted = test_replica_config(3, ReplicaRole::Backup);
+        let probes = vec![
+            RuntimeReplicaProbe {
+                replica: primary.clone(),
+                status: Ok(test_replica_status(&primary)),
+            },
+            RuntimeReplicaProbe {
+                replica: backup.clone(),
+                status: Err(String::from(
+                    "connection refused\ncommand terminated with exit code 1",
+                )),
+            },
+            RuntimeReplicaProbe {
+                replica: faulted.clone(),
+                status: Ok(test_faulted_replica_status(
+                    &faulted,
+                    "applied lsn behind commit lsn",
+                )),
+            },
+        ];
+
+        let summary = render_runtime_probe_summary(&probes);
+
+        assert!(summary.contains("1:primary@view7"));
+        assert!(summary.contains("2:down(connection refused)"));
+        assert!(summary.contains("3:faulted(applied lsn behind commit lsn)"));
+    }
+
+    #[test]
+    fn summarize_runtime_probes_counts_only_active_roles() {
+        let primary = test_replica_config(1, ReplicaRole::Primary);
+        let backup = test_replica_config(2, ReplicaRole::Backup);
+        let faulted = test_replica_config(3, ReplicaRole::Backup);
+        let probes = vec![
+            RuntimeReplicaProbe {
+                replica: primary.clone(),
+                status: Ok(test_replica_status(&primary)),
+            },
+            RuntimeReplicaProbe {
+                replica: backup.clone(),
+                status: Ok(test_replica_status(&backup)),
+            },
+            RuntimeReplicaProbe {
+                replica: faulted.clone(),
+                status: Ok(test_faulted_replica_status(&faulted, "stale metadata")),
+            },
+        ];
+
+        assert_eq!(
+            summarize_runtime_probes(&probes),
+            RuntimeReplicaTopology {
+                active: 2,
+                primaries: 1,
+                backups: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_watch_kubevirt_lane_spec_extracts_name_workspace_and_output_root() {
+        let lane = parse_watch_kubevirt_lane_spec("lane-a,/tmp/work-a,/tmp/out-a").unwrap();
+        assert_eq!(
+            lane,
+            KubevirtWatchLaneSpec {
+                name: String::from("lane-a"),
+                workspace_root: PathBuf::from("/tmp/work-a"),
+                output_root: PathBuf::from("/tmp/out-a"),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_watch_kubevirt_lane_spec_rejects_missing_fields() {
+        let error = parse_watch_kubevirt_lane_spec("lane-a,/tmp/work-a").unwrap_err();
+        assert!(error.contains("expected <name,workspace,output-root>"));
+    }
+
+    #[test]
+    fn compact_fault_window_progress_formats_control_and_faulted_runs() {
+        let mut snapshot = RunStatusSnapshot {
+            backend_name: String::from("kubevirt"),
+            run_id: String::from("reservation_contention-control"),
+            state: RunTrackerState::Running,
+            phase: RunTrackerPhase::Executing,
+            detail: String::from("executing"),
+            started_at_millis: 0,
+            updated_at_millis: 0,
+            elapsed_secs: 45,
+            minimum_fault_window_secs: None,
+            history_events: 3,
+            history_file: None,
+            artifact_bundle: None,
+            logs_archive: None,
+            release_gate_passed: None,
+            blockers: None,
+            last_error: None,
+        };
+        assert_eq!(compact_fault_window_progress(&snapshot), "ctrl");
+        snapshot.minimum_fault_window_secs = Some(1_800);
+        snapshot.elapsed_secs = 900;
+        assert!(compact_fault_window_progress(&snapshot).contains("50%"));
+    }
+
+    #[test]
+    fn disable_local_tar_copyfile_metadata_sets_expected_env() {
+        let mut command = Command::new("sh");
+        disable_local_tar_copyfile_metadata(&mut command);
+        let output = command
+            .arg("-lc")
+            .arg("printf %s \"${COPYFILE_DISABLE:-}\"")
+            .output()
+            .unwrap();
+        let value = String::from_utf8(output.stdout).unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(value, "1");
+        } else {
+            assert!(value.is_empty());
+        }
     }
 }

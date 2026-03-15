@@ -1061,21 +1061,50 @@ impl ReplicaNode {
     ) -> Result<(), ReplicaProtocolError> {
         self.ensure_active()?;
         if !matches!(role, ReplicaRole::Primary | ReplicaRole::Backup) {
+            warn!(
+                "rejecting unsupported normal role transition: replica_id={} shard_id={} current_role={} requested_role={} current_view={} commit_lsn={}",
+                self.metadata.identity.replica_id.get(),
+                self.metadata.identity.shard_id,
+                format_replica_role(self.metadata.role),
+                format_replica_role(role),
+                self.metadata.current_view,
+                format_optional_lsn(self.metadata.commit_lsn),
+            );
             return Err(ReplicaProtocolError::UnsupportedNormalRole(role));
         }
         let highest_known_view = self.highest_known_view();
         if current_view < highest_known_view {
+            warn!(
+                "rejecting normal-role view regression: replica_id={} shard_id={} current_role={} requested_role={} highest_known_view={} requested_view={} durable_vote={} last_normal_view={} commit_lsn={}",
+                self.metadata.identity.replica_id.get(),
+                self.metadata.identity.shard_id,
+                format_replica_role(self.metadata.role),
+                format_replica_role(role),
+                highest_known_view,
+                current_view,
+                format_optional_vote(self.metadata.durable_vote),
+                format_optional_view(self.metadata.last_normal_view),
+                format_optional_lsn(self.metadata.commit_lsn),
+            );
             return Err(ReplicaProtocolError::ViewRegression {
                 current_view: highest_known_view,
                 requested_view: current_view,
             });
         }
 
+        let previous_metadata = self.metadata;
         self.metadata.current_view = current_view;
         self.metadata.role = role;
         self.metadata.last_normal_view = Some(current_view);
         self.metadata.durable_vote = None;
         self.persist_metadata()?;
+        log_metadata_transition(
+            "configure_normal_role",
+            &previous_metadata,
+            &self.metadata,
+            self.prepared_entries.len(),
+            self.highest_prepared_lsn(),
+        );
         Ok(())
     }
 
@@ -1094,17 +1123,38 @@ impl ReplicaNode {
         self.ensure_active()?;
         let highest_known_view = self.highest_known_view();
         if voted_view < highest_known_view {
+            warn!(
+                "rejecting durable vote regression: replica_id={} shard_id={} role={} highest_known_view={} voted_view={} voted_for={} current_view={} durable_vote={} last_normal_view={} commit_lsn={}",
+                self.metadata.identity.replica_id.get(),
+                self.metadata.identity.shard_id,
+                format_replica_role(self.metadata.role),
+                highest_known_view,
+                voted_view,
+                voted_for.get(),
+                self.metadata.current_view,
+                format_optional_vote(self.metadata.durable_vote),
+                format_optional_view(self.metadata.last_normal_view),
+                format_optional_lsn(self.metadata.commit_lsn),
+            );
             return Err(ReplicaProtocolError::ViewRegression {
                 current_view: highest_known_view,
                 requested_view: voted_view,
             });
         }
 
+        let previous_metadata = self.metadata;
         self.metadata.durable_vote = Some(DurableVote {
             view: voted_view,
             voted_for,
         });
         self.persist_metadata()?;
+        log_metadata_transition(
+            "record_durable_vote",
+            &previous_metadata,
+            &self.metadata,
+            self.prepared_entries.len(),
+            self.highest_prepared_lsn(),
+        );
         Ok(())
     }
 
@@ -1117,11 +1167,28 @@ impl ReplicaNode {
     pub fn enter_view_uncertain(&mut self) -> Result<(), ReplicaProtocolError> {
         self.ensure_active()?;
         if self.metadata.role == ReplicaRole::ViewUncertain {
+            info!(
+                "replica already view-uncertain: replica_id={} shard_id={} current_view={} commit_lsn={} durable_vote={} last_normal_view={}",
+                self.metadata.identity.replica_id.get(),
+                self.metadata.identity.shard_id,
+                self.metadata.current_view,
+                format_optional_lsn(self.metadata.commit_lsn),
+                format_optional_vote(self.metadata.durable_vote),
+                format_optional_view(self.metadata.last_normal_view),
+            );
             return Ok(());
         }
 
+        let previous_metadata = self.metadata;
         self.metadata.role = ReplicaRole::ViewUncertain;
         self.persist_metadata()?;
+        log_metadata_transition(
+            "enter_view_uncertain",
+            &previous_metadata,
+            &self.metadata,
+            self.prepared_entries.len(),
+            self.highest_prepared_lsn(),
+        );
         Ok(())
     }
 
@@ -1133,6 +1200,16 @@ impl ReplicaNode {
     /// cannot be updated durably.
     pub fn discard_uncommitted_suffix(&mut self) -> Result<(), ReplicaProtocolError> {
         self.ensure_active()?;
+        info!(
+            "discarding uncommitted suffix: replica_id={} shard_id={} role={} current_view={} commit_lsn={} prepared_count={} highest_prepared_lsn={}",
+            self.metadata.identity.replica_id.get(),
+            self.metadata.identity.shard_id,
+            format_replica_role(self.metadata.role),
+            self.metadata.current_view,
+            format_optional_lsn(self.metadata.commit_lsn),
+            self.prepared_entries.len(),
+            format_optional_lsn(self.highest_prepared_lsn()),
+        );
         self.prepared_entries.clear();
         self.persist_prepared_entries()
     }
@@ -1279,11 +1356,33 @@ impl ReplicaNode {
             self.metadata.role,
             ReplicaRole::Backup | ReplicaRole::ViewUncertain
         ) {
+            warn!(
+                "rejecting committed-prefix reconstruction outside recovery roles: replica_id={} shard_id={} role={} current_view={} commit_lsn={} target_commit_lsn={} durable_vote={} last_normal_view={}",
+                self.metadata.identity.replica_id.get(),
+                self.metadata.identity.shard_id,
+                format_replica_role(self.metadata.role),
+                self.metadata.current_view,
+                format_optional_lsn(self.metadata.commit_lsn),
+                commit_lsn.get(),
+                format_optional_vote(self.metadata.durable_vote),
+                format_optional_view(self.metadata.last_normal_view),
+            );
             return Err(ReplicaProtocolError::RoleSetMismatch {
                 expected: "backup or view_uncertain",
                 found: self.metadata.role,
             });
         }
+        info!(
+            "reconstructing committed prefix: replica_id={} shard_id={} role={} current_view={} from_commit_lsn={} target_commit_lsn={} prepared_count={} highest_prepared_lsn={}",
+            self.metadata.identity.replica_id.get(),
+            self.metadata.identity.shard_id,
+            format_replica_role(self.metadata.role),
+            self.metadata.current_view,
+            format_optional_lsn(self.metadata.commit_lsn),
+            commit_lsn.get(),
+            self.prepared_entries.len(),
+            format_optional_lsn(self.highest_prepared_lsn()),
+        );
         self.commit_prepared_through_impl(commit_lsn)
     }
 
@@ -1396,6 +1495,16 @@ impl ReplicaNode {
             .and_then(|lsn| lsn.get().checked_add(1))
             .unwrap_or(1);
         if commit_lsn.get() < first_pending {
+            info!(
+                "commit-through request already satisfied: replica_id={} shard_id={} role={} current_view={} current_commit_lsn={} requested_commit_lsn={} prepared_count={}",
+                self.metadata.identity.replica_id.get(),
+                self.metadata.identity.shard_id,
+                format_replica_role(self.metadata.role),
+                self.metadata.current_view,
+                format_optional_lsn(self.metadata.commit_lsn),
+                commit_lsn.get(),
+                self.prepared_entries.len(),
+            );
             return Ok(None);
         }
 
@@ -1408,9 +1517,31 @@ impl ReplicaNode {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        info!(
+            "committing prepared prefix: replica_id={} shard_id={} role={} current_view={} first_pending_lsn={} requested_commit_lsn={} entry_count={} highest_prepared_lsn={}",
+            self.metadata.identity.replica_id.get(),
+            self.metadata.identity.shard_id,
+            format_replica_role(self.metadata.role),
+            self.metadata.current_view,
+            first_pending,
+            commit_lsn.get(),
+            entries.len(),
+            format_optional_lsn(self.highest_prepared_lsn()),
+        );
+
         let mut last_result = None;
         for entry in &entries {
             if entry.view != self.metadata.current_view {
+                warn!(
+                    "rejecting commit-through because entry view mismatched current view: replica_id={} shard_id={} role={} current_view={} entry_view={} lsn={} commit_lsn={}",
+                    self.metadata.identity.replica_id.get(),
+                    self.metadata.identity.shard_id,
+                    format_replica_role(self.metadata.role),
+                    self.metadata.current_view,
+                    entry.view,
+                    entry.lsn.get(),
+                    format_optional_lsn(self.metadata.commit_lsn),
+                );
                 return Err(ReplicaProtocolError::ViewMismatch {
                     expected: self.metadata.current_view,
                     found: entry.view,
@@ -1444,6 +1575,17 @@ impl ReplicaNode {
 
         self.persist_prepared_entries()?;
         self.persist_metadata()?;
+        info!(
+            "committed prepared prefix: replica_id={} shard_id={} role={} current_view={} new_commit_lsn={} active_snapshot_lsn={} remaining_prepared_count={} highest_prepared_lsn={}",
+            self.metadata.identity.replica_id.get(),
+            self.metadata.identity.shard_id,
+            format_replica_role(self.metadata.role),
+            self.metadata.current_view,
+            format_optional_lsn(self.metadata.commit_lsn),
+            format_optional_lsn(self.metadata.active_snapshot_lsn),
+            self.prepared_entries.len(),
+            format_optional_lsn(self.highest_prepared_lsn()),
+        );
         Ok(last_result)
     }
 
@@ -1490,6 +1632,60 @@ impl ReplicaNode {
             engine: None,
         }
     }
+}
+
+fn log_metadata_transition(
+    action: &str,
+    previous: &ReplicaMetadata,
+    current: &ReplicaMetadata,
+    prepared_count: usize,
+    highest_prepared_lsn: Option<Lsn>,
+) {
+    info!(
+        "replica metadata transition: action={} replica_id={} shard_id={} role={}=>{} current_view={}=>{} commit_lsn={}=>{} active_snapshot_lsn={}=>{} last_normal_view={}=>{} durable_vote={}=>{} prepared_count={} highest_prepared_lsn={}",
+        action,
+        current.identity.replica_id.get(),
+        current.identity.shard_id,
+        format_replica_role(previous.role),
+        format_replica_role(current.role),
+        previous.current_view,
+        current.current_view,
+        format_optional_lsn(previous.commit_lsn),
+        format_optional_lsn(current.commit_lsn),
+        format_optional_lsn(previous.active_snapshot_lsn),
+        format_optional_lsn(current.active_snapshot_lsn),
+        format_optional_view(previous.last_normal_view),
+        format_optional_view(current.last_normal_view),
+        format_optional_vote(previous.durable_vote),
+        format_optional_vote(current.durable_vote),
+        prepared_count,
+        format_optional_lsn(highest_prepared_lsn),
+    );
+}
+
+fn format_replica_role(role: ReplicaRole) -> &'static str {
+    match role {
+        ReplicaRole::Primary => "primary",
+        ReplicaRole::Backup => "backup",
+        ReplicaRole::ViewUncertain => "view_uncertain",
+        ReplicaRole::Recovering => "recovering",
+        ReplicaRole::Faulted => "faulted",
+    }
+}
+
+fn format_optional_lsn(lsn: Option<Lsn>) -> String {
+    lsn.map_or_else(|| String::from("none"), |lsn| lsn.get().to_string())
+}
+
+fn format_optional_view(view: Option<u64>) -> String {
+    view.map_or_else(|| String::from("none"), |view| view.to_string())
+}
+
+fn format_optional_vote(vote: Option<DurableVote>) -> String {
+    vote.map_or_else(
+        || String::from("none"),
+        |vote| format!("view:{} voted_for:{}", vote.view, vote.voted_for.get()),
+    )
 }
 
 enum LoadedMetadata {

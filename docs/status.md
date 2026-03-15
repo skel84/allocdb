@@ -1,7 +1,6 @@
 # AllocDB Status
 
 ## Current State
-
 - Phase: replicated implementation
 - Planning IDs: tasks use `M#-T#`; spikes use `M#-S#`
 - Current milestone status:
@@ -138,6 +137,7 @@
   - one persisted `cluster-faults.txt` file that marks whole-replica client/protocol isolation without affecting control reachability, plus one append-only `cluster-timeline.log` for later checker/debug reuse
   - reserved `client` and `protocol` listeners now fail with explicit isolation errors when the local fault harness marks that replica isolated
   - real primary-side client/protocol transport for external `submit`, `get_resource`, `get_reservation`, `get_metrics`, and replicated `tick_expirations`, with majority append before publish and backup reads still failing closed as `not primary`
+  - structured daemon-side logging for successful prepare quorum formation, commit-broadcast acknowledgements, accepted protocol prepare/commit traffic, expiration batch planning, and applied expiration commands
 - Durability primitives:
   - WAL frame codec and recovery scan
   - file-backed WAL append, sync, recovery, and torn-tail truncation
@@ -203,16 +203,18 @@
   - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
 ## Current Focus
-- `M8-T04` now has one real external Jepsen executor for the documented release-gate matrix across both QEMU and KubeVirt: the live runtime surface covers replicated `submit`, strict reads, and `tick_expirations`, while `allocdb-jepsen` can now capture one KubeVirt layout, verify the KubeVirt surface, execute real KubeVirt control runs with archived histories and host-side failover/rejoin cutovers, and expose one terminal watcher for live phase/replica progress during the run
+- `M8-T04` now has one real external Jepsen executor for the documented release-gate matrix across both QEMU and KubeVirt: the live runtime surface covers replicated `submit`, strict reads, and `tick_expirations`, while `allocdb-jepsen` can now capture one KubeVirt layout, verify the KubeVirt surface, execute real KubeVirt control runs with archived histories and host-side failover/rejoin cutovers, and expose both one single-lane watcher and one multi-lane KubeVirt fleet watcher for live phase/replica progress during the run
 - Jepsen run isolation is now stronger on persistent clusters: each `allocdb-jepsen` invocation uses one distinct client/slot namespace instead of reusing the same request identity across separate runs
-- the next honest step is still operational, not architectural: start `watch-kubevirt` in one terminal, run the full KubeVirt matrix in another, capture artifacts for every run, and then decide whether the roadmap should open a post-M8 hardening milestone or declare the current queue complete
-## How To Check Progress
-- implementation status: [work-breakdown.md](./work-breakdown.md)
-- milestone sequencing: [roadmap.md](./roadmap.md)
-- reviewable history: `git log --oneline`
-## Update Rule
-Update this file whenever a task or milestone materially changes:
-- milestone completion state
-- implementation coverage
-- recommended next step
-- required validation commands
+- multi-lane external Jepsen staging is now lane-scoped on the host, and faulted iterations repair the cluster back to one primary plus two backups before the next slice starts, so KubeVirt partition-heal and mixed-failover waves do not inherit temp-path collisions or a partially recovered lane
+- server-side debugging is stronger now: the replica daemon initializes structured `log` output on KubeVirt guests, replica role/view transitions are logged inside `ReplicaNode`, and the authoritative trace now lives in guest-local `/var/log/allocdb/replica-{1,2,3}.log`
+- the expiration-and-recovery Jepsen scenarios now drain bounded expiration backlog explicitly on
+  long-lived lanes by issuing follow-up ticks until the target resource becomes `Available`, so
+  one committed tick batch does not get misclassified as a target expiration when earlier due
+  reservations still remain ahead of it
+- the rebuilt KubeVirt release-gate profile is now proven end to end: `3` spread lanes on
+  `longhorn-strict-local-wffc` completed the full documented `15`-run Jepsen matrix, and every
+  control, crash-restart, partition-heal, and mixed-failover run finished with
+  `release_gate_passed=true` and `blockers=0`
+- the immediate next honest step is no longer “run the matrix” but “decide whether to open a
+  post-M8 hardening milestone or promote the Hetzner follow-on for repeatable non-homelab gate
+  execution”
