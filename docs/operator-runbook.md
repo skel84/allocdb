@@ -121,9 +121,19 @@ Command surface:
 - `cargo run -p allocdb-node --bin allocdb-qemu-testbed -- control --workspace <path> -- <status|isolate|heal|crash|restart|reboot|export-replica|import-replica|collect-logs> ...`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- analyze --history-file <history.txt>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- capture-kubevirt-layout --workspace <path> --kubeconfig <path> --namespace <name> --ssh-private-key <path>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-qemu-surface --workspace <path>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- verify-kubevirt-surface --workspace <path>`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- run-qemu --workspace <path> --run-id <run-id> --output-root <artifacts>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- run-kubevirt --workspace <path> --run-id <run-id> --output-root <artifacts>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- watch-kubevirt --workspace <path> --output-root <artifacts> [--run-id <run-id>] [--follow]`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- watch-kubevirt-fleet --lane <name,workspace,output-root> [--lane <name,workspace,output-root> ...] [--follow]`
 - `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-qemu --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
+- `cargo run -p allocdb-node --bin allocdb-jepsen -- archive-kubevirt --workspace <path> --run-id <run-id> --history-file <history.txt> --output-root <artifacts>`
+
+For local diagnosis, operators can shorten one faulted run with
+`ALLOCDB_JEPSEN_FAULT_WINDOW_SECS_OVERRIDE=<secs>`. Use that only for debugging or quick repros;
+full release-gate evidence still requires the documented `1800s` minimum fault window.
 
 What `prepare` does:
 
@@ -185,6 +195,11 @@ Current control hooks:
   host-side tools can stage failover and rejoin rewrites without inventing a second recovery path
 - `collect-logs` gathers replica `journalctl`, `cluster-faults.txt`, `cluster-timeline.log`, and
   control-status snapshots under the control guest
+- the replica daemons also write structured startup, role/view transition, prepare/commit, and
+  fail-closed rejection logs to `/var/log/allocdb/replica-{1,2,3}.log`; those files now also
+  record successful prepare quorum formation, commit-broadcast acknowledgements, accepted protocol
+  prepare/commit traffic, and expiration batch planning/application. Inspect them when debugging
+  one failover or rejoin issue because the current archive path does not yet bundle them
 
 Current limits:
 
@@ -192,10 +207,39 @@ Current limits:
   downloadable on the host
 - `verify-qemu-surface` proves one metrics probe on every replica, one protocol reachability probe
   on every replica, and one primary submit/read round trip
+- `capture-kubevirt-layout` depends on one reachable kubeconfig plus one staged SSH key from the
+  KubeVirt bootstrap path, and `verify-kubevirt-surface` and `run-kubevirt` auto-create one
+  temporary helper pod when needed to bridge host orchestration into the KubeVirt guest network
 - `run-qemu` now executes the documented Jepsen control and nemesis runs, but it still drives one
-  scripted gate scenario at a time rather than one long-running soak with independent clients
-- failover and rejoin now use host-side staged workspace rewrites, so the operator still needs one
-  prepared QEMU testbed and enough local disk for fetched/pushed replica archives during those runs
+  scripted fault-window loop rather than one independent-client Jepsen cluster
+- `run-kubevirt` currently uses the same scripted gate model and the same control-node
+  `allocdb-qemu-control` surface as the QEMU path; it does not yet add one separate KubeVirt
+  packet-level nemesis layer
+- `run-kubevirt` now writes one `<run-id>-status.txt` file, one `<run-id>-events.log` file, and
+  one `allocdb-jepsen-latest-status.txt` pointer file under the chosen artifact root
+- faulted `run-qemu` and `run-kubevirt` runs now repeat whole scenario iterations until the
+  configured minimum fault window is satisfied, while keeping one fresh request namespace per
+  iteration and one monotonic Jepsen history sequence across the whole run
+- those faulted iterations now also heal isolation, restart stopped replicas, and wait for one
+  primary plus two backups before the next scenario slice starts
+- during KubeVirt debugging, the authoritative per-replica transition trace is the guest-local
+  `/var/log/allocdb/replica-{1,2,3}.log` file rather than the archived `journal.log`
+- `watch-kubevirt --workspace <path> --output-root <artifacts> [--run-id <run-id>] [--follow]`
+  can stay open in another terminal and show the current phase, elapsed time, recent Jepsen
+  events, and live replica health/metrics while the run is active; `--follow` keeps the dashboard
+  open after completion so operators can watch repeated runs without restarting the command
+- `watch-kubevirt-fleet --lane <name,workspace,output-root> ... [--follow]` can aggregate multiple
+  KubeVirt Jepsen lanes into one dashboard, so operators can watch one `3`-lane release-gate batch
+  without juggling one terminal per cluster
+- the stable homelab KubeVirt profile now uses `longhorn-strict-local-wffc` together with
+  replica-only anti-affinity, so each `3`-replica lane spreads one replica per host while the
+  control VM can colocate where capacity allows
+- failover and rejoin now use host-side staged workspace rewrites, but those temp workspaces are
+  lane-scoped on the host, so parallel KubeVirt lanes do not collide on shared temp paths during
+  fetched/pushed replica archive handling
+- when debugging one failing faulted scenario, rebootstrap the affected lane first and then run
+  the short repro with `ALLOCDB_JEPSEN_FAULT_WINDOW_SECS_OVERRIDE`; do not treat that shortened run
+  as release-gate evidence
 
 ## Single-Node Engine
 

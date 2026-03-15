@@ -19,6 +19,7 @@
 - [Architecture](./architecture.md)
 - [Fault Model](./fault-model.md)
 - [Operator Runbook](./operator-runbook.md)
+- [KubeVirt Jepsen Report](./kubevirt-jepsen-report.md)
 - [Replication Notes](./replication.md)
 - [Benchmark Harness](./benchmark-harness.md)
 - [Roadmap](./roadmap.md)

@@ -2,6 +2,7 @@ pub mod api;
 mod bounded_queue;
 pub mod engine;
 pub mod jepsen;
+pub mod kubevirt_testbed;
 pub mod local_cluster;
 pub mod qemu_testbed;
 pub mod replica;

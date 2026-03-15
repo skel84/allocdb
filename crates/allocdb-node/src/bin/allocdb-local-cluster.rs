@@ -25,6 +25,7 @@ use allocdb_node::{
     SubmissionFailure, SubmissionFailureCode, SubmitResponse, TickExpirationsApplied,
     TickExpirationsResponse, decode_request, encode_response,
 };
+use log::{info, warn};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -104,6 +105,7 @@ enum ReplicaProtocolResponse {
 }
 
 fn main() -> ExitCode {
+    init_logging();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -111,6 +113,12 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn init_logging() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .try_init();
 }
 
 fn run() -> Result<(), String> {
@@ -585,6 +593,11 @@ fn run_replica_daemon(layout_file: &Path, replica_id: ReplicaId) -> Result<(), S
         replica.paths.clone(),
     )
     .map_err(|error| format!("failed to recover replica {}: {error:?}", replica_id.get()))?;
+    eprintln!(
+        "replica={} event=startup_recovered {}",
+        replica.replica_id.get(),
+        format_replica_debug_summary(&node)
+    );
     if node.status() == ReplicaNodeStatus::Active
         && matches!(node.metadata().role, ReplicaRole::Recovering)
     {
@@ -595,6 +608,13 @@ fn run_replica_daemon(layout_file: &Path, replica_id: ReplicaId) -> Result<(), S
                     replica_id.get()
                 )
             })?;
+        eprintln!(
+            "replica={} event=startup_configured_normal_role target_role={} target_view={} {}",
+            replica.replica_id.get(),
+            encode_role(replica.role),
+            layout.current_view,
+            format_replica_debug_summary(&node)
+        );
     }
 
     write_pid_file(&replica.pid_path, process::id())?;
@@ -604,9 +624,10 @@ fn run_replica_daemon(layout_file: &Path, replica_id: ReplicaId) -> Result<(), S
     let client_listener = bind_listener(replica.client_addr)?;
     let protocol_listener = bind_listener(replica.protocol_addr)?;
     eprintln!(
-        "replica={} startup=ready status={}",
+        "replica={} startup=ready status={} {}",
         replica.replica_id.get(),
-        describe_node_status(node.status())
+        describe_node_status(node.status()),
+        format_replica_debug_summary(&node)
     );
 
     let loop_result = replica_event_loop(
@@ -770,38 +791,10 @@ fn handle_protocol_stream(
             request_slot,
             payload,
         }) => {
-            let entry = allocdb_node::ReplicaPreparedEntry {
-                kind,
-                view,
-                lsn: Lsn(lsn),
-                request_slot,
-                payload,
-            };
-            node.append_prepared_entry(entry)
-                .map_err(|error| protocol_error_message(&error))?;
-            Ok(ReplicaProtocolResponse::PrepareAck {
-                view,
-                lsn,
-                replica_id: replica.replica_id,
-            })
+            handle_prepare_protocol_request(replica, node, kind, view, lsn, request_slot, payload)
         }
         Ok(ReplicaProtocolRequest::Commit { view, commit_lsn }) => {
-            if node.metadata().current_view != view {
-                return write_response(
-                    stream,
-                    &encode_control_error(&format!(
-                        "protocol view mismatch: expected={} found={view}",
-                        node.metadata().current_view
-                    )),
-                );
-            }
-            node.commit_prepared_through(Lsn(commit_lsn))
-                .map_err(|error| protocol_error_message(&error))?;
-            Ok(ReplicaProtocolResponse::CommitAck {
-                view,
-                commit_lsn,
-                replica_id: replica.replica_id,
-            })
+            handle_commit_protocol_request(replica, node, view, commit_lsn)
         }
         Err(error) => Err(error),
     };
@@ -815,6 +808,96 @@ fn handle_protocol_stream(
     }
 }
 
+fn handle_prepare_protocol_request(
+    replica: &LocalClusterReplicaConfig,
+    node: &mut ReplicaNode,
+    kind: ReplicaPreparedKind,
+    view: u64,
+    lsn: u64,
+    request_slot: Slot,
+    payload: Vec<u8>,
+) -> Result<ReplicaProtocolResponse, String> {
+    let entry = allocdb_node::ReplicaPreparedEntry {
+        kind,
+        view,
+        lsn: Lsn(lsn),
+        request_slot,
+        payload,
+    };
+    if let Err(error) = node.append_prepared_entry(entry) {
+        eprintln!(
+            "replica={} event=protocol_prepare_rejected role={} local_view={} request_view={} request_lsn={} error={error:?}",
+            replica.replica_id.get(),
+            encode_role(node.metadata().role),
+            node.metadata().current_view,
+            view,
+            lsn
+        );
+        return Err(protocol_error_message(&error));
+    }
+    info!(
+        "replica={} event=protocol_prepare_accepted role={} local_view={} request_view={} request_lsn={} request_slot={} kind={}",
+        replica.replica_id.get(),
+        encode_role(node.metadata().role),
+        node.metadata().current_view,
+        view,
+        lsn,
+        request_slot.get(),
+        encode_protocol_prepared_kind(kind),
+    );
+    Ok(ReplicaProtocolResponse::PrepareAck {
+        view,
+        lsn,
+        replica_id: replica.replica_id,
+    })
+}
+
+fn handle_commit_protocol_request(
+    replica: &LocalClusterReplicaConfig,
+    node: &mut ReplicaNode,
+    view: u64,
+    commit_lsn: u64,
+) -> Result<ReplicaProtocolResponse, String> {
+    if node.metadata().current_view != view {
+        eprintln!(
+            "replica={} event=protocol_commit_view_mismatch role={} local_view={} commit_view={} commit_lsn={}",
+            replica.replica_id.get(),
+            encode_role(node.metadata().role),
+            node.metadata().current_view,
+            view,
+            commit_lsn
+        );
+        return Err(format!(
+            "protocol view mismatch: expected={} found={view}",
+            node.metadata().current_view
+        ));
+    }
+    if let Err(error) = node.commit_prepared_through(Lsn(commit_lsn)) {
+        eprintln!(
+            "replica={} event=protocol_commit_rejected role={} local_view={} commit_lsn={} error={error:?}",
+            replica.replica_id.get(),
+            encode_role(node.metadata().role),
+            node.metadata().current_view,
+            commit_lsn
+        );
+        return Err(protocol_error_message(&error));
+    }
+    info!(
+        "replica={} event=protocol_commit_applied role={} local_view={} commit_view={} commit_lsn={} commit_lsn_after={}",
+        replica.replica_id.get(),
+        encode_role(node.metadata().role),
+        node.metadata().current_view,
+        view,
+        commit_lsn,
+        display_optional_lsn(node.metadata().commit_lsn),
+    );
+    Ok(ReplicaProtocolResponse::CommitAck {
+        view,
+        commit_lsn,
+        replica_id: replica.replica_id,
+    })
+}
+
 fn handle_replicated_submit(
     node: &mut ReplicaNode,
     layout: &LocalClusterLayout,
@@ -822,9 +905,22 @@ fn handle_replicated_submit(
     request: &allocdb_node::SubmitRequest,
 ) -> Result<Vec<u8>, String> {
     if node.status() != ReplicaNodeStatus::Active {
+        eprintln!(
+            "replica={} event=client_submit_rejected status={} {}",
+            replica.replica_id.get(),
+            describe_node_status(node.status()),
+            format_replica_debug_summary(node)
+        );
         return Err(String::from("replica faulted"));
     }
     if node.metadata().role != ReplicaRole::Primary {
+        eprintln!(
+            "replica={} event=client_submit_not_primary role={} view={} commit_lsn={}",
+            replica.replica_id.get(),
+            encode_role(node.metadata().role),
+            node.metadata().current_view,
+            display_optional_lsn(node.metadata().commit_lsn)
+        );
         return Err(format!(
             "not primary: role={}",
             encode_role(node.metadata().role)
@@ -841,17 +937,36 @@ fn handle_replicated_submit(
         PreparedSubmit::Entry(entry) => entry,
         PreparedSubmit::Response(response) => return Ok(response),
     };
-    let acked_replicas = collect_prepare_quorum(layout, replica, &entry);
-    if acked_replicas < majority_quorum(layout) {
-        log_quorum_unavailable(replica, &entry, acked_replicas, majority_quorum(layout));
+    let quorum = collect_prepare_quorum(layout, replica, &entry);
+    if quorum.acked_replicas < majority_quorum(layout) {
+        log_quorum_unavailable(
+            replica,
+            &entry,
+            quorum.acked_replicas,
+            majority_quorum(layout),
+        );
         return Ok(storage_failure_submit_response());
     }
+    log_prepare_quorum_formed(replica, &entry, &quorum, majority_quorum(layout));
 
     let result = match commit_primary_entry(node, &entry)? {
         CommittedSubmit::Result(result) => result,
         CommittedSubmit::Response(response) => return Ok(response),
     };
-    broadcast_commit_to_backups(layout, replica, &entry);
+    let broadcast = broadcast_commit_to_backups(layout, replica, &entry);
+    log_commit_broadcast_complete(replica, &entry, &broadcast, layout.replicas.len());
+    info!(
+        "replica={} event=client_submit_committed view={} lsn={} result_code={:?} from_retry_cache={} acked_prepare_replicas={} acked_prepare_peers={} commit_ack_replicas={} commit_ack_peers={}",
+        replica.replica_id.get(),
+        entry.view,
+        entry.lsn.get(),
+        result.outcome.result_code,
+        result.from_retry_cache,
+        quorum.acked_replicas,
+        format_replica_id_list(&quorum.acked_peers),
+        broadcast.acked_replicas,
+        format_replica_id_list(&broadcast.acked_peers),
+    );
 
     Ok(encode_response(&ApiResponse::Submit(
         SubmitResponse::Committed(result.into()),
@@ -865,9 +980,22 @@ fn handle_replicated_tick_expirations(
     request: allocdb_node::TickExpirationsRequest,
 ) -> Result<Vec<u8>, String> {
     if node.status() != ReplicaNodeStatus::Active {
+        eprintln!(
+            "replica={} event=tick_expirations_rejected status={} {}",
+            replica.replica_id.get(),
+            describe_node_status(node.status()),
+            format_replica_debug_summary(node)
+        );
         return Err(String::from("replica faulted"));
     }
     if node.metadata().role != ReplicaRole::Primary {
+        eprintln!(
+            "replica={} event=tick_expirations_not_primary role={} view={} commit_lsn={}",
+            replica.replica_id.get(),
+            encode_role(node.metadata().role),
+            node.metadata().current_view,
+            display_optional_lsn(node.metadata().commit_lsn)
+        );
         return Err(format!(
             "not primary: role={}",
             encode_role(node.metadata().role)
@@ -890,32 +1018,35 @@ fn handle_replicated_tick_expirations(
         }
     };
 
+    info!(
+        "replica={} event=tick_expirations_prepared current_slot={} prepared_entries={} request_slot={}",
+        replica.replica_id.get(),
+        request.current_wall_clock_slot.get(),
+        entries.len(),
+        entries.first().map_or_else(
+            || String::from("none"),
+            |entry| entry.request_slot.get().to_string()
+        ),
+    );
+
     let mut processed_count = 0_u32;
     let mut last_applied_lsn = None;
     for entry in &entries {
-        let acked_replicas = collect_prepare_quorum(layout, replica, entry);
-        if acked_replicas < majority_quorum(layout) {
-            log_quorum_unavailable(replica, entry, acked_replicas, majority_quorum(layout));
-            return Ok(storage_failure_tick_response());
-        }
-
-        let result = match node.commit_prepared_through(entry.lsn) {
-            Ok(Some(result)) => result,
-            Ok(None) => {
-                return Err(format!(
-                    "primary commit at lsn {} did not apply one prepared entry",
-                    entry.lsn.get()
-                ));
-            }
-            Err(allocdb_node::ReplicaProtocolError::Submission(error)) => {
-                return Ok(tick_rejection_response(&error));
-            }
-            Err(error) => return Err(protocol_error_message(&error)),
+        let result = match commit_tick_entry(node, layout, replica, entry)? {
+            TickCommitResult::Committed(result) => result,
+            TickCommitResult::StorageFailure => return Ok(storage_failure_tick_response()),
+            TickCommitResult::Rejected(error) => return Ok(tick_rejection_response(&error)),
         };
-        broadcast_commit_to_backups(layout, replica, entry);
         processed_count = processed_count.saturating_add(1);
         last_applied_lsn = Some(result.applied_lsn);
     }
+
+    info!(
+        "replica={} event=tick_expirations_complete processed_count={} last_applied_lsn={}",
+        replica.replica_id.get(),
+        processed_count,
+        display_optional_lsn(last_applied_lsn),
+    );
 
     Ok(encode_response(&ApiResponse::TickExpirations(
         TickExpirationsResponse::Applied(TickExpirationsApplied {
@@ -923,6 +1054,59 @@ fn handle_replicated_tick_expirations(
             last_applied_lsn,
         }),
     )))
+}
+
+enum TickCommitResult {
+    Committed(allocdb_node::SubmissionResult),
+    StorageFailure,
+    Rejected(allocdb_node::SubmissionError),
+}
+
+fn commit_tick_entry(
+    node: &mut ReplicaNode,
+    layout: &LocalClusterLayout,
+    replica: &LocalClusterReplicaConfig,
+    entry: &allocdb_node::ReplicaPreparedEntry,
+) -> Result<TickCommitResult, String> {
+    let quorum = collect_prepare_quorum(layout, replica, entry);
+    if quorum.acked_replicas < majority_quorum(layout) {
+        log_quorum_unavailable(
+            replica,
+            entry,
+            quorum.acked_replicas,
+            majority_quorum(layout),
+        );
+        return Ok(TickCommitResult::StorageFailure);
+    }
+    log_prepare_quorum_formed(replica, entry, &quorum, majority_quorum(layout));
+
+    let result = match node.commit_prepared_through(entry.lsn) {
+        Ok(Some(result)) => result,
+        Ok(None) => {
+            return Err(format!(
+                "primary commit at lsn {} did not apply one prepared entry",
+                entry.lsn.get()
+            ));
+        }
+        Err(allocdb_node::ReplicaProtocolError::Submission(error)) => {
+            return Ok(TickCommitResult::Rejected(error));
+        }
+        Err(error) => return Err(protocol_error_message(&error)),
+    };
+    let broadcast = broadcast_commit_to_backups(layout, replica, entry);
+    log_commit_broadcast_complete(replica, entry, &broadcast, layout.replicas.len());
+    info!(
+        "replica={} event=tick_expirations_entry_committed view={} lsn={} result_code={:?} acked_prepare_replicas={} acked_prepare_peers={} commit_ack_replicas={} commit_ack_peers={}",
+        replica.replica_id.get(),
+        entry.view,
+        entry.lsn.get(),
+        result.outcome.result_code,
+        quorum.acked_replicas,
+        format_replica_id_list(&quorum.acked_peers),
+        broadcast.acked_replicas,
+        format_replica_id_list(&broadcast.acked_peers),
+    );
+    Ok(TickCommitResult::Committed(result))
 }
 
 enum PreparedSubmit {
@@ -933,6 +1117,16 @@ enum PreparedSubmit {
 enum CommittedSubmit {
     Result(allocdb_node::SubmissionResult),
     Response(Vec<u8>),
+}
+
+struct PrepareQuorumResult {
+    acked_replicas: usize,
+    acked_peers: Vec<ReplicaId>,
+}
+
+struct CommitBroadcastResult {
+    acked_replicas: usize,
+    acked_peers: Vec<ReplicaId>,
 }
 
 fn prepare_or_resume_entry(
@@ -961,8 +1155,9 @@ fn collect_prepare_quorum(
     layout: &LocalClusterLayout,
     replica: &LocalClusterReplicaConfig,
     entry: &allocdb_node::ReplicaPreparedEntry,
-) -> usize {
+) -> PrepareQuorumResult {
     let mut acked_replicas = 1_usize;
+    let mut acked_peers = Vec::new();
     for peer in &layout.replicas {
         if peer.replica_id == replica.replica_id {
             continue;
@@ -977,12 +1172,16 @@ fn collect_prepare_quorum(
         match send_protocol_request(peer.protocol_addr, &request) {
             Ok(response) if is_expected_prepare_ack(&response, peer.replica_id, entry) => {
                 acked_replicas += 1;
+                acked_peers.push(peer.replica_id);
             }
             Ok(other) => log_prepare_ack_rejected(replica, peer, entry, &other),
             Err(error) => log_prepare_ack_failed(replica, peer, entry, &error),
         }
     }
-    acked_replicas
+    PrepareQuorumResult {
+        acked_replicas,
+        acked_peers,
+    }
 }
 
 fn commit_primary_entry(
@@ -1016,11 +1215,17 @@ fn drain_pending_internal_suffix(
             return Ok(false);
         }
 
-        let acked_replicas = collect_prepare_quorum(layout, replica, &entry);
-        if acked_replicas < majority_quorum(layout) {
-            log_quorum_unavailable(replica, &entry, acked_replicas, majority_quorum(layout));
+        let quorum = collect_prepare_quorum(layout, replica, &entry);
+        if quorum.acked_replicas < majority_quorum(layout) {
+            log_quorum_unavailable(
+                replica,
+                &entry,
+                quorum.acked_replicas,
+                majority_quorum(layout),
+            );
             return Ok(false);
         }
+        log_prepare_quorum_formed(replica, &entry, &quorum, majority_quorum(layout));
 
         match node.commit_prepared_through(entry.lsn) {
             Ok(Some(_)) => {}
@@ -1032,7 +1237,8 @@ fn drain_pending_internal_suffix(
             }
             Err(error) => return Err(protocol_error_message(&error)),
         }
-        broadcast_commit_to_backups(layout, replica, &entry);
+        let broadcast = broadcast_commit_to_backups(layout, replica, &entry);
+        log_commit_broadcast_complete(replica, &entry, &broadcast, layout.replicas.len());
         drained_any = true;
     }
 }
@@ -1041,7 +1247,9 @@ fn broadcast_commit_to_backups(
     layout: &LocalClusterLayout,
     replica: &LocalClusterReplicaConfig,
     entry: &allocdb_node::ReplicaPreparedEntry,
-) {
+) -> CommitBroadcastResult {
+    let mut acked_replicas = 1_usize;
+    let mut acked_peers = Vec::new();
     for peer in &layout.replicas {
         if peer.replica_id == replica.replica_id {
             continue;
@@ -1050,15 +1258,41 @@ fn broadcast_commit_to_backups(
             view: entry.view,
             commit_lsn: entry.lsn.get(),
         };
-        if let Err(error) = send_protocol_request(peer.protocol_addr, &request) {
-            eprintln!(
-                "replica={} event=commit_broadcast_failed peer={} view={} commit_lsn={} error={error}",
-                replica.replica_id.get(),
-                peer.replica_id.get(),
-                entry.view,
-                entry.lsn.get(),
-            );
+        match send_protocol_request(peer.protocol_addr, &request) {
+            Ok(ReplicaProtocolResponse::CommitAck {
+                view,
+                commit_lsn,
+                replica_id,
+            }) if view == entry.view
+                && commit_lsn == entry.lsn.get()
+                && replica_id == peer.replica_id =>
+            {
+                acked_replicas += 1;
+                acked_peers.push(peer.replica_id);
+            }
+            Ok(other) => {
+                warn!(
+                    "replica={} event=commit_ack_rejected peer={} expected_view={} expected_commit_lsn={} response={other:?}",
+                    replica.replica_id.get(),
+                    peer.replica_id.get(),
+                    entry.view,
+                    entry.lsn.get(),
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "replica={} event=commit_broadcast_failed peer={} view={} commit_lsn={} error={error}",
+                    replica.replica_id.get(),
+                    peer.replica_id.get(),
+                    entry.view,
+                    entry.lsn.get(),
+                );
+            }
         }
+    }
+    CommitBroadcastResult {
+        acked_replicas,
+        acked_peers,
     }
 }
 
@@ -1134,6 +1368,50 @@ fn log_quorum_unavailable(
         entry.lsn.get(),
         acked_replicas,
     );
+}
+
+fn log_prepare_quorum_formed(
+    replica: &LocalClusterReplicaConfig,
+    entry: &allocdb_node::ReplicaPreparedEntry,
+    quorum: &PrepareQuorumResult,
+    required_quorum: usize,
+) {
+    info!(
+        "replica={} event=prepare_quorum_formed kind={} view={} lsn={} request_slot={} acked_replicas={} required_quorum={} acked_peers={}",
+        replica.replica_id.get(),
+        encode_protocol_prepared_kind(entry.kind),
+        entry.view,
+        entry.lsn.get(),
+        entry.request_slot.get(),
+        quorum.acked_replicas,
+        required_quorum,
+        format_replica_id_list(&quorum.acked_peers),
+    );
+}
+
+fn log_commit_broadcast_complete(
+    replica: &LocalClusterReplicaConfig,
+    entry: &allocdb_node::ReplicaPreparedEntry,
+    broadcast: &CommitBroadcastResult,
+    replica_count: usize,
+) {
+    info!(
+        "replica={} event=commit_broadcast_complete view={} commit_lsn={} acked_replicas={} replica_count={} acked_peers={}",
+        replica.replica_id.get(),
+        entry.view,
+        entry.lsn.get(),
+        broadcast.acked_replicas,
+        replica_count,
+        format_replica_id_list(&broadcast.acked_peers),
+    );
+}
+
+fn format_replica_id_list(replica_ids: &[ReplicaId]) -> String {
+    replica_ids
+        .iter()
+        .map(|replica_id| replica_id.get().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn handle_resource_request(node: &ReplicaNode, request: allocdb_node::ResourceRequest) -> Vec<u8> {
@@ -1877,6 +2155,20 @@ fn describe_node_status(status: ReplicaNodeStatus) -> &'static str {
     }
 }
 
+fn format_replica_debug_summary(node: &ReplicaNode) -> String {
+    let metadata = node.metadata();
+    format!(
+        "role={} current_view={} commit_lsn={} snapshot_lsn={} last_normal_view={} durable_vote={} highest_prepared_lsn={}",
+        encode_role(metadata.role),
+        metadata.current_view,
+        display_optional_lsn(metadata.commit_lsn),
+        display_optional_lsn(metadata.active_snapshot_lsn),
+        display_optional_u64(metadata.last_normal_view),
+        display_optional_durable_vote(metadata.durable_vote),
+        display_optional_lsn(node.highest_prepared_lsn())
+    )
+}
+
 fn print_live_status(status: &ReplicaRuntimeStatus, network_isolated: bool) {
     println!(
         "replica={} state={} network={} pid={} role={} view={} control={} client={} protocol={}",
@@ -1925,6 +2217,17 @@ fn print_live_status(status: &ReplicaRuntimeStatus, network_isolated: bool) {
 
 fn display_optional_lsn(value: Option<allocdb_core::ids::Lsn>) -> String {
     value.map_or_else(|| String::from("none"), |value| value.get().to_string())
+}
+
+fn display_optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| String::from("none"), |value| value.to_string())
+}
+
+fn display_optional_durable_vote(value: Option<allocdb_node::replica::DurableVote>) -> String {
+    value.map_or_else(
+        || String::from("none"),
+        |vote| format!("view{}->replica{}", vote.view, vote.voted_for.get()),
+    )
 }
 
 fn display_optional_bool(value: Option<bool>) -> &'static str {

@@ -17,7 +17,7 @@ use allocdb_core::snapshot_file::SnapshotFile;
 use allocdb_core::state_machine::AllocDb;
 use allocdb_core::wal::{Frame, RecordType};
 use allocdb_core::wal_file::{WalFile, WalFileError};
-use log::{error, trace, warn};
+use log::{error, info, trace, warn};
 
 use crate::bounded_queue::{BoundedQueue, BoundedQueueError};
 
@@ -652,6 +652,14 @@ impl SingleNodeEngine {
 
         let due = self.collect_due_expirations(current_wall_clock_slot);
         let expiration_request_slot = self.expiration_request_slot(current_wall_clock_slot);
+        info!(
+            "planned direct expiration tick: current_slot={} request_slot={} due_candidates={} max_per_tick={} queue_depth={}",
+            current_wall_clock_slot.get(),
+            expiration_request_slot.get(),
+            due.len(),
+            self.config.max_expirations_per_tick,
+            self.queue.len(),
+        );
         let mut remaining_due = self.config.max_expirations_per_tick;
         let mut processed_count = 0_u32;
         let mut last_applied_lsn = None;
@@ -670,6 +678,14 @@ impl SingleNodeEngine {
             processed_count = processed_count.saturating_add(1);
             last_applied_lsn = Some(result.applied_lsn);
         }
+
+        info!(
+            "completed direct expiration tick: current_slot={} request_slot={} processed_count={} last_applied_lsn={}",
+            current_wall_clock_slot.get(),
+            expiration_request_slot.get(),
+            processed_count,
+            last_applied_lsn.map_or_else(|| String::from("none"), |lsn| lsn.get().to_string()),
+        );
 
         Ok(ExpirationTickResult {
             processed_count,
@@ -702,8 +718,9 @@ impl SingleNodeEngine {
         }
 
         let request_slot = self.expiration_request_slot(current_wall_clock_slot);
-        let commands = self
-            .collect_due_expirations(current_wall_clock_slot)
+        let due = self.collect_due_expirations(current_wall_clock_slot);
+        let due_candidate_count = due.len();
+        let commands: Vec<_> = due
             .into_iter()
             .take(
                 usize::try_from(self.config.max_expirations_per_tick)
@@ -714,6 +731,15 @@ impl SingleNodeEngine {
                 deadline_slot: target.deadline_slot,
             })
             .collect();
+        info!(
+            "planned replicated expiration batch: current_slot={} request_slot={} due_candidates={} planned_commands={} max_per_tick={} queue_depth={}",
+            current_wall_clock_slot.get(),
+            request_slot.get(),
+            due_candidate_count,
+            commands.len(),
+            self.config.max_expirations_per_tick,
+            self.queue.len(),
+        );
         Ok(PlannedExpirationBatch {
             request_slot,
             commands,
@@ -1053,6 +1079,20 @@ impl SingleNodeEngine {
             },
             command,
         );
+        if let Command::Expire {
+            reservation_id,
+            deadline_slot,
+        } = command
+        {
+            info!(
+                "applied internal expiration command: request_slot={} reservation_id={} deadline_slot={} applied_lsn={} result_code={:?}",
+                request_slot.get(),
+                reservation_id.get(),
+                deadline_slot.get(),
+                applied_lsn.get(),
+                outcome.result_code,
+            );
+        }
         if let Some(plan) = self.maybe_inject_crash(CrashPoint::InternalAfterApply) {
             return Err(SubmissionError::CrashInjected(plan));
         }
