@@ -184,12 +184,25 @@ pub(super) fn run_kubevirt_remote_host_command(
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("failed to spawn kubevirt remote ssh command: {error}"))?;
-        child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| String::from("kubevirt remote ssh stdin was unavailable"))?
-            .write_all(stdin_bytes)
-            .map_err(|error| format!("failed to write kubevirt remote ssh stdin: {error}"))?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| String::from("kubevirt remote ssh stdin was unavailable"))?;
+            if let Err(error) = stdin.write_all(stdin_bytes) {
+                drop(stdin);
+                let output = child.wait_with_output().map_err(|wait_error| {
+                    format!(
+                        "failed to write kubevirt remote ssh stdin: {error}; additionally failed to reap kubevirt remote ssh command: {wait_error}"
+                    )
+                })?;
+                return Err(format!(
+                    "failed to write kubevirt remote ssh stdin: {error}; status={} stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
         child
             .wait_with_output()
             .map_err(|error| format!("failed to wait for kubevirt remote ssh command: {error}"))?
@@ -348,12 +361,25 @@ fn apply_kubevirt_helper_pod(layout: &KubevirtTestbedLayout) -> Result<(), Strin
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("failed to create kubevirt helper pod: {error}"))?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| String::from("kubevirt helper manifest stdin was unavailable"))?
-        .write_all(manifest.as_bytes())
-        .map_err(|error| format!("failed to write kubevirt helper manifest: {error}"))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| String::from("kubevirt helper manifest stdin was unavailable"))?;
+        if let Err(error) = stdin.write_all(manifest.as_bytes()) {
+            drop(stdin);
+            let output = child.wait_with_output().map_err(|wait_error| {
+                format!(
+                    "failed to write kubevirt helper manifest: {error}; additionally failed to reap kubevirt helper apply: {wait_error}"
+                )
+            })?;
+            return Err(format!(
+                "failed to write kubevirt helper manifest: {error}; status={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
     let output = child
         .wait_with_output()
         .map_err(|error| format!("failed to wait for kubevirt helper apply: {error}"))?;

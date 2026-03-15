@@ -38,6 +38,12 @@ The long-term binary layout should become:
 - `allocdb-jepsen/runs.rs`: run/archive orchestration and fault-window enforcement
 - `allocdb-jepsen/watch.rs`: watch loop orchestration and lane snapshot collection
 - `allocdb-jepsen/watch_render.rs`: terminal rendering and presentation helpers
+- `allocdb-jepsen/remote.rs`: QEMU/KubeVirt remote ssh/tcp helpers and request encoding
+- `allocdb-jepsen/kubevirt.rs`: KubeVirt layout capture, helper-pod lifecycle, and lane setup
+- `allocdb-jepsen/cluster.rs`: runtime cluster convergence, failover, and rejoin helpers
+- `allocdb-jepsen/events.rs`: Jepsen event construction and expiration-drain semantics
+- `allocdb-jepsen/scenarios.rs`: control and crash-restart workload families
+- `allocdb-jepsen/nemesis.rs`: partition-heal and mixed-failover workload families
 
 This keeps the binary implementation in one place under `src/bin/` while establishing seams that
 can later support a dedicated validation crate if it still makes sense.

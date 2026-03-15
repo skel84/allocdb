@@ -465,3 +465,17 @@ pub(super) fn decode_tracker_field(value: &str) -> String {
     }
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_tracker_field, encode_tracker_field};
+
+    #[test]
+    fn tracker_field_round_trips_backslashes_and_newlines() {
+        for original in ["C:\\tmp\\foo", "line1\nline2", "C:\\tmp\\foo\nline2"] {
+            let encoded = encode_tracker_field(original);
+            let decoded = decode_tracker_field(&encoded);
+            assert_eq!(decoded, original);
+        }
+    }
+}

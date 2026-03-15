@@ -981,4 +981,21 @@ mod tests {
         assert!(response_text_is_not_primary("not primary: role=backup"));
         assert!(!response_text_is_not_primary("unexpected failure"));
     }
+
+    #[test]
+    fn classify_resource_read_outcome_rejects_mismatched_resource() {
+        let outcome = classify_resource_read_outcome(
+            ResourceId(7),
+            RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::Found(
+                allocdb_node::ResourceView {
+                    resource_id: ResourceId(8),
+                    state: allocdb_core::ResourceState::Available,
+                    current_reservation_id: None,
+                    version: 1,
+                },
+            ))),
+        )
+        .unwrap_err();
+        assert!(outcome.contains("mismatched resource 8"));
+    }
 }

@@ -215,11 +215,11 @@ fn run_external<T: ExternalTestbed>(
         logs_archive.display()
     );
     print!("{}", render_analysis_report(&report));
+    tracker.complete(&history_path, &bundle_dir, &logs_archive, &report)?;
     if let Err(error) = enforce_minimum_fault_window(&run_spec, started_at.elapsed()) {
         let _ = tracker.fail(RunTrackerPhase::Completed, &error);
         return Err(error);
     }
-    tracker.complete(&history_path, &bundle_dir, &logs_archive, &report)?;
 
     if report.release_gate_passed() {
         Ok(())
@@ -372,17 +372,40 @@ mod tests {
         effective_minimum_fault_window_secs, effective_minimum_fault_window_secs_with_override,
     };
     use allocdb_node::jepsen::{JepsenNemesisFamily, JepsenRunSpec, JepsenWorkloadFamily};
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[allow(unsafe_code)]
+    fn with_fault_window_override<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_MUTEX.lock().expect("fault-window env mutex poisoned");
+        match value {
+            Some(value) => unsafe {
+                std::env::set_var(super::super::FAULT_WINDOW_OVERRIDE_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(super::super::FAULT_WINDOW_OVERRIDE_ENV);
+            },
+        }
+        let result = f();
+        unsafe {
+            std::env::remove_var(super::super::FAULT_WINDOW_OVERRIDE_ENV);
+        }
+        result
+    }
 
     #[test]
     fn fault_window_override_does_not_change_control_runs() {
-        let run_spec = JepsenRunSpec {
-            run_id: String::from("reservation_contention-control"),
-            workload: JepsenWorkloadFamily::ReservationContention,
-            nemesis: JepsenNemesisFamily::None,
-            minimum_fault_window_secs: None,
-            release_blocking: true,
-        };
-        assert_eq!(effective_minimum_fault_window_secs(&run_spec), None);
+        with_fault_window_override(Some("180"), || {
+            let run_spec = JepsenRunSpec {
+                run_id: String::from("reservation_contention-control"),
+                workload: JepsenWorkloadFamily::ReservationContention,
+                nemesis: JepsenNemesisFamily::None,
+                minimum_fault_window_secs: None,
+                release_blocking: true,
+            };
+            assert_eq!(effective_minimum_fault_window_secs(&run_spec), None);
+        });
     }
 
     #[test]

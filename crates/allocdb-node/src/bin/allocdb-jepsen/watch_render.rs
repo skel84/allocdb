@@ -539,7 +539,13 @@ fn render_recent_events(
             "  {} {} {}",
             icon,
             watch_style(color, &[ANSI_DIM], &pad_watch_cell(&elapsed, 8)),
-            style_event_detail(color, &flatten_watch_text(&event.detail))
+            style_event_detail(
+                color,
+                &truncate_for_watch(
+                    &flatten_watch_text(&event.detail),
+                    WATCH_RULE_WIDTH.saturating_sub(14),
+                ),
+            )
         );
     }
 }

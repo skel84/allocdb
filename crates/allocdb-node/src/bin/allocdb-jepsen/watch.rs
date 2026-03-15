@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 use std::thread;
@@ -68,13 +69,7 @@ pub(super) fn watch_kubevirt(
             refresh_millis,
             follow,
         )?;
-        if !follow {
-            break;
-        }
-        if snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.state != RunTrackerState::Running)
-        {
+        if should_stop_watch(snapshot.as_ref(), follow) {
             break;
         }
         thread::sleep(Duration::from_millis(refresh_millis));
@@ -247,12 +242,131 @@ fn load_recent_run_events(
     let Ok(bytes) = fs::read_to_string(&events_path) else {
         return Vec::new();
     };
-    let mut events = bytes
-        .lines()
-        .filter_map(|line| parse_watch_event_line(line).ok())
-        .collect::<Vec<_>>();
-    if events.len() > limit {
-        events.drain(..events.len().saturating_sub(limit));
+    let mut events = VecDeque::with_capacity(limit.max(1));
+    for line in bytes.lines() {
+        match parse_watch_event_line(line) {
+            Ok(event) => {
+                if events.len() == limit.max(1) {
+                    events.pop_front();
+                }
+                events.push_back(event);
+            }
+            Err(error) => {
+                log::debug!(
+                    "discarding malformed watch event from {}: {}",
+                    events_path.display(),
+                    error
+                );
+            }
+        }
     }
-    events
+    events.into_iter().collect()
+}
+
+fn should_stop_watch(snapshot: Option<&RunStatusSnapshot>, follow: bool) -> bool {
+    !follow || snapshot.is_some_and(|snapshot| snapshot.state != RunTrackerState::Running)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_recent_run_events, should_stop_watch};
+    use crate::tracker::{
+        RunStatusSnapshot, RunTrackerPhase, RunTrackerState, encode_tracker_field,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_output_root(label: &str) -> PathBuf {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let path = std::env::temp_dir().join(format!(
+            "allocdb-watch-tests-{label}-{}-{millis}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create watch temp dir");
+        path
+    }
+
+    fn test_snapshot(run_id: &str, state: RunTrackerState) -> RunStatusSnapshot {
+        RunStatusSnapshot {
+            backend_name: String::from("kubevirt"),
+            run_id: String::from(run_id),
+            state,
+            phase: RunTrackerPhase::Executing,
+            detail: String::from("running"),
+            started_at_millis: 1,
+            updated_at_millis: 2,
+            elapsed_secs: 0,
+            minimum_fault_window_secs: Some(180),
+            history_events: 0,
+            history_file: None,
+            artifact_bundle: None,
+            logs_archive: None,
+            release_gate_passed: None,
+            blockers: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn should_stop_watch_honors_follow_and_terminal_states() {
+        let running = test_snapshot("run-a", RunTrackerState::Running);
+        let passed = test_snapshot("run-b", RunTrackerState::Passed);
+        assert!(should_stop_watch(Some(&running), false));
+        assert!(!should_stop_watch(Some(&running), true));
+        assert!(should_stop_watch(Some(&passed), true));
+        assert!(!should_stop_watch(None, true));
+    }
+
+    #[test]
+    fn load_recent_run_events_keeps_only_latest_entries() {
+        let output_root = temp_output_root("recent-events");
+        let snapshot = test_snapshot("run-a", RunTrackerState::Running);
+        let events_path = crate::tracker::run_events_path(&output_root, &snapshot.run_id);
+        let contents = (1..=5)
+            .map(|index| {
+                format!(
+                    "time_millis={} detail={}",
+                    index,
+                    encode_tracker_field(&format!("event {index}"))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&events_path, format!("{contents}\n")).expect("write watch events");
+
+        let events = load_recent_run_events(&output_root, Some(&snapshot), None, 3);
+        let details = events
+            .into_iter()
+            .map(|event| event.detail)
+            .collect::<Vec<_>>();
+        assert_eq!(details, vec!["event 3", "event 4", "event 5"]);
+    }
+
+    #[test]
+    fn load_recent_run_events_discards_missing_and_malformed_lines() {
+        let output_root = temp_output_root("malformed-events");
+        let snapshot = test_snapshot("run-b", RunTrackerState::Running);
+        assert!(load_recent_run_events(&output_root, Some(&snapshot), None, 4).is_empty());
+
+        let events_path = crate::tracker::run_events_path(&output_root, &snapshot.run_id);
+        fs::write(
+            &events_path,
+            format!(
+                "not-an-event\n\
+time_millis=1 detail={}\n\
+time_millis=bad detail={}\n",
+                encode_tracker_field("ok"),
+                encode_tracker_field("ignored")
+            ),
+        )
+        .expect("write malformed watch events");
+
+        let events = load_recent_run_events(&output_root, Some(&snapshot), None, 4);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail, "ok");
+    }
 }
