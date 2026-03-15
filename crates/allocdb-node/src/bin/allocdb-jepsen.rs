@@ -2038,7 +2038,7 @@ fn watch_kubevirt_fleet(
     refresh_millis: u64,
     follow: bool,
 ) -> Result<(), String> {
-    let mut contexts = lanes.iter().cloned().map(|_| None).collect::<Vec<_>>();
+    let mut contexts = lanes.iter().map(|_| None).collect::<Vec<_>>();
     let refresh_millis = refresh_millis.max(250);
 
     loop {
@@ -3235,12 +3235,13 @@ fn run_remote_control_command<T: ExternalTestbed>(
     layout.run_remote_host_command(&remote_command, stdin_bytes)
 }
 
+#[cfg(target_os = "macos")]
 fn disable_local_tar_copyfile_metadata(command: &mut Command) {
-    #[cfg(target_os = "macos")]
-    {
-        command.env("COPYFILE_DISABLE", "1");
-    }
+    command.env("COPYFILE_DISABLE", "1");
 }
+
+#[cfg(not(target_os = "macos"))]
+fn disable_local_tar_copyfile_metadata(_: &mut Command) {}
 
 fn run_local_tar_extract(destination_root: &Path, archive: &[u8]) -> Result<(), String> {
     let mut command = Command::new("tar");
