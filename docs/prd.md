@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft. This file is the top-level product overview for AllocDB.
+This file is the top-level product overview for AllocDB.
 
 For the detailed product docs, read:
 
@@ -27,9 +27,9 @@ These are product requirements, not implementation preferences:
 4. Allocation-free steady-state execution is the target for the Rust trusted core.
 5. Single-node correctness comes before replication.
 
-## v1 Shape
+## Shape
 
-v1 is intentionally narrow:
+The current shape is intentionally narrow:
 
 - single-node, single-shard execution
 - logical-slot TTLs
@@ -40,6 +40,6 @@ v1 is intentionally narrow:
 
 ## Document Map
 
-- [product.md](./product.md): problem statement, goals, non-goals, milestones, success criteria
+- [product.md](./product.md): problem statement, goals, non-goals, success criteria
 - [semantics.md](./semantics.md): resource model, reservation lifecycle, API contract, consistency
 - [principles.md](./principles.md): TigerStyle adapted to AllocDB and Rust

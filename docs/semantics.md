@@ -2,10 +2,10 @@
 
 ## Scope
 
-This document defines the v1 data model, command semantics, consistency model, and product-level
+This document defines the data model, command semantics, consistency model, and product-level
 API rules.
 
-For the current transport-neutral alpha request/response surface, see [api.md](./api.md).
+For the current transport-neutral request/response surface, see [api.md](./api.md).
 
 ## Core Concepts
 
@@ -32,7 +32,7 @@ current_reservation_id   : u128 | 0
 version                  : u64
 ```
 
-`version` increments on every resource state transition. In v1 it is a read-side observation field,
+`version` increments on every resource state transition. It is a read-side observation field,
 not a write precondition.
 
 ### Reservation
@@ -93,7 +93,7 @@ The first implementation stores operation outcomes in the trusted core so duplic
 reservation_id = (shard_id << 64) | lsn
 ```
 
-For the single-node prototype, `shard_id` is always `0`.
+For the single-node deployment, `shard_id` is always `0`.
 
 ### Operation IDs
 
@@ -121,7 +121,7 @@ External APIs may accept duration-style input, but the WAL and state machine ope
 - `ttl_slots`
 - `deadline_slot`
 
-v1 TTL policy:
+TTL policy:
 
 - product-level maximum reservation TTL is 1 hour
 - deployments may configure a lower maximum
@@ -145,7 +145,7 @@ The command signatures below show payload fields only.
 
 ## Result Codes
 
-The current v1 result-code set is:
+The current result-code set is:
 
 - `ok`
 - `noop`
@@ -237,7 +237,7 @@ Failure cases:
 - `invalid_state`
 - `holder_mismatch`
 
-v1 intentionally does not add `conditional_confirm(expected_version)`.
+AllocDB intentionally does not add `conditional_confirm(expected_version)`.
 
 Rationale:
 
@@ -246,7 +246,7 @@ Rationale:
 - the stale client sees `invalid_state`, `reservation_not_found`, or `reservation_retired` instead
 
 If the product later needs read-modify-write protection keyed to a resource read version, that can
-be added as a separate command without changing the single-node v1 safety model.
+be added as a separate command without changing the single-node safety model.
 
 ### Release
 
@@ -316,9 +316,9 @@ Rules:
 
 ## Consistency and Idempotency
 
-### Single-Node v1
+### Core Execution
 
-The first version targets strict serializable behavior on a single shard with one executor.
+The current version targets strict serializable behavior on a single shard with one executor.
 
 All state changes are applied in one deterministic order.
 
@@ -353,7 +353,7 @@ Clients must distinguish:
 
 Indefinite outcomes are expected under timeout, disconnect, process crash, or reply loss.
 
-The v1 rule is:
+The rule is:
 
 - clients resolve indefinite outcomes by retrying the same `operation_id` within the dedupe window
 - the server returns the original result if that operation already committed
@@ -382,13 +382,13 @@ Current single-node engine rule:
 This is the practical meaning of reliable submission in v1. It keeps command handling bounded
 without pretending that transport failures do not exist.
 
-### v1 Decisions
+### Architectural Decisions
 
-The following rules are fixed for v1:
+The following rules are fixed:
 
 1. `confirm` and `release` require `holder_id`.
 2. `confirm` remains keyed by `reservation_id`, not `resource.version`.
-3. The resource `version` field is observable but is not a v1 write guard.
+3. The resource `version` field is observable but is not a write guard.
 4. Reservation lookup history is bounded and returns `reservation_retired` after retirement.
 5. Resource metadata is excluded from the trusted core.
 6. Indefinite write outcomes are resolved by client retry with the same `operation_id`.

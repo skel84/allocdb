@@ -80,7 +80,7 @@ made is indeed progress.
 
 ## Safety
 
-> “The rules act like the seat-belt in your car: initially they are perhaps a little uncomfortable,
+> “The rules act like the seat-belt in your car: they are perhaps a little uncomfortable,
 > but after a while their use becomes second-nature and not using them becomes unimaginable.” —
 > Gerard J. Holzmann
 
@@ -149,7 +149,7 @@ Code](https://spinroot.com/gerard/pdf/P10.pdf) will change the way you code fore
       of code.
 
 - All memory must be statically allocated at startup. **No memory may be dynamically allocated (or
-  freed and reallocated) after initialization.** This avoids unpredictable behavior that can
+  freed and reallocated) after startup.** This avoids unpredictable behavior that can
   significantly affect performance, and avoids use-after-free. As a second-order effect, it is our
   experience that this also makes for more efficient, simpler designs that are more performant and
   easier to maintain and reason about, compared to designs that do not consider all possible memory

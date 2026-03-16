@@ -1,12 +1,9 @@
-# AllocDB Replication Protocol Draft
+# AllocDB Replication Protocol
 
 ## Status
 
-`M6-T01` turns the old placeholder notes into a concrete first protocol draft for replicated
-AllocDB.
-
-This document chooses the initial protocol family, states the safety invariants replication must
-preserve, and narrows the first replicated release. The replicated simulation plan and Jepsen gate
+This document chooses the protocol family, states the safety invariants replication must
+preserve, and narrows the replicated release. The replicated simulation plan and Jepsen gate
 now live in [testing.md](./testing.md).
 
 ## Scope

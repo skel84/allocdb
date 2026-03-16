@@ -24,7 +24,7 @@ AllocDB is defined by hard constraints as well as features:
    explicit limit.
 3. Assertions for programmer mistakes, result codes for operating conditions.
 4. Rust trusted-core code should target allocation-free steady-state execution after startup.
-5. Single-node correctness is the gate for replication.
+5. A rock-solid single-node trusted core is the foundation for replication.
 
 ## Problem Statement
 
@@ -66,10 +66,9 @@ AllocDB exists to remove those failure modes from application code.
 - low operational overhead
 - simple, auditable failure behavior
 
-### Initial Engineering Target
+### Core Engineering Target
 
-The first milestone proves correctness and boundedness on a single node before pursuing
-multi-node scale claims.
+AllocDB proves correctness and boundedness on its trusted core before scaling out through replication.
 
 ## Non-Goals
 
@@ -94,30 +93,7 @@ The first version must tolerate:
 - restart from snapshot plus WAL replay
 
 Network partitions, failover, and replication lag matter later, but they are not allowed to
-distort the single-node design.
-
-## Milestones
-
-### Phase 1: Single-Node Prototype
-
-- WAL
-- deterministic state machine
-- bounded queues and tables
-- logical-slot TTL handling
-- crash recovery
-- invariant-heavy testing
-
-### Phase 2: Replication
-
-- replicated log
-- follower replay
-- failover semantics
-
-### Phase 3: Sharding
-
-- partitioned resource space
-- shard routing
-- operational tooling
+distort the trusted core design.
 
 ## Success Criteria
 
@@ -128,4 +104,4 @@ AllocDB succeeds when the following are true:
 - replay after crash yields the same state and command outcomes
 - all hot-path limits are explicit and testable
 - command outcomes are deterministic under contention
-- replication can be added without rewriting the single-node allocator semantics
+- replication provides high availability without rewriting the trusted core allocator semantics
