@@ -1,0 +1,14 @@
+allocdb:
+  label: AllocDB
+  permalink: /allocdb
+  description: Notes and updates about AllocDB
+
+launch:
+  label: Launch
+  permalink: /launch
+  description: AllocDB launch announcements
+
+announcement:
+  label: Announcement
+  permalink: /announcement
+  description: Major product and milestone announcements

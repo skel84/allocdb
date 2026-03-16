@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft. This document adapts TigerStyle to AllocDB, Rust, and a deterministic resource-allocation
+This document adapts TigerStyle to AllocDB, Rust, and a deterministic resource-allocation
 database.
 
 These rules apply most strongly to the trusted core:

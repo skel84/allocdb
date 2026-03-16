@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document defines the faults v1 is designed to tolerate, the faults it detects and halts on,
+This document defines the faults the system is designed to tolerate, the faults it detects and halts on,
 and the faults intentionally deferred until replication.
 
 ## Principle
@@ -12,11 +12,11 @@ AllocDB prefers fail-closed behavior over ambiguous continuation.
 If the system detects broken invariants or storage corruption, it should halt rather than continue
 serving potentially incorrect allocation decisions.
 
-## v1 Fault Classes
+## Fault Classes
 
 ### Process Faults
 
-v1 is designed to tolerate:
+The system is designed to tolerate:
 
 - process crash
 - process restart
@@ -42,7 +42,7 @@ This makes clock skew a liveness issue, not a correctness issue, for v1.
 
 ### Storage Faults
 
-v1 explicitly considers:
+The system explicitly considers:
 
 - torn WAL tail
 - checksum mismatch in WAL frame
@@ -61,7 +61,7 @@ The system must not continue after discovering corrupted allocator state.
 
 ### Capacity and Overload Faults
 
-v1 assumes overload happens and treats it as a normal operating condition.
+The system assumes overload happens and treats it as a normal operating condition.
 
 Required behavior:
 
@@ -88,7 +88,7 @@ Required behavior:
 
 ## Faults Deferred Until Replication
 
-These matter later, but should not distort the v1 core:
+These matter later, but should not distort the core:
 
 - primary crash
 - follower lag

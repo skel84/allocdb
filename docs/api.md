@@ -1,11 +1,11 @@
-# AllocDB Alpha API
+# AllocDB API
 
 ## Scope
 
-This document defines the current transport-neutral alpha API exposed by
+This document defines the transport-neutral API exposed by
 `crates/allocdb-node::api`.
 
-It is intentionally not an HTTP or RPC spec yet. v1 first fixes:
+It is intentionally not an HTTP or RPC spec. It first fixes:
 
 - request and response shapes
 - binary wire encoding
@@ -17,7 +17,7 @@ Network transport, authentication, and multi-node routing are out of scope for t
 
 ## Current Rust Entry Points
 
-The alpha API is available through:
+The API is available through:
 
 - `allocdb_node::SingleNodeEngine::handle_api_request`
 - `allocdb_node::SingleNodeEngine::handle_api_bytes`
@@ -62,7 +62,7 @@ client_id    : u128
 command      : ...
 ```
 
-The node API deliberately wraps that payload instead of redefining command encoding a second time.
+The API deliberately wraps that payload instead of redefining command encoding a second time.
 
 ### Get Resource
 
@@ -287,7 +287,7 @@ failures with category `definite_failure` and code `invalid_request(...)`.
 
 ## Non-Goals
 
-The current alpha API does not yet specify:
+The current API does not yet specify:
 
 - HTTP or gRPC transport
 - authentication or authorization

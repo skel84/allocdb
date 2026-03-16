@@ -2,12 +2,12 @@
 
 ## Scope
 
-This document defines the v1 execution model, logical-time handling, boundedness rules, and
-single-node system shape.
+This document defines the execution model, logical-time handling, boundedness rules, and
+trusted-core system shape.
 
-## v1 Target
+## Current Target
 
-The first implementation target is intentionally narrow:
+The implementation target is intentionally narrow:
 
 - single process
 - single shard
@@ -26,7 +26,7 @@ The first implementation target is intentionally narrow:
 7. Correctness beats reclaim latency. A resource may become reusable late, but never early.
 8. The trusted core targets allocation-free steady-state execution after startup.
 
-## Single-Node Components
+## Core Components
 
 - API ingress
 - bounded submission queue
@@ -73,7 +73,7 @@ client
   -> answer from in-memory state or return fence_not_applied
 ```
 
-For a single node, this is enough for strict reads in the current alpha.
+For the trusted core, this is enough for strict reads in the current implementation.
 
 If the live engine halts after a WAL-path ambiguity, reads must fail closed until recovery
 reconstructs memory from durable state.
@@ -120,7 +120,7 @@ max_expiration_bucket_len        : u32
 Rules:
 
 - external APIs may accept `ttl_ms`, but the WAL and executor operate only on slots
-- `max_ttl_slots * slot_duration_ms <= 3_600_000` in v1
+- `max_ttl_slots * slot_duration_ms <= 3_600_000`
 - `reservation_history_window_slots <= max_ttl_slots`
 
 Crossing a deadline does not instantly free the resource. A resource becomes reusable only after
@@ -128,7 +128,7 @@ the corresponding `expire` command is committed and applied.
 
 ## Retention and Capacity Model
 
-The v1 design uses one fixed-capacity reservation table for both active and recently terminal
+The design uses one fixed-capacity reservation table for both active and recently terminal
 reservations.
 
 Rules:
@@ -193,4 +193,4 @@ Rules:
 - if a slot bucket reaches `MAX_EXPIRATION_BUCKET_LEN`, new reserves fail fast with
   `expiration_index_full`
 
-This is a v1 design decision, not an open question.
+This is a fundamental design decision, not an open question.

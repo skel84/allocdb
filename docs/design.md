@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft. This file is the top-level engineering overview for the v1 design.
+This file is the top-level engineering overview for the design.
 
 For the detailed design docs, read:
 
@@ -50,7 +50,7 @@ Current implementation anchor:
 - [architecture.md](./architecture.md): single-node pipeline, logical time, bounds, scheduler
 - [fault-model.md](./fault-model.md): crash, clock, storage, and bounded-overload assumptions
 - [replication.md](./replication.md): deferred distributed design areas and boundaries
-- [roadmap.md](./roadmap.md): milestone plan and exit criteria
+- [roadmap.md](./roadmap.md): high-level roadmap and exit criteria
 - [work-breakdown.md](./work-breakdown.md): concrete units of work for the first implementation
 - [spikes.md](./spikes.md): bounded throwaway experiments for implementation uncertainty
 - [storage.md](./storage.md): WAL, snapshots, recovery

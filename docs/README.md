@@ -34,7 +34,7 @@
 
 ## Repository Workflow
 
-- [Contributing Guide](../CONTRIBUTING.md)
+- [Contributing Guide](https://github.com/skel84/allocdb/blob/main/CONTRIBUTING.md)
 
 ## Source Style Docs
 

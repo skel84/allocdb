@@ -115,14 +115,14 @@ fresh clones.
 
 Representative final status files:
 
-- [`reservation_contention-crash-restart-status.txt`](../.artifacts/kubevirt-jepsen-20260315/lane-a/reservation_contention-crash-restart-status.txt)
-- [`ambiguous_write_retry-partition-heal-status.txt`](../.artifacts/kubevirt-jepsen-20260315/lane-b/ambiguous_write_retry-partition-heal-status.txt)
-- [`failover_read_fences-mixed-failover-status.txt`](../.artifacts/kubevirt-jepsen-20260315/lane-c/failover_read_fences-mixed-failover-status.txt)
-- [`expiration_and_recovery-mixed-failover-status.txt`](../.artifacts/kubevirt-jepsen-20260315/lane-c/expiration_and_recovery-mixed-failover-status.txt)
+- `../.artifacts/kubevirt-jepsen-20260315/lane-a/reservation_contention-crash-restart-status.txt`
+- `../.artifacts/kubevirt-jepsen-20260315/lane-b/ambiguous_write_retry-partition-heal-status.txt`
+- `../.artifacts/kubevirt-jepsen-20260315/lane-c/failover_read_fences-mixed-failover-status.txt`
+- `../.artifacts/kubevirt-jepsen-20260315/lane-c/expiration_and_recovery-mixed-failover-status.txt`
 
 Representative final artifact bundles:
 
-- [`ambiguous_write_retry-mixed-failover-1773570559554`](../.artifacts/kubevirt-jepsen-20260315/lane-a/ambiguous_write_retry-mixed-failover-1773570559554)
-- [`expiration_and_recovery-partition-heal-1773568653724`](../.artifacts/kubevirt-jepsen-20260315/lane-a/expiration_and_recovery-partition-heal-1773568653724)
-- [`ambiguous_write_retry-partition-heal-1773568857293`](../.artifacts/kubevirt-jepsen-20260315/lane-b/ambiguous_write_retry-partition-heal-1773568857293)
-- [`expiration_and_recovery-mixed-failover-1773569536167`](../.artifacts/kubevirt-jepsen-20260315/lane-c/expiration_and_recovery-mixed-failover-1773569536167)
+- `../.artifacts/kubevirt-jepsen-20260315/lane-a/ambiguous_write_retry-mixed-failover-1773570559554`
+- `../.artifacts/kubevirt-jepsen-20260315/lane-a/expiration_and_recovery-partition-heal-1773568653724`
+- `../.artifacts/kubevirt-jepsen-20260315/lane-b/ambiguous_write_retry-partition-heal-1773568857293`
+- `../.artifacts/kubevirt-jepsen-20260315/lane-c/expiration_and_recovery-mixed-failover-1773569536167`
