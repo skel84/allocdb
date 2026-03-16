@@ -64,10 +64,10 @@ The result is a fascinating case study: by enforcing strict determinism and "no-
 
 **Next Steps:**
 
-* Read the [Architecture Overview](https://www.google.com/search?q=./docs/architecture.md).
+* Read the [Architecture Overview](./docs/architecture.md).
 
 
-* Explore the [TigerStyle Principles](https://www.google.com/search?q=./docs/principles.md).
+* Explore the [TigerStyle Principles](./docs/principles.md).
 
 
-* Check out the [Jepsen Testing Report](https://www.google.com/search?q=./docs/jepsen-testing.md).
+* Check out the [Jepsen Testing Report](./docs/jepsen-testing.md).
