@@ -2,18 +2,20 @@
 
 ## Scope
 
-This document defines the transport-neutral API exposed by
-`crates/allocdb-node::api`.
+This document defines the transport-neutral API exposed by `crates/allocdb-node::api`.
 
 It is intentionally not an HTTP or RPC spec. It first fixes:
 
 - request and response shapes
 - binary wire encoding
 - definite vs indefinite submission failures
-- strict-read behavior for resource and reservation queries
+- strict-read behavior for resource and lease queries
 - metrics exposure
 
 Network transport, authentication, and multi-node routing are out of scope for this stage.
+
+The approved follow-on lease-centric surface is defined here. The current implementation still
+exposes a reservation-centric alpha compatibility path while `M9` is being implemented.
 
 ## Current Rust Entry Points
 
@@ -37,13 +39,17 @@ encoded request -> decode -> engine -> encode -> encoded response
 
 ## Request Types
 
-The current request set is:
+The approved request set is:
 
 - `submit`
 - `get_resource`
-- `get_reservation`
+- `get_lease`
 - `get_metrics`
 - `tick_expirations`
+
+Compatibility note:
+
+- the current alpha `get_reservation` request is the compatibility precursor to `get_lease`
 
 ### Submit
 
@@ -54,7 +60,7 @@ submit {
 }
 ```
 
-`payload` is the existing encoded core `ClientRequest` payload:
+`payload` is the encoded core `ClientRequest` payload:
 
 ```text
 operation_id : u128
@@ -63,6 +69,20 @@ command      : ...
 ```
 
 The API deliberately wraps that payload instead of redefining command encoding a second time.
+
+The approved command set inside `payload` is:
+
+- `create_resource`
+- `reserve_bundle`
+- `activate`
+- `release`
+- `revoke`
+- `reclaim`
+
+Compatibility note:
+
+- the current single-resource `reserve`, `confirm`, and reservation-centric `release` commands
+  remain only as compatibility aliases while the implementation transitions to the lease model
 
 ### Get Resource
 
@@ -75,17 +95,17 @@ get_resource {
 
 If `required_lsn` is present, the node enforces the strict-read fence before serving the read.
 
-### Get Reservation
+### Get Lease
 
 ```text
-get_reservation {
-  required_lsn   : u64 | none
-  current_slot   : u64
-  reservation_id : u128
+get_lease {
+  required_lsn : u64 | none
+  current_slot : u64
+  lease_id     : u128
 }
 ```
 
-`current_slot` is required because reservation retirement is defined in logical slots.
+`current_slot` is required because retained-history retirement is defined in logical slots.
 
 ### Get Metrics
 
@@ -107,8 +127,8 @@ tick_expirations {
 ```
 
 This request drives the bounded expiration scheduler for one maintenance tick. The node inspects
-due reservations, commits up to `MAX_EXPIRATIONS_PER_TICK` internal `expire` commands through the
-WAL, and applies them through the normal executor path.
+due reserved leases, commits up to `MAX_EXPIRATIONS_PER_TICK` internal `expire` commands through
+the WAL, and applies them through the normal executor path.
 
 ## Submission Responses
 
@@ -123,15 +143,20 @@ Submission responses are split into two classes:
 committed {
   applied_lsn       : u64
   result_code       : enum
-  reservation_id    : u128 | none
+  lease_id          : u128 | none
+  lease_epoch       : u64 | none
   deadline_slot     : u64 | none
   from_retry_cache  : bool
 }
 ```
 
 This is the committed state-machine result. A committed command may still return domain failures
-such as `resource_busy` or `holder_mismatch`; those are allocator outcomes, not submission-layer
-failures.
+such as `resource_busy`, `holder_mismatch`, or `stale_epoch`; those are allocator outcomes, not
+submission-layer failures.
+
+Compatibility note:
+
+- the current alpha response field `reservation_id` is superseded by `lease_id`
 
 ### Rejected
 
@@ -164,8 +189,8 @@ The required category mapping is:
   - `engine_halted`
   - `storage_failure`
 
-This distinction is mandatory. The API must not flatten indefinite write outcomes into ordinary hard
-failures.
+This distinction is mandatory. The API must not flatten indefinite write outcomes into ordinary
+hard failures.
 
 ## Read Responses
 
@@ -178,47 +203,52 @@ failures.
 - `engine_halted`
 - `fence_not_applied(required_lsn, last_applied_lsn)`
 
-Current `resource_view` fields are:
+Approved `resource_view` fields are:
 
 ```text
-resource_id             : u128
-state                   : enum { available, reserved, confirmed }
-current_reservation_id  : u128 | none
-version                 : u64
+resource_id        : u128
+state              : enum { available, reserved, active, revoking }
+current_lease_id   : u128 | none
+version            : u64
 ```
 
-### Reservation Query
+### Lease Query
 
-`get_reservation` returns one of:
+`get_lease` returns one of:
 
-- `found(reservation_view)`
+- `found(lease_view)`
 - `not_found`
 - `retired`
 - `engine_halted`
 - `fence_not_applied(required_lsn, last_applied_lsn)`
 
-Current `reservation_view` fields are:
+Approved `lease_view` fields are:
 
 ```text
-reservation_id    : u128
-resource_id       : u128
-holder_id         : u128
-state             : enum { reserved, confirmed, released, expired }
-created_lsn       : u64
-deadline_slot     : u64
-released_lsn      : u64 | none
-retire_after_slot : u64 | none
+lease_id             : u128
+holder_id            : u128
+state                : enum { reserved, active, revoking, released, expired, revoked }
+lease_epoch          : u64
+created_lsn          : u64
+deadline_slot        : u64 | none
+released_lsn         : u64 | none
+retire_after_slot    : u64 | none
+member_resource_ids  : [u128]
 ```
 
 `retired` is distinct from `not_found` because bounded history is part of the product contract.
-The live reservation record remains queryable until `retire_after_slot`; after that, the engine
-may drop the full record but must keep returning `retired` for shard-local `reservation_id`
-values at or below its retired watermark. This watermark is conservative: once full history is
-gone, the API no longer distinguishes an aged-out reservation from an older shard-local
-`reservation_id` below that watermark.
+The live lease record remains queryable until `retire_after_slot`; after that, the engine may drop
+the full record but must keep returning `retired` for shard-local `lease_id` values at or below
+its retired watermark. This watermark is conservative: once full history is gone, the API no
+longer distinguishes an aged-out lease from an older shard-local `lease_id` below that watermark.
 
 If the live engine has halted after a WAL-path ambiguity, reads must fail closed with
 `engine_halted` until recovery rebuilds memory from durable state.
+
+Compatibility note:
+
+- the current alpha `get_reservation` and `reservation_view` are superseded by `get_lease` and
+  `lease_view`
 
 ## Expiration Tick Responses
 
@@ -265,6 +295,10 @@ metrics {
     operation_table_used
     operation_table_capacity
     operation_table_utilization_pct
+    lease_table_used
+    lease_table_capacity
+    lease_member_table_used
+    lease_member_table_capacity
   }
 }
 ```
@@ -274,12 +308,12 @@ snapshot_only` with `loaded_snapshot_lsn = none`.
 
 ## Wire Discipline
 
-The current binary encoding is:
+The binary encoding remains:
 
 - little-endian
 - fixed-width integers
 - explicit request and response tags
-- length-prefixed byte payloads where variable length is required
+- length-prefixed arrays or byte payloads where variable length is required
 - no generic serializer dependency
 
 Malformed outer API frames are codec failures. Malformed `submit.payload` values are submission

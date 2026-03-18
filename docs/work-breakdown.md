@@ -1276,6 +1276,241 @@ Test evidence:
 
 - `./scripts/preflight.sh`
 
+## M9: Lease Kernel Follow-On
+
+### M9-T01: Freeze generic lease-kernel scope and non-goals
+
+Goal:
+
+- define the minimal generic AllocDB lease-kernel surface needed by downstream consumers without
+  moving scheduler or product policy into the trusted core
+
+Blocked by:
+
+- M8-T04
+- [lease-kernel-follow-on.md](./lease-kernel-follow-on.md)
+
+Acceptance criteria:
+
+- bundle ownership, fencing, revoke, and liveness-boundary work are explicitly in or out of scope
+- Kubernetes, queueing, topology, routing, and chargeback concerns stay explicitly outside AllocDB
+- the follow-on is documented as a generic lease-kernel extension, not a product-specific fork
+
+Test evidence:
+
+- docs review only
+
+### M9-T02: Decide bundle lease data model and invariants
+
+Goal:
+
+- choose the exact ownership model for all-or-nothing multi-resource commits
+
+Blocked by:
+
+- M9-T01
+- [semantics.md](./semantics.md)
+
+Acceptance criteria:
+
+- the bundle identifier strategy is explicit
+- per-resource and bundle-level invariants are explicit
+- partial visibility and partial success are ruled out explicitly
+- retained-history rules for bundle members are documented
+
+Test evidence:
+
+- docs review only
+
+### M9-T03: Decide fencing-token and stale-holder semantics
+
+Goal:
+
+- define how external holders prove current authority and how stale actors are rejected
+
+Blocked by:
+
+- M9-T02
+
+Acceptance criteria:
+
+- token shape and monotonicity rules are explicit
+- stale-holder rejection outcomes are documented
+- replay and failover preserve the same fencing behavior
+
+Test evidence:
+
+- docs review only
+
+### M9-T04: Decide revoke and liveness-boundary semantics
+
+Goal:
+
+- define explicit revoke behavior and the boundary between external liveness observation and
+  trusted-core ownership transitions
+
+Blocked by:
+
+- M9-T01
+- M9-T03
+
+Acceptance criteria:
+
+- revoke is documented as an explicit logged transition
+- the trusted core does not read wall-clock time or external heartbeats directly
+- reclaim semantics still preserve the late-not-early reuse rule
+
+Test evidence:
+
+- docs review only
+
+### M9-T05: Extend semantics, API, and fault-model docs for the approved lease surface
+
+Goal:
+
+- fold the approved follow-on decisions into the authoritative product and engineering docs
+
+Blocked by:
+
+- M9-T02
+- M9-T03
+- M9-T04
+
+Acceptance criteria:
+
+- [semantics.md](./semantics.md), [api.md](./api.md), [architecture.md](./architecture.md), and
+  [fault-model.md](./fault-model.md) reflect the approved command and result-code surface
+- the docs make clear which previous single-resource commands remain unchanged, which are
+  generalized, and which are superseded
+- retention and idempotency rules for the new primitives are explicit
+
+Test evidence:
+
+- docs review only
+
+### M9-T06: Implement atomic bundle commit in the trusted core
+
+Goal:
+
+- add the real all-or-nothing multi-resource ownership transition in `allocdb-core`
+
+Blocked by:
+
+- M9-T05
+
+Acceptance criteria:
+
+- a successful bundle commit acquires all target resources atomically
+- failure leaves no partial ownership behind
+- deterministic capacity and conflict failures remain explicit and bounded
+- trusted-core invariants cover bundle membership and per-resource exclusivity
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M9-T07: Implement fencing tokens and stale-holder rejection
+
+Goal:
+
+- add the approved authority token model to live execution, replay, and read surfaces
+
+Blocked by:
+
+- M9-T06
+
+Acceptance criteria:
+
+- holder-facing operations can reject stale authority deterministically
+- duplicate requests remain idempotent under the new token rules
+- the read surface exposes the authority information needed by external controllers
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M9-T08: Implement explicit revoke and safe reuse rules
+
+Goal:
+
+- add revoke behavior without weakening the late-not-early reuse guarantee
+
+Blocked by:
+
+- M9-T07
+
+Acceptance criteria:
+
+- revoke transitions are logged and replayable
+- duplicate revoke requests are deterministic
+- revoked ownership cannot be reused early under crash, retry, or failover
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M9-T09: Extend WAL, snapshot, recovery, and transport surfaces for lease primitives
+
+Goal:
+
+- preserve the new lease semantics through persistence, restart, and external API boundaries
+
+Blocked by:
+
+- M9-T08
+
+Acceptance criteria:
+
+- WAL and snapshot formats can encode the new primitives
+- live apply and replay share the same path and produce the same results
+- wire-level request and response surfaces expose the approved fields without ambiguity
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M9-T10: Preserve lease primitives across replication and failover
+
+Goal:
+
+- extend the replicated path so bundle ownership, fencing, and revoke semantics survive quorum
+  replication and view change unchanged
+
+Blocked by:
+
+- M9-T09
+
+Acceptance criteria:
+
+- replication does not invent a second apply path for the new primitives
+- failover preserves committed bundle ownership and fencing outcomes
+- stale primaries and stale holders still fail closed
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
+### M9-T11: Add simulation and regression coverage for bundle, revoke, and stale-holder faults
+
+Goal:
+
+- promote the new lease-kernel safety rules into reproducible regression coverage
+
+Blocked by:
+
+- M9-T10
+
+Acceptance criteria:
+
+- tests cover duplicate bundle retries, partial-failure avoidance, revoke races, stale-holder
+  rejection, crash recovery, and replicated failover
+- the new scenarios run through the same deterministic simulation and replicated-validation
+  surfaces already used elsewhere in the repo
+
+Test evidence:
+
+- `./scripts/preflight.sh`
+
 ## Suggested First Slice
 
 If implementation starts immediately, the highest-value first slice is:
