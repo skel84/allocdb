@@ -19,6 +19,8 @@
 - [Architecture](./architecture.md)
 - [Fault Model](./fault-model.md)
 - [Jepsen Refactor Plan](./jepsen-refactor-plan.md)
+- [Lease Kernel Design Decisions](./lease-kernel-design.md)
+- [Lease Kernel Follow-On](./lease-kernel-follow-on.md)
 - [Operator Runbook](./operator-runbook.md)
 - [KubeVirt Jepsen Report](./kubevirt-jepsen-report.md)
 - [Replication Notes](./replication.md)

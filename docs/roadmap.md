@@ -292,12 +292,38 @@ Exit criteria:
   expiration safety
 - the external validation path is documented well enough to run before any replicated release
 
+### M9: Lease Kernel Follow-On
+
+Goal:
+
+- extend AllocDB with the minimal correctness-critical lease primitives needed for broader
+  scarce-resource ownership without turning the trusted core into a scheduler or policy engine
+
+Deliverables:
+
+- approved follow-on kernel scope and non-goals for generic scarce-resource use cases
+- explicit bundle-ownership semantics with all-or-nothing visibility
+- explicit fencing-token and revoke semantics
+- one minimal lease lifecycle that carries only correctness-bearing state
+- durability, API, replay, and replication plans for the new primitives
+- simulation and regression plan for stale-holder, revoke, and bundle-failure paths
+
+Exit criteria:
+
+- the follow-on kernel scope is explicit and keeps Kubernetes, queueing, topology, and routing
+  policy outside the trusted core
+- bundle commit, fencing, revoke, and liveness-boundary semantics are documented before
+  implementation starts
+- replay, crash recovery, and replication invariants for the new primitives are explicit
+- the work can be broken into reviewable implementation tasks without reopening settled `M0`-`M8`
+  semantics
+
 ## Sequencing
 
 The minimum dependency chain is:
 
 ```text
-M0 -> M1 -> M1H -> M2 -> M3 -> M4 -> M5 -> M6 -> M7 -> M8
+M0 -> M1 -> M1H -> M2 -> M3 -> M4 -> M5 -> M6 -> M7 -> M8 -> M9
 ```
 
 Allowed overlap:
@@ -310,6 +336,8 @@ Allowed overlap:
 - some M5 API and metrics work can start during late M3
 - some M8 cluster-runner and operator packaging work can start during late M7 when it does not
   weaken deterministic replicated-harness coverage
+- some M9 planning docs can advance during late M8 or its maintainability follow-up when they do
+  not destabilize the current replicated release gate
 
 Not allowed:
 
@@ -328,6 +356,7 @@ Suggested review points:
 6. end of M5: alpha readiness review
 7. end of M7: replicated prototype correctness review
 8. end of M8: external validation gate review
+9. end of M9: lease-kernel follow-on scope and readiness review
 
 ## Planning Output
 

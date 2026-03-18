@@ -10,6 +10,8 @@ For the detailed design docs, read:
 - [Alpha API](./api.md)
 - [Architecture](./architecture.md)
 - [Fault Model](./fault-model.md)
+- [Lease Kernel Design Decisions](./lease-kernel-design.md)
+- [Lease Kernel Follow-On](./lease-kernel-follow-on.md)
 - [Replication Notes](./replication.md)
 - [Roadmap](./roadmap.md)
 - [Work Breakdown](./work-breakdown.md)
@@ -49,6 +51,10 @@ Current implementation anchor:
 - [api.md](./api.md): transport-neutral alpha request/response surface and wire error schema
 - [architecture.md](./architecture.md): single-node pipeline, logical time, bounds, scheduler
 - [fault-model.md](./fault-model.md): crash, clock, storage, and bounded-overload assumptions
+- [lease-kernel-design.md](./lease-kernel-design.md): concrete local `M9` design direction for
+  first-class leases, bundle ownership, fencing, and revoke
+- [lease-kernel-follow-on.md](./lease-kernel-follow-on.md): post-`M8` planning for minimal
+  generic lease-kernel extensions such as bundle ownership, fencing, and revoke
 - [replication.md](./replication.md): deferred distributed design areas and boundaries
 - [roadmap.md](./roadmap.md): high-level roadmap and exit criteria
 - [work-breakdown.md](./work-breakdown.md): concrete units of work for the first implementation

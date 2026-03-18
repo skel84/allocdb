@@ -2,8 +2,13 @@
 
 ## Scope
 
-This document defines the faults the system is designed to tolerate, the faults it detects and halts on,
-and the faults intentionally deferred until replication.
+This document defines the faults the system is designed to tolerate, the faults it detects and
+halts on, and the faults intentionally deferred until replication.
+
+The lease-centric follow-on adds two important correctness concerns to the model:
+
+- stale holders acting on old authority
+- delayed but explicit revoke and reclaim decisions from external observers
 
 ## Principle
 
@@ -26,7 +31,7 @@ The system is designed to tolerate:
 Expected behavior:
 
 - crash recovery replays snapshot plus WAL
-- pauses may delay expiration, but must never cause early reuse
+- pauses may delay expiration, revoke, or reclaim progress, but must never cause early reuse
 
 ### Clock and Time Faults
 
@@ -35,10 +40,12 @@ The trusted core does not consult wall-clock time.
 Rules:
 
 - TTL is represented in logical slots
-- slot delay may make a reservation expire late
-- no clock jump may make a reservation reusable early
+- slot delay may make a reserved lease expire late
+- no clock jump may make a lease reusable early
+- active or revoking leases must never be reclaimed directly from wall-clock observation
 
-This makes clock skew a liveness issue, not a correctness issue, for v1.
+This makes clock skew and liveness observation delays operational liveness issues, not correctness
+issues, for the trusted core.
 
 ### Storage Faults
 
@@ -86,6 +93,34 @@ Required behavior:
 - the server returns the original result if the command already committed within retention
 - the server never executes the same `operation_id` twice
 
+### Stale-Holder Faults
+
+External actors may continue acting after their authority has been withdrawn.
+
+Examples:
+
+- a retried worker acts on a prior lease view
+- a node agent continues after revoke
+- a delayed release arrives after a newer authority change
+
+Required behavior:
+
+- holder-authorized commands validate the current `(lease_id, lease_epoch)`
+- stale holders are rejected deterministically with `stale_epoch` or `invalid_state`
+- revoke increments the fencing token before reuse is allowed
+
+### External Observation Faults
+
+The trusted core assumes external observers may be late or uncertain when deciding whether reclaim
+is safe.
+
+Required behavior:
+
+- late external observation may delay revoke or reclaim
+- missing or delayed heartbeats must not free resources automatically
+- delayed reclaim is acceptable
+- premature reclaim is not
+
 ## Faults Deferred Until Replication
 
 These matter later, but should not distort the core:
@@ -109,3 +144,6 @@ The fault model implies:
 - replay and live execution share the same apply logic
 - corruption handling is explicit, not "best effort"
 - transport ambiguity is handled by idempotent submission, not by pretending ambiguity cannot occur
+- stale-holder rejection is a kernel concern, not a best-effort client convention
+- liveness observation remains outside the trusted core; only explicit `revoke`, `reclaim`, and
+  `expire` transitions may change ownership state

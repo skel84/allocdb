@@ -3,16 +3,19 @@
 ## Scope
 
 This document defines the execution model, logical-time handling, boundedness rules, and
-trusted-core system shape.
+trusted-core system shape for the approved lease-centric follow-on surface.
+
+The current implementation anchor is still reservation-centric in places. The architecture here
+describes the contract the implementation is expected to converge toward as `M9` lands.
 
 ## Current Target
 
-The implementation target is intentionally narrow:
+The implementation target remains intentionally narrow:
 
 - single process
 - single shard
 - single writer and executor thread
-- deterministic TTL expiration through logged events
+- deterministic expiration through logged events
 
 ## Design Constraints
 
@@ -25,6 +28,8 @@ The implementation target is intentionally narrow:
    error, data corruption, and broken invariants.
 7. Correctness beats reclaim latency. A resource may become reusable late, but never early.
 8. The trusted core targets allocation-free steady-state execution after startup.
+9. Liveness observation stays outside the trusted core; the core consumes explicit ownership
+   transitions such as `revoke` and `reclaim`.
 
 ## Core Components
 
@@ -57,12 +62,14 @@ Rules:
 - the executor is single-threaded for one shard
 - live execution and replay use the same apply logic
 - publish never rewrites the result after the command is applied
+- bundle visibility is all-or-nothing at the executor boundary
+- holder-authorized mutations validate the current `(lease_id, lease_epoch)` before state changes
 
 Current implementation anchor:
 
 - `allocdb_node::SingleNodeEngine` in `crates/allocdb-node/src/engine.rs`
 - `allocdb_node::api` in `crates/allocdb-node/src/api.rs` for the current transport-neutral alpha
-  request/response boundary
+  request and response boundary
 
 ## Read Path
 
@@ -73,20 +80,21 @@ client
   -> answer from in-memory state or return fence_not_applied
 ```
 
-For the trusted core, this is enough for strict reads in the current implementation.
+For the trusted core, this is enough for strict reads.
+
+The approved public read shapes are:
+
+- `get_resource(resource_id)`
+- `get_lease(lease_id)`
 
 If the live engine halts after a WAL-path ambiguity, reads must fail closed until recovery
 reconstructs memory from durable state.
-
-Current implementation anchor:
-
-- `SingleNodeEngine::enforce_read_fence(required_lsn)` in `crates/allocdb-node/src/engine_observe.rs`
 
 ## Expiration Path
 
 ```text
 slot ticker
-  -> inspect due reservations
+  -> inspect due reserved leases
   -> enqueue internal expire commands
   -> append to WAL
   -> executor applies expire
@@ -96,12 +104,27 @@ Rules:
 
 - the scheduler never mutates allocation state directly
 - at most `MAX_EXPIRATIONS_PER_TICK` expirations are enqueued
+- only `reserved` leases are eligible for expiration
+- `active` or `revoking` leases are never freed by timer
 - lag must be observable as an explicit metric outside the trusted core
 
-Current implementation anchor:
+## Revoke And Reclaim Path
 
-- `SingleNodeEngine::tick_expirations(current_wall_clock_slot)` in
-  `crates/allocdb-node/src/engine.rs`
+```text
+external observer
+  -> decides holder authority should be withdrawn
+  -> submit revoke(lease_id)
+  -> executor moves lease to revoking and bumps lease_epoch
+  -> later submit reclaim(lease_id) when reuse is safe
+  -> executor returns member resources to available
+```
+
+Rules:
+
+- external systems observe heartbeats, node state, pod state, or other liveness signals
+- the trusted core does not inspect those signals directly
+- revoke may happen before reuse is safe
+- reclaim is the explicit point where reuse becomes allowed
 
 ## Time and TTL Model
 
@@ -113,31 +136,36 @@ Required configuration:
 slot_duration_ms                 : u64
 max_ttl_slots                    : u64
 max_client_retry_window_slots    : u64
-reservation_history_window_slots : u64
+lease_history_window_slots       : u64
 max_expiration_bucket_len        : u32
+max_bundle_size                  : u32
 ```
 
 Rules:
 
 - external APIs may accept `ttl_ms`, but the WAL and executor operate only on slots
 - `max_ttl_slots * slot_duration_ms <= 3_600_000`
-- `reservation_history_window_slots <= max_ttl_slots`
+- `lease_history_window_slots <= max_ttl_slots`
+- TTL applies to `reserved` leases only
 
-Crossing a deadline does not instantly free the resource. A resource becomes reusable only after
-the corresponding `expire` command is committed and applied.
+Crossing a deadline does not instantly free resources. Resources become reusable only after the
+corresponding `expire` or `reclaim` command is committed and applied.
 
 ## Retention and Capacity Model
 
-The design uses one fixed-capacity reservation table for both active and recently terminal
-reservations.
+The design uses:
+
+- one fixed-capacity lease table for active and recently terminal leases
+- one fixed-capacity lease-member table for bundle membership
 
 Rules:
 
-- active reservations occupy entries until they terminate
-- terminal reservations keep their entry until `retire_after_slot`
-- retirement frees the slot for reuse
-- retirement also advances a bounded retired-lookup watermark so later reservation lookups stay
-  distinct from `not_found` after the full record is dropped
+- active and revoking leases occupy entries until they terminate
+- terminal leases keep their entry until `retire_after_slot`
+- member records retire with the parent lease
+- retirement frees table slots for reuse
+- retirement also advances a bounded retired-lookup watermark so later lease lookups stay distinct
+  from `not_found` after the full record is dropped
 
 This keeps history bounded and prevents the product-level history policy from silently making the
 core unbounded.
@@ -150,10 +178,12 @@ At minimum define:
 - `MAX_BATCH_SIZE`
 - `MAX_COMMAND_BYTES`
 - `MAX_RESOURCES`
-- `MAX_RESERVATIONS`
+- `MAX_LEASES`
+- `MAX_LEASE_MEMBERS`
+- `MAX_BUNDLE_SIZE`
 - `MAX_OPERATION_RECORDS`
 - `MAX_TTL_SLOTS`
-- `RESERVATION_HISTORY_WINDOW_SLOTS`
+- `LEASE_HISTORY_WINDOW_SLOTS`
 - `MAX_EXPIRATION_BUCKET_LEN`
 - `MAX_EXPIRATIONS_PER_TICK`
 
@@ -162,12 +192,15 @@ Expected behavior under pressure:
 - new writes fail fast with `overloaded` or a more specific capacity error
 - reads remain available where possible
 - expirations may lag, but lag must be observable
+- revoke or reclaim may be delayed externally, but the kernel must not guess
 
 Required operational signals:
 
 - `logical_slot_lag = max(0, current_wall_clock_slot - last_request_slot)`
 - expiration backlog, for example the number of due expirations not yet applied
-- `operation_table_utilization`, so dedupe-window pressure is visible before `operation_table_full`
+- `operation_table_utilization`
+- `lease_table_utilization`
+- `lease_member_table_utilization`
 - recovery and checkpoint status, including:
   - how the current process started (`fresh_start`, `wal_only`, `snapshot_only`, or
     `snapshot_and_wal`)
@@ -175,12 +208,7 @@ Required operational signals:
   - how many WAL frames were replayed at startup
   - what snapshot LSN is currently the active durable anchor
 
-Current implementation anchor:
-
-- `AllocDb::health_metrics(current_wall_clock_slot)` in `crates/allocdb-core/src/state_machine_metrics.rs`
-- `SingleNodeEngine::metrics(current_wall_clock_slot)` in `crates/allocdb-node/src/engine_observe.rs`
-
-Delayed expiration is acceptable. Premature reuse is not.
+Delayed expiration and delayed reclaim are acceptable. Premature reuse is not.
 
 ## Expiration Index
 
@@ -188,9 +216,9 @@ The expiration index is a fixed-capacity timing wheel keyed by `deadline_slot`.
 
 Rules:
 
-- each slot holds a bounded list of reservation references
+- each slot holds a bounded list of reserved lease references
 - the wheel size is derived from `MAX_TTL_SLOTS`
-- if a slot bucket reaches `MAX_EXPIRATION_BUCKET_LEN`, new reserves fail fast with
+- if a slot bucket reaches `MAX_EXPIRATION_BUCKET_LEN`, new reserve commands fail fast with
   `expiration_index_full`
 
 This is a fundamental design decision, not an open question.

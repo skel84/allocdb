@@ -2,10 +2,18 @@
 
 ## Scope
 
-This document defines the data model, command semantics, consistency model, and product-level
-API rules.
+This document defines the approved follow-on data model, command semantics, consistency model, and
+product-level API rules for AllocDB's generic lease kernel.
 
-For the current transport-neutral request/response surface, see [api.md](./api.md).
+For the transport-neutral request and response surface, see [api.md](./api.md).
+
+The current implementation still exposes a reservation-centric alpha compatibility path. That path
+is expected to converge toward the lease-centric model defined here as `M9` lands.
+
+Related planning docs:
+
+- [lease-kernel-follow-on.md](./lease-kernel-follow-on.md)
+- [lease-kernel-design.md](./lease-kernel-design.md)
 
 ## Core Concepts
 
@@ -20,43 +28,67 @@ Examples:
 - `hotel_room_204`
 - `inventory_unit_8932`
 
-In the trusted core, a resource has only allocatable state. Arbitrary metadata is out of scope for
-v1.
+In the trusted core, a resource has only allocatable state. Arbitrary metadata is out of scope.
 
 Suggested record:
 
 ```text
 resource_id              : u128
-current_state            : enum { available, reserved, confirmed }
-current_reservation_id   : u128 | 0
+current_state            : enum { available, reserved, active, revoking }
+current_lease_id         : u128 | 0
 version                  : u64
 ```
 
-`version` increments on every resource state transition. It is a read-side observation field,
-not a write precondition.
+`version` increments on every resource state transition. It is a read-side observation field, not
+a write precondition.
 
-### Reservation
+### Lease
 
-A reservation is a historical claim on one resource by one holder.
+A lease is the authoritative ownership object for one scarce-resource claim by one holder.
+
+A lease may cover:
+
+- one resource
+- or one all-or-nothing bundle of multiple resources
 
 Suggested record:
 
 ```text
-reservation_id           : u128
-resource_id              : u128
+lease_id                 : u128
 holder_id                : u128
-state                    : enum { reserved, confirmed, released, expired }
+state                    : enum { reserved, active, revoking, released, expired, revoked }
+lease_epoch              : u64
 created_lsn              : u64
-deadline_slot            : u64
+deadline_slot            : u64 | 0
 released_lsn             : u64 | 0
 retire_after_slot        : u64 | 0
+member_count             : u32
 ```
 
 Rules:
 
-- reservation state is separate from resource state
-- `released` and `expired` are reservation-history states, not live resource states
-- terminal reservation history is retained only until `retire_after_slot`
+- lease state is separate from resource state
+- `released`, `expired`, and `revoked` are terminal lease-history states, not live resource states
+- `revoking` withdraws holder authority but does not yet make the resources reusable
+- terminal lease history is retained only until `retire_after_slot`
+
+### Lease Member
+
+A lease member ties one `resource_id` to one parent `lease_id`.
+
+Suggested record:
+
+```text
+lease_id                 : u128
+resource_id              : u128
+member_index             : u32
+```
+
+Rules:
+
+- member records exist only to describe the resource set owned by one lease
+- a member has no independent holder, lifecycle, or public identity
+- member history retires with the parent lease
 
 ### Operation
 
@@ -68,7 +100,7 @@ Suggested record:
 operation_id             : u128
 command_hash             : u128
 result_code              : enum
-result_reservation_id    : u128 | 0
+result_lease_id          : u128 | 0
 result_deadline_slot     : u64 | 0
 applied_lsn              : u64
 retire_after_slot        : u64
@@ -76,8 +108,8 @@ retire_after_slot        : u64
 
 The operation table provides bounded idempotency, not permanent dedupe.
 
-The first implementation stores operation outcomes in the trusted core so duplicate
-`operation_id` retries can return the original result while the dedupe window is still open.
+The trusted core stores operation outcomes so duplicate `operation_id` retries can return the
+original result while the dedupe window is still open.
 
 ## Identifier Strategy
 
@@ -85,12 +117,12 @@ The first implementation stores operation outcomes in the trusted core so duplic
 
 `resource_id` is externally supplied and stable.
 
-### Reservation IDs
+### Lease IDs
 
-`reservation_id` is derived from committed log position:
+`lease_id` is derived from committed log position:
 
 ```text
-reservation_id = (shard_id << 64) | lsn
+lease_id = (shard_id << 64) | lsn
 ```
 
 For the single-node deployment, `shard_id` is always `0`.
@@ -101,16 +133,20 @@ For the single-node deployment, `shard_id` is always `0`.
 
 ## Hard Invariants
 
-1. A resource has at most one active reservation at a time.
-2. An active reservation belongs to exactly one resource.
-3. `confirmed` reservations cannot be expired.
-4. A terminal reservation never becomes active again.
-5. A successful `reserve` creates exactly one reservation object.
-6. Every committed command has exactly one log position and one replay result.
-7. Replaying the same snapshot plus WAL yields the same state and the same command outcomes.
-8. Expiration can make a resource reusable late, but never early.
-9. Reads that claim strict consistency must observe a specific applied LSN.
-10. Bounded retention rules must be sufficient to preserve the advertised API semantics.
+1. A resource has at most one active lease authority at a time.
+2. A successful bundle commit becomes visible atomically or not at all.
+3. Every active lease member belongs to exactly one active lease.
+4. `active` and `revoking` leases cannot be expired.
+5. A terminal lease never becomes active again.
+6. A successful reserve command creates exactly one lease object.
+7. Every holder-authorized mutation is checked against the current `(lease_id, lease_epoch)`.
+8. Revoke may withdraw authority immediately, but reuse may happen only after explicit safe
+   reclaim.
+9. Every committed command has exactly one log position and one replay result.
+10. Replaying the same snapshot plus WAL yields the same state and the same command outcomes.
+11. Expiration or reclaim can make a resource reusable late, but never early.
+12. Reads that claim strict consistency must observe a specific applied LSN.
+13. Bounded retention rules must be sufficient to preserve the advertised API semantics.
 
 ## Logical Time
 
@@ -123,9 +159,11 @@ External APIs may accept duration-style input, but the WAL and state machine ope
 
 TTL policy:
 
-- product-level maximum reservation TTL is 1 hour
+- product-level maximum reserve TTL is `1` hour
 - deployments may configure a lower maximum
-- longer-lived ownership should use `confirmed`, not ever-longer reservation TTLs
+- TTL applies to the `reserved` pre-activation state
+- longer-lived ownership should use `active` leases plus explicit revoke and reclaim, not
+  ever-longer timer-driven reuse inside the state machine
 
 ## Command Model
 
@@ -145,7 +183,7 @@ The command signatures below show payload fields only.
 
 ## Result Codes
 
-The current result-code set is:
+The approved follow-on result-code set is:
 
 - `ok`
 - `noop`
@@ -153,15 +191,18 @@ The current result-code set is:
 - `resource_table_full`
 - `resource_not_found`
 - `resource_busy`
+- `bundle_too_large`
 - `ttl_out_of_range`
-- `reservation_table_full`
-- `reservation_not_found`
-- `reservation_retired`
+- `lease_table_full`
+- `lease_member_table_full`
+- `lease_not_found`
+- `lease_retired`
 - `expiration_index_full`
 - `operation_table_full`
 - `operation_conflict`
 - `invalid_state`
 - `holder_mismatch`
+- `stale_epoch`
 - `slot_overflow`
 
 `operation_table_full` is a pre-commit failure: the allocator cannot accept a new deduped client
@@ -170,6 +211,8 @@ command because it has no bounded space to remember the outcome.
 `slot_overflow` is the trusted-core guard result when a derived deadline or retirement slot would
 exceed `u64::MAX`. The single-node engine rejects the same condition before WAL commit as a
 definite submission failure.
+
+## Commands
 
 ### Create Resource
 
@@ -186,133 +229,216 @@ Failure cases:
 - `already_exists`
 - `resource_table_full`
 
-### Reserve
+### Reserve Bundle
 
 ```text
-reserve(resource_id, holder_id, ttl_slots)
+reserve_bundle(resource_ids[], holder_id, ttl_slots)
 ```
 
 Preconditions:
 
-- resource exists
-- resource state is `available`
+- `resource_ids` is non-empty
+- `resource_ids.len()` is within the configured maximum bundle size
+- every `resource_id` is unique within the command
+- every resource exists
+- every resource state is `available`
 - `ttl_slots` is within configured bounds
 
 Success effect:
 
-- derive `reservation_id` from the committed `lsn`
+- derive `lease_id` from the committed `lsn`
 - compute `deadline_slot = request_slot + ttl_slots`
-- create reservation with `state = reserved`
-- attach the reservation to the resource
+- create a lease with `state = reserved` and `lease_epoch = 1`
+- create one bounded member record for each resource
+- attach all member resources to the new lease atomically
 
 Failure cases:
 
 - `resource_not_found`
 - `resource_busy`
+- `bundle_too_large`
 - `ttl_out_of_range`
-- `reservation_table_full`
+- `lease_table_full`
+- `lease_member_table_full`
 - `expiration_index_full`
 
-### Confirm
+Compatibility rule:
+
+- the current single-resource `reserve(resource_id, holder_id, ttl_slots)` command is the
+  compatibility form of `reserve_bundle([resource_id], holder_id, ttl_slots)`
+
+### Activate
 
 ```text
-confirm(reservation_id, holder_id)
+activate(lease_id, holder_id, lease_epoch)
 ```
 
 Preconditions:
 
-- reservation exists
-- reservation state is `reserved`
+- lease exists
+- lease state is `reserved`
 - `holder_id` matches
+- `lease_epoch` matches the current live lease record
 
 Success effect:
 
-- reservation state becomes `confirmed`
-- resource state becomes `confirmed`
+- lease state becomes `active`
+- every member resource state becomes `active`
 
 Failure cases:
 
-- `reservation_not_found`
-- `reservation_retired`
+- `lease_not_found`
+- `lease_retired`
 - `invalid_state`
 - `holder_mismatch`
+- `stale_epoch`
 
-AllocDB intentionally does not add `conditional_confirm(expected_version)`.
+Compatibility rule:
 
-Rationale:
-
-- `reservation_id` is derived from committed log position and is never reused
-- stale confirms on an old reservation cannot mutate a newer reservation for the same resource
-- the stale client sees `invalid_state`, `reservation_not_found`, or `reservation_retired` instead
-
-If the product later needs read-modify-write protection keyed to a resource read version, that can
-be added as a separate command without changing the single-node safety model.
+- the current single-resource `confirm(reservation_id, holder_id)` command is a compatibility form
+  of `activate(lease_id, holder_id, lease_epoch)` for a bundle of size `1`
 
 ### Release
 
 ```text
-release(reservation_id, holder_id)
+release(lease_id, holder_id, lease_epoch)
 ```
 
 Preconditions:
 
-- reservation exists
-- reservation state is `reserved` or `confirmed`
+- lease exists
+- lease state is `reserved` or `active`
 - `holder_id` matches
+- `lease_epoch` matches the current live lease record
 
 Success effect:
 
-- reservation state becomes `released`
-- resource returns to `available`
+- lease state becomes `released`
+- `lease_epoch` increments to invalidate further holder authority
+- all member resources return to `available`
 
 Failure cases:
 
-- `reservation_not_found`
-- `reservation_retired`
+- `lease_not_found`
+- `lease_retired`
 - `invalid_state`
 - `holder_mismatch`
+- `stale_epoch`
+
+Compatibility rule:
+
+- the current single-resource `release(reservation_id, holder_id)` command is a compatibility form
+  of `release(lease_id, holder_id, lease_epoch)` for a bundle of size `1`
+
+### Revoke
+
+```text
+revoke(lease_id)
+```
+
+Preconditions:
+
+- lease exists
+- lease state is `active`
+
+Success effect:
+
+- lease state becomes `revoking`
+- `lease_epoch` increments
+- member resources remain unavailable for reuse
+
+Failure cases:
+
+- `lease_not_found`
+- `lease_retired`
+- `invalid_state`
+
+### Reclaim
+
+```text
+reclaim(lease_id)
+```
+
+Preconditions:
+
+- lease exists
+- lease state is `revoking`
+
+Success effect:
+
+- lease state becomes `revoked`
+- all member resources return to `available`
+
+Failure cases:
+
+- `lease_not_found`
+- `lease_retired`
+- `invalid_state`
 
 ### Expire
 
 ```text
-expire(reservation_id, deadline_slot)
+expire(lease_id, deadline_slot)
 ```
 
 This is an internal command written through the same WAL path as external commands.
 
 Preconditions:
 
-- reservation exists
-- reservation state is `reserved`
-- `deadline_slot` matches the reservation record
+- lease exists
+- lease state is `reserved`
+- `deadline_slot` matches the lease record
 
 Success effect:
 
-- reservation state becomes `expired`
-- resource returns to `available`
+- lease state becomes `expired`
+- `lease_epoch` increments to invalidate any future stale holder use
+- all member resources return to `available`
 
 Deterministic no-op cases:
 
-- reservation already `confirmed`
-- reservation already `released`
-- reservation already `expired`
-- reservation does not match the expected deadline
+- lease already `active`
+- lease already `revoking`
+- lease already `released`
+- lease already `expired`
+- lease already `revoked`
+- lease does not match the expected deadline
 
 ### Query State
 
 ```text
 get_resource(resource_id)
-get_reservation(reservation_id)
+get_lease(lease_id)
 ```
 
 Rules:
 
 - strict reads are tied to an applied LSN
-- active reservations are always queryable
-- terminal reservations remain queryable until `retire_after_slot`
-- after the live record retires, reads return `reservation_retired` via bounded retained metadata
+- reserved leases created by `reserve_bundle`, along with active and revoking leases, are always
+  queryable
+- terminal leases remain queryable until `retire_after_slot`
+- after the live record retires, reads return `lease_retired` via bounded retained metadata
 - that retained metadata is conservative: once full history is dropped, older shard-local
-  `reservation_id` values at or below the retired watermark also read as `reservation_retired`
+  `lease_id` values at or below the retired watermark also read as `lease_retired`
+
+Compatibility rule:
+
+- the current `get_reservation(reservation_id)` read is superseded by `get_lease(lease_id)` and
+  remains only as a compatibility surface during the implementation transition
+
+## Compatibility Surface
+
+The approved lease model supersedes the older reservation-centric naming.
+
+During the implementation transition:
+
+- `reserve(resource_id, holder_id, ttl_slots)` remains as the compatibility form of one-member
+  `reserve_bundle`
+- `confirm(reservation_id, holder_id)` remains as the compatibility form of one-member `activate`
+- `release(reservation_id, holder_id)` remains as the compatibility form of one-member `release`
+- `get_reservation(reservation_id)` remains as the compatibility form of `get_lease(lease_id)`
+
+The semantic rule is that these compatibility commands must not diverge from the lease model.
 
 ## Consistency and Idempotency
 
@@ -379,16 +505,18 @@ Current single-node engine rule:
 - the future wire protocol must preserve that distinction explicitly instead of flattening all
   submission errors into one generic failure class
 
-This is the practical meaning of reliable submission in v1. It keeps command handling bounded
-without pretending that transport failures do not exist.
+This is the practical meaning of reliable submission. It keeps command handling bounded without
+pretending that transport failures do not exist.
 
 ### Architectural Decisions
 
 The following rules are fixed:
 
-1. `confirm` and `release` require `holder_id`.
-2. `confirm` remains keyed by `reservation_id`, not `resource.version`.
-3. The resource `version` field is observable but is not a write guard.
-4. Reservation lookup history is bounded and returns `reservation_retired` after retirement.
-5. Resource metadata is excluded from the trusted core.
-6. Indefinite write outcomes are resolved by client retry with the same `operation_id`.
+1. holder-authorized commands carry both `holder_id` and the current `lease_epoch`
+2. lease authority is keyed by `lease_id`, not `resource.version`
+3. the resource `version` field is observable but is not a write guard
+4. lease lookup history is bounded and returns `lease_retired` after retirement
+5. resource metadata is excluded from the trusted core
+6. indefinite write outcomes are resolved by client retry with the same `operation_id`
+7. liveness observation stays outside the trusted core; the core consumes explicit `revoke` and
+   `reclaim` commands instead of wall-clock-derived lease timeouts

@@ -1,7 +1,7 @@
 # AllocDB Status
 
 ## Current State
-- Phase: replicated implementation
+- Phase: replicated implementation plus lease-kernel docs freeze
 - Planning IDs: tasks use `M#-T#`; spikes use `M#-S#`
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
@@ -14,6 +14,7 @@
   - `M6` replication design: implemented
   - `M7` replicated core prototype: in progress
   - `M8` external cluster validation: in progress
+  - `M9` generic lease-kernel follow-on: docs freeze in progress
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -23,40 +24,15 @@
   - `3d6ff0f` `Fail closed on WAL corruption`
   - `39f103b` `Defer conditional confirm and add health metrics`
   - `82cb8d8` `Add single-node submission engine crate`
-  - current validated chunk: explicit seeded crash-point injection across submit, checkpoint, and
-    recovery boundaries plus checked slot and LSN arithmetic across trusted-core and single-node
-    sequencing paths, including deterministic pre-commit overflow rejection for request slots,
-    fail-closed replay rejection for overflowed WAL commands, restart coverage for post-sync
-    submit replay and replay-interrupted recovery, explicit `next_lsn` exhaustion handling after
-    `u64::MAX`, deterministic storage-fault injection for append failures, sync-failure
-    ambiguity, checksum-mismatch fail-closed recovery, and torn-tail truncation over the real WAL
-    restart path, plus replayable seeded schedule exploration over ingress contention,
-    due-expiration selection with earliest-deadline priority, retry timing, a replicated-node
-    wrapper with durable replica metadata bootstrap, restart validation, and explicit faulted-state
-    entry on invalid local protocol metadata, and a deterministic three-replica harness with one
-    explicit message queue, one connectivity matrix, and replayable transcripts for queued,
-    delivered, dropped, crashed, and restarted replica actions, plus the first majority-backed
-    quorum write path with one configured primary, durable prepared-entry buffering, real
-    `prepare`/`prepare_ack`/`commit` queue semantics, commit publication only after majority
-    durable append, primary-only read enforcement on locally applied committed state, explicit
-    quorum-loss demotion into `view_uncertain`, durable higher-view vote recording, higher-view
-    takeover that reconstructs the latest committed prefix before normal mode, stale-message
-    discard across view change, fail-closed stale-primary read and write rejection, plus
-    checkpoint-aware stale-replica rejoin that chooses suffix-only catch-up when the target still
-    holds a recent enough committed durable prefix, falls back to snapshot transfer when the
-    primary has already pruned older history, discards divergent uncommitted prepared suffix
-    during rejoin, rejects faulted replicas instead of auto-repairing them, and fails closed if a
-    target already knows a higher durable view than the current primary, plus promoted
-    deterministic partition and primary-crash scenarios that prove minority-partition catch-up,
-    full-split fail-closed behavior, pre-quorum retry replay, majority-appended failover
-    reconstruction, prepared-suffix recovery from another voter during takeover, and post-reply
-    retry/read preservation on the new primary, and the first multi-process local cluster runner
-    with one persisted `cluster-layout.txt`, stable three-replica workspaces, per-replica pid and
-    log files, reserved loopback addresses, and a smoke-tested `start`/`status`/`stop` command
-    surface that preserves replica identity and on-disk layout across restart, plus the first
-    local fault-control harness with per-replica `crash`/`restart`/`isolate`/`heal` commands, one
-    persisted `cluster-faults.txt` network-isolation state, one replayable `cluster-timeline.log`,
-    and externally visible isolation rejection on the reserved `client` and `protocol` listeners, plus one host-side QEMU testbed CLI that materializes per-guest overlays, NoCloud seed images, firmware vars, one static in-guest cluster layout, and one control-node orchestration script around the existing replica daemon and local fault-control commands
+  - current validated chunk: seeded crash-point and WAL-fault coverage across submit, checkpoint,
+    and recovery boundaries; checked slot and LSN overflow handling; deterministic simulation over
+    contention, retry timing, and due-expiration ordering; replicated metadata bootstrap and
+    fail-closed faulted-state entry; majority-backed quorum writes with primary-only reads,
+    quorum-loss demotion, and higher-view takeover; suffix and snapshot-based stale-replica rejoin
+    with divergent prepared-suffix discard; promoted partition and primary-crash scenarios that
+    preserve fail-closed behavior and retry/read continuity after failover; and the first local
+    three-replica cluster runner, fault-control harness, and QEMU testbed around the real replica
+    daemon
 
 ## What Exists
 
@@ -101,6 +77,16 @@
   - metrics exposure through the same API boundary
 - Operator documentation:
   - operator-facing runbook for the single-node alpha, local replicated cluster runner, and local QEMU testbed, including workspace layout plus current control-hook limits
+- Follow-on planning:
+  - one draft lease-kernel follow-on plan that narrows the next trusted-core additions to bundle
+    ownership, fencing, revoke, and an explicit liveness boundary, framed as generic
+    scarce-resource semantics rather than product-specific behavior
+  - one draft lease-kernel design-decision document that chooses a first-class lease authority
+    object, bundle size `1` as the single-resource semantic special case, a lease-scoped fencing
+    token, and a two-stage `revoke -> reclaim` safety model
+  - one active authoritative-docs pass under issue `#80` that is rewriting semantics, API,
+    architecture, and fault-model docs to the approved lease-centric contract while keeping the
+    current reservation-centric implementation explicitly marked as compatibility surface
 - Replication design draft:
   - VSR-style primary/backup replicated log with fixed membership and majority quorums
   - primary-only reads in the first replicated release
@@ -218,3 +204,8 @@
 - the immediate maintainability follow-up is issue `#70`: split `allocdb-jepsen.rs` into
   focused bin-local modules first, then re-evaluate a dedicated validation crate or Hetzner
   follow-on once the existing KubeVirt path is easier to maintain
+- `M9-T01` through `M9-T05` now exist as tracked GitHub issues, and issue `#80` is the active
+  doc-freeze slice on the `AllocDB` project
+- the current `M9` focus is to finish the authoritative lease-centric docs freeze across
+  `semantics.md`, `api.md`, `architecture.md`, and `fault-model.md` before opening code-bearing
+  implementation slices
