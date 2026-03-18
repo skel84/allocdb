@@ -1288,11 +1288,7 @@ Goal:
 Blocked by:
 
 - [lease-kernel-follow-on.md](./lease-kernel-follow-on.md)
-
-Sequencing note:
-
-- planning overlap with late `M8-T04` is allowed
-- code-bearing `M9` tasks still remain downstream of the external-validation gate
+- M8-T04 (only for code-bearing `M9` tasks; not required for docs-freeze planning)
 
 Acceptance criteria:
 
