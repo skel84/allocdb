@@ -18,7 +18,7 @@ AllocDB already provides the right core shape for deterministic scarce-capacity 
 - late reuse is acceptable, early reuse is not
 
 The current surface, however, is intentionally narrow and optimized for one-resource reservations.
-Broader scarce-resource use cases need a small number of additional correctness primitives before
+Broader scarce-resource use cases need a few additional correctness primitives before
 they can rely on AllocDB for multi-resource ownership and stale-holder safety.
 
 This document defines that minimum follow-on scope.
@@ -144,26 +144,31 @@ Required boundary:
 The starting bias should be to keep heartbeat observation outside the kernel and encode only the
 resulting ownership transition as an explicit AllocDB command.
 
-## Open Design Decisions For M9
+## Frozen Design Decisions For M9
 
-These questions must be resolved explicitly in docs before implementation:
+These decisions are frozen for the current planning slice and should be treated as the default M9
+direction unless a later milestone explicitly reopens them:
 
-1. Should AllocDB introduce a first-class `lease_id`, or should it generalize the current
-   reservation model without a new top-level identifier?
-2. Should a bundle be represented as one logical lease with member resources, or as grouped
-   reservation records under one bundle authority object?
-3. Does the current `confirm` surface evolve into a more general activation or bind command, or
-   does bundle ownership fit cleanly into existing command names?
-4. Which result codes need to be added for revoke, stale fencing, and bundle-specific conflicts?
-5. How should retired-history lookup work for revoked or partially materialized bundles?
-6. Should the single-resource path become a thin special case of bundle size `1`, or remain a
-   separately optimized command path over the same invariants?
+1. M9 decision: introduce a first-class `lease_id`; the older `reservation_id` naming survives
+   only as compatibility surface while implementation transitions.
+2. M9 decision: represent a bundle as one logical lease plus bounded member-resource records, not
+   as loosely grouped peer reservation records.
+3. M9 decision: the authoritative command surface becomes `reserve_bundle`, `activate`, `release`,
+   `revoke`, and `reclaim`; the current single-resource `confirm` path remains only as a
+   compatibility alias while the implementation catches up.
+4. M9 decision: extend the result-code set with the lease-centric and bundle-specific outcomes
+   needed for this model, including stale-fencing, lease-history, and bundle-capacity failures.
+5. M9 decision: retained-history lookup becomes lease-centric; `get_lease` returns
+   `lease_retired` after `retire_after_slot`, and member history retires with the parent lease.
+6. M9 decision: the single-resource path is the semantic special case of bundle size `1`;
+   specialized command forms may remain temporarily for compatibility or implementation reasons,
+   but they must not diverge from the lease model.
 
 ## Constraints On The Solution
 
 Any approved design must preserve these properties:
 
-1. no resource has more than one active owner at the same logical point in time
+1. no resource has more than one active owner at the same logical point
 2. bundle visibility is atomic
 3. replay of the same committed log yields the same bundle, fencing, and revoke outcomes
 4. stale holders are rejected without requiring wall-clock reasoning in the state machine

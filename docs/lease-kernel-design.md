@@ -2,11 +2,19 @@
 
 ## Status
 
-Draft. This document freezes the current local design direction for `M9` so follow-on semantics
-work can proceed from explicit choices instead of open-ended scope language.
+Accepted local design rationale for the `M9` docs freeze. This document records the design choices
+behind the current lease-centric follow-on direction so implementation work can proceed from
+explicit decisions instead of open-ended scope language.
 
-It is still a planning document. It does not yet change the authoritative API contract in
-[semantics.md](./semantics.md) or [api.md](./api.md).
+The authoritative command and state surface now lives in:
+
+- [semantics.md](./semantics.md)
+- [api.md](./api.md)
+- [architecture.md](./architecture.md)
+- [fault-model.md](./fault-model.md)
+
+This document should be read as the rationale behind that frozen surface, not as a competing
+future plan.
 
 ## Purpose
 
@@ -363,17 +371,17 @@ These decisions are still intentionally deferred:
 - holder transfer between different holders
 - policy reasons, tenant metadata, or topology metadata inside the trusted core
 
-Those should be handled by the next doc pass that updates the authoritative semantics and API
-documents.
+Those remain intentionally deferred beyond the current docs freeze. Reopening any of them should
+happen only through a later milestone or an explicit revision to the authoritative docs.
 
-## Required Next Doc Pass
+## Authoritative Alignment
 
-If this design direction is accepted, the next local planning step should update:
+These design choices are now reflected in:
 
 - [semantics.md](./semantics.md)
 - [api.md](./api.md)
 - [architecture.md](./architecture.md)
 - [fault-model.md](./fault-model.md)
 
-That pass should turn these design choices into one coherent command, state, and result-code
-surface.
+Those documents define the command, state, and result-code surface to implement. This file remains
+the supporting design-rationale record for why that surface is shaped the way it is.

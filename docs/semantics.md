@@ -414,7 +414,8 @@ get_lease(lease_id)
 Rules:
 
 - strict reads are tied to an applied LSN
-- active and revoking leases are always queryable
+- reserved leases created by `reserve_bundle`, along with active and revoking leases, are always
+  queryable
 - terminal leases remain queryable until `retire_after_slot`
 - after the live record retires, reads return `lease_retired` via bounded retained metadata
 - that retained metadata is conservative: once full history is dropped, older shard-local
