@@ -1,7 +1,7 @@
 # AllocDB Status
 
 ## Current State
-- Phase: replicated implementation plus lease-kernel docs freeze
+- Phase: replicated implementation with Jepsen maintainability follow-up and M9 docs freeze
 - Planning IDs: tasks use `M#-T#`; spikes use `M#-S#`
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
@@ -14,7 +14,7 @@
   - `M6` replication design: implemented
   - `M7` replicated core prototype: in progress
   - `M8` external cluster validation: in progress
-  - `M9` generic lease-kernel follow-on: docs freeze in progress
+  - `M9` generic lease-kernel follow-on: docs freeze merged; implementation pending
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -204,8 +204,10 @@
 - the immediate maintainability follow-up is issue `#70`: split `allocdb-jepsen.rs` into
   focused bin-local modules first, then re-evaluate a dedicated validation crate or Hetzner
   follow-on once the existing KubeVirt path is easier to maintain
-- `M9-T01` through `M9-T05` now exist as tracked GitHub issues, and issue `#80` is the active
-  doc-freeze slice on the `AllocDB` project
-- the current `M9` focus is to finish the authoritative lease-centric docs freeze across
-  `semantics.md`, `api.md`, `architecture.md`, and `fault-model.md` before opening code-bearing
-  implementation slices
+- `M9-T01` through `M9-T05` are now merged on `main` via PR `#81`, and the corresponding planning
+  issues are closed on the `AllocDB` project
+- the immediate maintainability follow-up is issue `#70`: keep `allocdb-jepsen` thin and
+  bin-local by moving remaining bulk, including the binary test module, out of
+  `allocdb-jepsen.rs`
+- the next `M9` implementation slice after `#70` is `M9-T06`: atomic bundle commit in the trusted
+  core, followed by fencing, revoke, persistence, replication, and regression coverage
