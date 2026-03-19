@@ -195,9 +195,9 @@
   - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
 ## Current Focus
-- PR `#82` merged the `#70` maintainability follow-up, and the closing evidence included the live
-  KubeVirt `reservation_contention-control` and full `1800s`
-  `reservation_contention-crash-restart` reruns on `allocdb-a` with `blockers=0`
+- PR `#82` merged the `#70` maintainability follow-up, including live KubeVirt
+  `reservation_contention-control` and full `1800s` `reservation_contention-crash-restart`
+  reruns on `allocdb-a` with `blockers=0`
 - `M9-T01` through `M9-T05` are merged on `main` via PR `#81`, and the planning issues are closed
   on the `AllocDB` project
 - PR `#89` merged `M9-T06` on `main`: the trusted core now supports atomic bundle reservation,
@@ -208,13 +208,13 @@
   surfaces expose the current authority token for active reservations
 - PR `#92` merged `M9-T08` on `main`: the trusted core now has explicit `revoke` / `reclaim`
   commands, `revoking` and `revoked` states, and deterministic duplicate/recovery handling
-- issue `#86` / `M9-T09` is the active implementation slice on the current branch: the node API
-  and wire codec now expose the approved lease-centric surface with `get_lease`, flattened
-  committed results, `current_lease_id`, and ordered `member_resource_ids`, while keeping the
-  trusted-core naming and apply path intact
-- targeted validation on the active `#86` branch currently includes
-  `cargo test -p allocdb-node api -- --nocapture`
-- the active `#86` branch keeps the `T09` / `T10` boundary explicit: it finishes the lease
-  transport/read/recovery surface without adding new replication or view-change behavior
-- the next planned code-bearing slices after `#86` remain `M9-T10` replication preservation and
-  `M9-T11` broader regression coverage
+- PR `#93` merged `M9-T09` on `main`: the node API and wire codec now expose the approved
+  lease-centric surface with `get_lease`, flattened committed results, `current_lease_id`, and
+  ordered `member_resource_ids`, while keeping the trusted-core naming and apply path intact
+- issue `#87` / `M9-T10` is the active implementation slice on the current branch: preserve
+  bundle ownership, fencing outcomes, and revoke safety across replication, failover, and replica
+  rejoin without introducing a second apply path
+- targeted validation on the active `#87` branch currently centers on `cargo test -p allocdb-node replicated_simulation -- --nocapture`,
+  `cargo test -p allocdb-node replica -- --nocapture`, and `./scripts/preflight.sh`
+- the active `#87` branch keeps the `T10` / `T11` boundary explicit: it proves replicated-path preservation for the approved lease primitives, while broader scenario expansion stays in `M9-T11`
+- the next planned code-bearing slice after `#87` remains `M9-T11` broader regression coverage
