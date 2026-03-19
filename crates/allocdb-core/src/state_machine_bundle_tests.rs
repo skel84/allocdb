@@ -58,6 +58,7 @@ fn reserve_bundle_acquires_all_resources_atomically() {
 
     assert_eq!(outcome.result_code, ResultCode::Ok);
     assert_eq!(outcome.reservation_id, Some(ReservationId(3)));
+    assert_eq!(outcome.lease_epoch, Some(1));
     assert_eq!(outcome.deadline_slot, Some(Slot(9)));
     assert_eq!(db.reservations.len(), 1);
     assert_eq!(db.reservation_members.len(), 2);
@@ -79,6 +80,7 @@ fn reserve_bundle_acquires_all_resources_atomically() {
     );
 
     let reservation = db.reservation(ReservationId(3), Slot(5)).unwrap();
+    assert_eq!(reservation.lease_epoch, 1);
     assert_eq!(reservation.member_count, 2);
     assert_eq!(reservation.resource_id, ResourceId(11));
     for resource_id in [ResourceId(11), ResourceId(12)] {
@@ -349,11 +351,13 @@ fn confirm_and_release_update_every_bundle_member() {
             command: Command::Confirm {
                 reservation_id: ReservationId(3),
                 holder_id: HolderId(1),
+                lease_epoch: 1,
             },
         },
     );
     assert_eq!(confirmed.result_code, ResultCode::Ok);
     let reservation = db.reservation(ReservationId(3), Slot(5)).unwrap();
+    assert_eq!(reservation.lease_epoch, 1);
     assert_eq!(reservation.state, ReservationState::Confirmed);
     assert_eq!(reservation.holder_id, HolderId(1));
     assert_eq!(reservation.member_count, 2);
@@ -371,6 +375,7 @@ fn confirm_and_release_update_every_bundle_member() {
             command: Command::Release {
                 reservation_id: ReservationId(3),
                 holder_id: HolderId(1),
+                lease_epoch: 1,
             },
         },
     );
@@ -383,6 +388,12 @@ fn confirm_and_release_update_every_bundle_member() {
     assert_eq!(
         db.reservation(ReservationId(3), Slot(5)).unwrap().state,
         ReservationState::Released
+    );
+    assert_eq!(
+        db.reservation(ReservationId(3), Slot(5))
+            .unwrap()
+            .lease_epoch,
+        2
     );
 }
 
@@ -423,5 +434,11 @@ fn expire_releases_every_bundle_member() {
     assert_eq!(
         db.reservation(ReservationId(3), Slot(5)).unwrap().state,
         ReservationState::Expired
+    );
+    assert_eq!(
+        db.reservation(ReservationId(3), Slot(5))
+            .unwrap()
+            .lease_epoch,
+        2
     );
 }

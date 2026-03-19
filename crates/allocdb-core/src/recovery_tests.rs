@@ -133,6 +133,7 @@ fn recover_allocdb_skips_frames_covered_by_snapshot() {
         command: Command::Confirm {
             reservation_id: ReservationId(2),
             holder_id: HolderId(5),
+            lease_epoch: 1,
         },
     };
 

@@ -79,13 +79,14 @@ fn stale_confirm_cannot_confirm_a_newer_reservation() {
             command: Command::Confirm {
                 reservation_id: ReservationId(2),
                 holder_id: HolderId(1),
+                lease_epoch: 1,
             },
         },
     );
 
     assert!(matches!(
         stale_confirm.result_code,
-        ResultCode::InvalidState | ResultCode::ReservationRetired
+        ResultCode::StaleEpoch | ResultCode::ReservationRetired
     ));
     assert_eq!(
         db.resource(ResourceId(11)).unwrap().current_reservation_id,

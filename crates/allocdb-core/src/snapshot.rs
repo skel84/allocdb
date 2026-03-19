@@ -18,7 +18,7 @@ mod issue_30_tests;
 mod tests;
 
 const MAGIC: u32 = 0x4144_4253;
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {

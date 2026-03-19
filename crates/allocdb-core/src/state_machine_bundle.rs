@@ -8,6 +8,8 @@ use crate::state_machine::{
 };
 
 impl AllocDb {
+    const INITIAL_LEASE_EPOCH: u64 = 1;
+
     pub(super) fn apply_reserve_bundle(
         &mut self,
         context: CommandContext,
@@ -39,6 +41,7 @@ impl AllocDb {
             reservation_id,
             resource_id: resource_ids[0],
             holder_id,
+            lease_epoch: Self::INITIAL_LEASE_EPOCH,
             state: ReservationState::Reserved,
             created_lsn: context.lsn,
             deadline_slot,
@@ -64,12 +67,18 @@ impl AllocDb {
         }
 
         debug!(
-            "reserved bundle reservation_id={} bundle_len={} deadline_slot={}",
+            "reserved bundle reservation_id={} lease_epoch={} bundle_len={} deadline_slot={}",
             reservation_id.get(),
+            Self::INITIAL_LEASE_EPOCH,
             resource_ids.len(),
             deadline_slot.get()
         );
-        CommandOutcome::with_reservation(ResultCode::Ok, reservation_id, deadline_slot)
+        CommandOutcome::with_reservation_epoch(
+            ResultCode::Ok,
+            reservation_id,
+            Self::INITIAL_LEASE_EPOCH,
+            deadline_slot,
+        )
     }
 
     fn reserve_bundle_precheck(

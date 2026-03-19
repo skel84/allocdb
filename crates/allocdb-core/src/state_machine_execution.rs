@@ -42,6 +42,7 @@ impl AllocDb {
                 return CommandOutcome {
                     result_code: record.result_code,
                     reservation_id: record.result_reservation_id,
+                    lease_epoch: record.result_lease_epoch,
                     deadline_slot: record.result_deadline_slot,
                 };
             } else {
@@ -72,6 +73,7 @@ impl AllocDb {
             command_fingerprint: fingerprint,
             result_code: outcome.result_code,
             result_reservation_id: outcome.reservation_id,
+            result_lease_epoch: outcome.lease_epoch,
             result_deadline_slot: outcome.deadline_slot,
             applied_lsn: context.lsn,
             retire_after_slot: operation_retire_after_slot,

@@ -137,6 +137,7 @@ fn expired_reservation_maps_to_released_read_state() {
         reservation_id: ReservationId(11),
         resource_id: ResourceId(22),
         holder_id: HolderId(33),
+        lease_epoch: 2,
         state: ReservationState::Expired,
         created_lsn: Lsn(1),
         deadline_slot: Slot(9),

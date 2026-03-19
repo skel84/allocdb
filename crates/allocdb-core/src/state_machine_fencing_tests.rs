@@ -1,7 +1,8 @@
 use crate::command::{ClientRequest, Command, CommandContext};
 use crate::config::Config;
 use crate::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
-use crate::state_machine::{AllocDb, ReservationLookupError, ReservationState};
+use crate::result::ResultCode;
+use crate::state_machine::{AllocDb, ReservationState, ResourceState};
 
 fn config() -> Config {
     Config {
@@ -35,7 +36,7 @@ fn create(resource_id: u128) -> ClientRequest {
 }
 
 #[test]
-fn retired_reservation_lookup_survives_unrelated_later_write() {
+fn confirm_rejects_stale_epoch_without_mutating_state() {
     let mut db = AllocDb::new(config()).unwrap();
     db.apply_client(context(1, 1), create(11));
     db.apply_client(
@@ -50,34 +51,43 @@ fn retired_reservation_lookup_survives_unrelated_later_write() {
             },
         },
     );
-    db.apply_client(
+
+    let stale = db.apply_client(
         context(3, 2),
         ClientRequest {
             operation_id: OperationId(3),
             client_id: ClientId(7),
-            command: Command::Release {
+            command: Command::Confirm {
                 reservation_id: ReservationId(2),
                 holder_id: HolderId(1),
-                lease_epoch: 1,
+                lease_epoch: 2,
             },
         },
     );
 
+    assert_eq!(stale.result_code, ResultCode::StaleEpoch);
     assert_eq!(
-        db.reservation(ReservationId(2), Slot(6)).unwrap().state,
-        ReservationState::Released
+        db.reservation(ReservationId(2), Slot(5)).unwrap().state,
+        ReservationState::Reserved
     );
-
-    db.apply_client(context(4, 7), create(12));
-
     assert_eq!(
-        db.reservation(ReservationId(2), Slot(7)),
-        Err(ReservationLookupError::Retired)
+        db.reservation(ReservationId(2), Slot(5))
+            .unwrap()
+            .lease_epoch,
+        1
+    );
+    assert_eq!(
+        db.resource(ResourceId(11)).unwrap().current_state,
+        ResourceState::Reserved
+    );
+    assert_eq!(
+        db.resource(ResourceId(11)).unwrap().current_reservation_id,
+        Some(ReservationId(2))
     );
 }
 
 #[test]
-fn reservation_lookup_keeps_unknown_future_ids_not_found() {
+fn confirm_reuse_of_operation_id_with_different_epoch_is_conflict() {
     let mut db = AllocDb::new(config()).unwrap();
     db.apply_client(context(1, 1), create(11));
     db.apply_client(
@@ -92,31 +102,38 @@ fn reservation_lookup_keeps_unknown_future_ids_not_found() {
             },
         },
     );
-    db.apply_client(
+
+    let first = db.apply_client(
         context(3, 2),
         ClientRequest {
             operation_id: OperationId(3),
             client_id: ClientId(7),
-            command: Command::Release {
+            command: Command::Confirm {
                 reservation_id: ReservationId(2),
                 holder_id: HolderId(1),
                 lease_epoch: 1,
             },
         },
     );
-    db.apply_client(context(4, 7), create(12));
-
-    assert_eq!(
-        db.reservation(ReservationId(99), Slot(7)),
-        Err(ReservationLookupError::NotFound)
+    let conflicting = db.apply_client(
+        context(4, 2),
+        ClientRequest {
+            operation_id: OperationId(3),
+            client_id: ClientId(7),
+            command: Command::Confirm {
+                reservation_id: ReservationId(2),
+                holder_id: HolderId(1),
+                lease_epoch: 2,
+            },
+        },
     );
+
+    assert_eq!(first.result_code, ResultCode::Ok);
+    assert_eq!(conflicting.result_code, ResultCode::OperationConflict);
 }
 
 #[test]
-fn reservation_lookup_conservatively_marks_older_ids_retired() {
-    // IDs below the retired watermark are conservatively reported as Retired,
-    // even if they were never actually created. This bounds memory usage while
-    // preserving the "never flips to NotFound after Retired" guarantee.
+fn release_rejects_stale_epoch_without_mutating_state() {
     let mut db = AllocDb::new(config()).unwrap();
     db.apply_client(context(1, 1), create(11));
     db.apply_client(
@@ -131,7 +148,8 @@ fn reservation_lookup_conservatively_marks_older_ids_retired() {
             },
         },
     );
-    db.apply_client(
+
+    let stale = db.apply_client(
         context(3, 2),
         ClientRequest {
             operation_id: OperationId(3),
@@ -139,14 +157,24 @@ fn reservation_lookup_conservatively_marks_older_ids_retired() {
             command: Command::Release {
                 reservation_id: ReservationId(2),
                 holder_id: HolderId(1),
-                lease_epoch: 1,
+                lease_epoch: 2,
             },
         },
     );
-    db.apply_client(context(4, 7), create(12));
 
+    assert_eq!(stale.result_code, ResultCode::StaleEpoch);
     assert_eq!(
-        db.reservation(ReservationId(1), Slot(7)),
-        Err(ReservationLookupError::Retired)
+        db.reservation(ReservationId(2), Slot(5)).unwrap().state,
+        ReservationState::Reserved
+    );
+    assert_eq!(
+        db.reservation(ReservationId(2), Slot(5))
+            .unwrap()
+            .lease_epoch,
+        1
+    );
+    assert_eq!(
+        db.resource(ResourceId(11)).unwrap().current_state,
+        ResourceState::Reserved
     );
 }

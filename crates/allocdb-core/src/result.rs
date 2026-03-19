@@ -19,6 +19,7 @@ pub enum ResultCode {
     OperationConflict,
     InvalidState,
     HolderMismatch,
+    StaleEpoch,
     SlotOverflow,
 }
 
@@ -26,6 +27,7 @@ pub enum ResultCode {
 pub struct CommandOutcome {
     pub result_code: ResultCode,
     pub reservation_id: Option<ReservationId>,
+    pub lease_epoch: Option<u64>,
     pub deadline_slot: Option<Slot>,
 }
 
@@ -35,6 +37,7 @@ impl CommandOutcome {
         Self {
             result_code,
             reservation_id: None,
+            lease_epoch: None,
             deadline_slot: None,
         }
     }
@@ -48,6 +51,22 @@ impl CommandOutcome {
         Self {
             result_code,
             reservation_id: Some(reservation_id),
+            lease_epoch: None,
+            deadline_slot: Some(deadline_slot),
+        }
+    }
+
+    #[must_use]
+    pub const fn with_reservation_epoch(
+        result_code: ResultCode,
+        reservation_id: ReservationId,
+        lease_epoch: u64,
+        deadline_slot: Slot,
+    ) -> Self {
+        Self {
+            result_code,
+            reservation_id: Some(reservation_id),
+            lease_epoch: Some(lease_epoch),
             deadline_slot: Some(deadline_slot),
         }
     }

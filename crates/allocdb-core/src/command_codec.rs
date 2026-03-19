@@ -92,18 +92,22 @@ fn encode_command(bytes: &mut Vec<u8>, command: &Command) {
         Command::Confirm {
             reservation_id,
             holder_id,
+            lease_epoch,
         } => {
             bytes.push(4);
             bytes.extend_from_slice(&reservation_id.get().to_le_bytes());
             bytes.extend_from_slice(&holder_id.get().to_le_bytes());
+            bytes.extend_from_slice(&lease_epoch.to_le_bytes());
         }
         Command::Release {
             reservation_id,
             holder_id,
+            lease_epoch,
         } => {
             bytes.push(5);
             bytes.extend_from_slice(&reservation_id.get().to_le_bytes());
             bytes.extend_from_slice(&holder_id.get().to_le_bytes());
+            bytes.extend_from_slice(&lease_epoch.to_le_bytes());
         }
         Command::Expire {
             reservation_id,
@@ -142,10 +146,12 @@ fn decode_command(cursor: &mut Cursor<'_>) -> Result<Command, CommandCodecError>
         4 => Ok(Command::Confirm {
             reservation_id: ReservationId(cursor.read_u128()?),
             holder_id: HolderId(cursor.read_u128()?),
+            lease_epoch: decode_optional_legacy_epoch(cursor)?,
         }),
         5 => Ok(Command::Release {
             reservation_id: ReservationId(cursor.read_u128()?),
             holder_id: HolderId(cursor.read_u128()?),
+            lease_epoch: decode_optional_legacy_epoch(cursor)?,
         }),
         6 => Ok(Command::Expire {
             reservation_id: ReservationId(cursor.read_u128()?),
@@ -198,6 +204,18 @@ impl<'a> Cursor<'a> {
 
     fn read_u128(&mut self) -> Result<u128, CommandCodecError> {
         Ok(u128::from_le_bytes(self.read_exact::<16>()?))
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+}
+
+fn decode_optional_legacy_epoch(cursor: &mut Cursor<'_>) -> Result<u64, CommandCodecError> {
+    match cursor.remaining() {
+        0 => Ok(1),
+        8 => cursor.read_u64(),
+        _ => Err(CommandCodecError::InvalidLayout),
     }
 }
 
@@ -252,6 +270,59 @@ mod tests {
 
         let decoded = decode_client_request(&encode_client_request(&request)).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn holder_commands_round_trip_with_lease_epoch() {
+        let requests = [
+            ClientRequest {
+                operation_id: OperationId(11),
+                client_id: ClientId(12),
+                command: Command::Confirm {
+                    reservation_id: ReservationId(13),
+                    holder_id: HolderId(14),
+                    lease_epoch: 15,
+                },
+            },
+            ClientRequest {
+                operation_id: OperationId(21),
+                client_id: ClientId(22),
+                command: Command::Release {
+                    reservation_id: ReservationId(23),
+                    holder_id: HolderId(24),
+                    lease_epoch: 25,
+                },
+            },
+        ];
+
+        for request in requests {
+            let decoded = decode_client_request(&encode_client_request(&request)).unwrap();
+            assert_eq!(decoded, request);
+        }
+    }
+
+    #[test]
+    fn decoder_accepts_legacy_holder_command_without_lease_epoch() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&OperationId(11).get().to_le_bytes());
+        bytes.extend_from_slice(&ClientId(12).get().to_le_bytes());
+        bytes.push(4);
+        bytes.extend_from_slice(&ReservationId(13).get().to_le_bytes());
+        bytes.extend_from_slice(&HolderId(14).get().to_le_bytes());
+
+        let decoded = decode_client_request(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            ClientRequest {
+                operation_id: OperationId(11),
+                client_id: ClientId(12),
+                command: Command::Confirm {
+                    reservation_id: ReservationId(13),
+                    holder_id: HolderId(14),
+                    lease_epoch: 1,
+                },
+            }
+        );
     }
 
     #[test]

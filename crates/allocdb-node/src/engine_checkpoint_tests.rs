@@ -71,6 +71,7 @@ fn confirm(reservation_id: u128, operation_id: u128, holder_id: u128) -> ClientR
         command: Command::Confirm {
             reservation_id: ReservationId(reservation_id),
             holder_id: HolderId(holder_id),
+            lease_epoch: 1,
         },
     }
 }
