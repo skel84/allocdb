@@ -21,6 +21,7 @@ fn core_config() -> Config {
         shard_id: 0,
         max_resources: 8,
         max_reservations: 8,
+        max_bundle_size: 1,
         max_operations: 16,
         max_ttl_slots: 16,
         max_client_retry_window_slots: 8,
@@ -185,7 +186,7 @@ fn setup_recovery_harness(
     harness.checkpoint().unwrap();
     for (slot, request) in replay_requests {
         harness.advance_to(*slot);
-        harness.submit(*request).unwrap();
+        harness.submit(request.clone()).unwrap();
     }
     harness
 }

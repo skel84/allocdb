@@ -1,7 +1,8 @@
 use crate::ids::{HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use crate::result::ResultCode;
 use crate::state_machine::{
-    OperationRecord, ReservationRecord, ReservationState, ResourceRecord, ResourceState,
+    OperationRecord, ReservationMemberRecord, ReservationRecord, ReservationState, ResourceRecord,
+    ResourceState,
 };
 
 use crate::snapshot::cursor::Cursor;
@@ -24,6 +25,11 @@ pub(super) fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
     encode_u32(
         &mut bytes,
         u32::try_from(snapshot.reservations.len()).expect("reservation count must fit u32"),
+    );
+    encode_u32(
+        &mut bytes,
+        u32::try_from(snapshot.reservation_members.len())
+            .expect("reservation member count must fit u32"),
     );
     encode_u32(
         &mut bytes,
@@ -53,6 +59,13 @@ pub(super) fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
         bytes.extend_from_slice(&reservation.deadline_slot.get().to_le_bytes());
         encode_optional_u64(&mut bytes, reservation.released_lsn.map(Lsn::get));
         encode_optional_u64(&mut bytes, reservation.retire_after_slot.map(Slot::get));
+        bytes.extend_from_slice(&reservation.member_count.to_le_bytes());
+    }
+
+    for reservation_member in &snapshot.reservation_members {
+        bytes.extend_from_slice(&reservation_member.reservation_id.get().to_le_bytes());
+        bytes.extend_from_slice(&reservation_member.resource_id.get().to_le_bytes());
+        bytes.extend_from_slice(&reservation_member.member_index.to_le_bytes());
     }
 
     for operation in &snapshot.operations {
@@ -90,25 +103,20 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, SnapshotError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != 1 && version != VERSION {
+    if version != 1 && version != 2 && version != VERSION {
         return Err(SnapshotError::InvalidVersion(version));
     }
 
-    let last_applied_lsn = cursor.read_optional_u64()?.map(Lsn);
-    let last_request_slot = cursor.read_optional_u64()?.map(Slot);
-    let max_retired_reservation_id = if version == 1 {
-        None
-    } else {
-        cursor.read_optional_u128()?.map(ReservationId)
-    };
-    let resource_count =
-        usize::try_from(cursor.read_u32()?).map_err(|_| SnapshotError::CountTooLarge)?;
-    let reservation_count =
-        usize::try_from(cursor.read_u32()?).map_err(|_| SnapshotError::CountTooLarge)?;
-    let operation_count =
-        usize::try_from(cursor.read_u32()?).map_err(|_| SnapshotError::CountTooLarge)?;
-    let wheel_len =
-        usize::try_from(cursor.read_u32()?).map_err(|_| SnapshotError::CountTooLarge)?;
+    let (
+        last_applied_lsn,
+        last_request_slot,
+        max_retired_reservation_id,
+        resource_count,
+        reservation_count,
+        reservation_member_count,
+        operation_count,
+        wheel_len,
+    ) = decode_snapshot_header(&mut cursor, version)?;
 
     let mut resources = Vec::with_capacity(resource_count);
     for _ in 0..resource_count {
@@ -120,19 +128,13 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, SnapshotError> {
         });
     }
 
-    let mut reservations = Vec::with_capacity(reservation_count);
-    for _ in 0..reservation_count {
-        reservations.push(ReservationRecord {
-            reservation_id: ReservationId(cursor.read_u128()?),
-            resource_id: ResourceId(cursor.read_u128()?),
-            holder_id: HolderId(cursor.read_u128()?),
-            state: decode_reservation_state(cursor.read_u8()?)?,
-            created_lsn: Lsn(cursor.read_u64()?),
-            deadline_slot: Slot(cursor.read_u64()?),
-            released_lsn: cursor.read_optional_u64()?.map(Lsn),
-            retire_after_slot: cursor.read_optional_u64()?.map(Slot),
-        });
-    }
+    let reservations = decode_snapshot_reservations(&mut cursor, reservation_count, version)?;
+    let reservation_members = decode_snapshot_reservation_members(
+        &mut cursor,
+        version,
+        reservation_member_count,
+        &reservations,
+    )?;
 
     let mut operations = Vec::with_capacity(operation_count);
     for _ in 0..operation_count {
@@ -168,9 +170,113 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, SnapshotError> {
         max_retired_reservation_id,
         resources,
         reservations,
+        reservation_members,
         operations,
         wheel,
     })
+}
+
+type SnapshotHeader = (
+    Option<Lsn>,
+    Option<Slot>,
+    Option<ReservationId>,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+);
+
+fn decode_snapshot_header(
+    cursor: &mut Cursor<'_>,
+    version: u16,
+) -> Result<SnapshotHeader, SnapshotError> {
+    let last_applied_lsn = cursor.read_optional_u64()?.map(Lsn);
+    let last_request_slot = cursor.read_optional_u64()?.map(Slot);
+    let max_retired_reservation_id = if version == 1 {
+        None
+    } else {
+        cursor.read_optional_u128()?.map(ReservationId)
+    };
+    let resource_count =
+        usize::try_from(cursor.read_u32()?).map_err(|_| SnapshotError::CountTooLarge)?;
+    let reservation_count =
+        usize::try_from(cursor.read_u32()?).map_err(|_| SnapshotError::CountTooLarge)?;
+    let reservation_member_count = if version >= 3 {
+        usize::try_from(cursor.read_u32()?).map_err(|_| SnapshotError::CountTooLarge)?
+    } else {
+        0
+    };
+    let operation_count =
+        usize::try_from(cursor.read_u32()?).map_err(|_| SnapshotError::CountTooLarge)?;
+    let wheel_len =
+        usize::try_from(cursor.read_u32()?).map_err(|_| SnapshotError::CountTooLarge)?;
+
+    Ok((
+        last_applied_lsn,
+        last_request_slot,
+        max_retired_reservation_id,
+        resource_count,
+        reservation_count,
+        reservation_member_count,
+        operation_count,
+        wheel_len,
+    ))
+}
+
+fn decode_snapshot_reservations(
+    cursor: &mut Cursor<'_>,
+    reservation_count: usize,
+    version: u16,
+) -> Result<Vec<ReservationRecord>, SnapshotError> {
+    let mut reservations = Vec::with_capacity(reservation_count);
+    for _ in 0..reservation_count {
+        reservations.push(ReservationRecord {
+            reservation_id: ReservationId(cursor.read_u128()?),
+            resource_id: ResourceId(cursor.read_u128()?),
+            holder_id: HolderId(cursor.read_u128()?),
+            state: decode_reservation_state(cursor.read_u8()?)?,
+            created_lsn: Lsn(cursor.read_u64()?),
+            deadline_slot: Slot(cursor.read_u64()?),
+            released_lsn: cursor.read_optional_u64()?.map(Lsn),
+            retire_after_slot: cursor.read_optional_u64()?.map(Slot),
+            member_count: if version >= 3 { cursor.read_u32()? } else { 1 },
+        });
+    }
+
+    Ok(reservations)
+}
+
+fn decode_snapshot_reservation_members(
+    cursor: &mut Cursor<'_>,
+    version: u16,
+    reservation_member_count: usize,
+    reservations: &[ReservationRecord],
+) -> Result<Vec<ReservationMemberRecord>, SnapshotError> {
+    let mut reservation_members = Vec::with_capacity(if version >= 3 {
+        reservation_member_count
+    } else {
+        reservations.len()
+    });
+    if version >= 3 {
+        for _ in 0..reservation_member_count {
+            reservation_members.push(ReservationMemberRecord {
+                reservation_id: ReservationId(cursor.read_u128()?),
+                resource_id: ResourceId(cursor.read_u128()?),
+                member_index: cursor.read_u32()?,
+            });
+        }
+    } else {
+        for reservation in reservations {
+            reservation_members.push(ReservationMemberRecord {
+                reservation_id: reservation.reservation_id,
+                resource_id: reservation.resource_id,
+                member_index: 0,
+            });
+        }
+    }
+
+    Ok(reservation_members)
 }
 
 fn encode_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -241,16 +347,18 @@ fn decode_result_code(tag: u8) -> Result<ResultCode, SnapshotError> {
         3 => Ok(ResultCode::ResourceTableFull),
         4 => Ok(ResultCode::ResourceNotFound),
         5 => Ok(ResultCode::ResourceBusy),
-        6 => Ok(ResultCode::TtlOutOfRange),
-        7 => Ok(ResultCode::ReservationTableFull),
-        8 => Ok(ResultCode::ReservationNotFound),
-        9 => Ok(ResultCode::ReservationRetired),
-        10 => Ok(ResultCode::ExpirationIndexFull),
-        11 => Ok(ResultCode::OperationTableFull),
-        12 => Ok(ResultCode::OperationConflict),
-        13 => Ok(ResultCode::InvalidState),
-        14 => Ok(ResultCode::HolderMismatch),
-        15 => Ok(ResultCode::SlotOverflow),
+        6 => Ok(ResultCode::BundleTooLarge),
+        7 => Ok(ResultCode::TtlOutOfRange),
+        8 => Ok(ResultCode::ReservationTableFull),
+        9 => Ok(ResultCode::ReservationMemberTableFull),
+        10 => Ok(ResultCode::ReservationNotFound),
+        11 => Ok(ResultCode::ReservationRetired),
+        12 => Ok(ResultCode::ExpirationIndexFull),
+        13 => Ok(ResultCode::OperationTableFull),
+        14 => Ok(ResultCode::OperationConflict),
+        15 => Ok(ResultCode::InvalidState),
+        16 => Ok(ResultCode::HolderMismatch),
+        17 => Ok(ResultCode::SlotOverflow),
         _ => Err(SnapshotError::InvalidStateTag(tag)),
     }
 }
@@ -263,15 +371,17 @@ fn encode_result_code(code: ResultCode) -> u8 {
         ResultCode::ResourceTableFull => 3,
         ResultCode::ResourceNotFound => 4,
         ResultCode::ResourceBusy => 5,
-        ResultCode::TtlOutOfRange => 6,
-        ResultCode::ReservationTableFull => 7,
-        ResultCode::ReservationNotFound => 8,
-        ResultCode::ReservationRetired => 9,
-        ResultCode::ExpirationIndexFull => 10,
-        ResultCode::OperationTableFull => 11,
-        ResultCode::OperationConflict => 12,
-        ResultCode::InvalidState => 13,
-        ResultCode::HolderMismatch => 14,
-        ResultCode::SlotOverflow => 15,
+        ResultCode::BundleTooLarge => 6,
+        ResultCode::TtlOutOfRange => 7,
+        ResultCode::ReservationTableFull => 8,
+        ResultCode::ReservationMemberTableFull => 9,
+        ResultCode::ReservationNotFound => 10,
+        ResultCode::ReservationRetired => 11,
+        ResultCode::ExpirationIndexFull => 12,
+        ResultCode::OperationTableFull => 13,
+        ResultCode::OperationConflict => 14,
+        ResultCode::InvalidState => 15,
+        ResultCode::HolderMismatch => 16,
+        ResultCode::SlotOverflow => 17,
     }
 }

@@ -6,20 +6,31 @@ pub struct CommandContext {
     pub request_slot: Slot,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientRequest {
     pub operation_id: OperationId,
     pub client_id: ClientId,
     pub command: Command,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+impl AsRef<ClientRequest> for ClientRequest {
+    fn as_ref(&self) -> &ClientRequest {
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     CreateResource {
         resource_id: ResourceId,
     },
     Reserve {
         resource_id: ResourceId,
+        holder_id: HolderId,
+        ttl_slots: u64,
+    },
+    ReserveBundle {
+        resource_ids: Vec<ResourceId>,
         holder_id: HolderId,
         ttl_slots: u64,
     },
@@ -37,9 +48,20 @@ pub enum Command {
     },
 }
 
+impl AsRef<Command> for Command {
+    fn as_ref(&self) -> &Command {
+        self
+    }
+}
+
 impl Command {
     #[must_use]
-    pub fn fingerprint(self) -> u128 {
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the in-memory bundle length cannot fit into `u128`, which cannot happen on
+    /// supported targets because slice lengths are already bounded by `usize`.
+    pub fn fingerprint(&self) -> u128 {
         let mut state = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58du128;
 
         match self {
@@ -55,17 +77,25 @@ impl Command {
                 state = mix(state, 2);
                 state = mix(state, resource_id.get());
                 state = mix(state, holder_id.get());
-                mix(state, u128::from(ttl_slots))
+                mix(state, u128::from(*ttl_slots))
             }
-            Self::Confirm {
-                reservation_id,
+            Self::ReserveBundle {
+                resource_ids,
                 holder_id,
+                ttl_slots,
             } => {
                 state = mix(state, 3);
-                state = mix(state, reservation_id.get());
-                mix(state, holder_id.get())
+                state = mix(
+                    state,
+                    u128::try_from(resource_ids.len()).expect("bundle len must fit u128"),
+                );
+                for resource_id in resource_ids {
+                    state = mix(state, resource_id.get());
+                }
+                state = mix(state, holder_id.get());
+                mix(state, u128::from(*ttl_slots))
             }
-            Self::Release {
+            Self::Confirm {
                 reservation_id,
                 holder_id,
             } => {
@@ -73,11 +103,19 @@ impl Command {
                 state = mix(state, reservation_id.get());
                 mix(state, holder_id.get())
             }
+            Self::Release {
+                reservation_id,
+                holder_id,
+            } => {
+                state = mix(state, 5);
+                state = mix(state, reservation_id.get());
+                mix(state, holder_id.get())
+            }
             Self::Expire {
                 reservation_id,
                 deadline_slot,
             } => {
-                state = mix(state, 5);
+                state = mix(state, 6);
                 state = mix(state, reservation_id.get());
                 mix(state, u128::from(deadline_slot.get()))
             }

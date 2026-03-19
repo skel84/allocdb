@@ -4,9 +4,7 @@ use crate::command::CommandContext;
 use crate::ids::{HolderId, ReservationId, ResourceId, Slot};
 use crate::result::{CommandOutcome, ResultCode};
 
-use crate::state_machine::{
-    AllocDb, ReservationRecord, ReservationState, ResourceRecord, ResourceState,
-};
+use crate::state_machine::{AllocDb, ReservationState, ResourceRecord, ResourceState};
 
 impl AllocDb {
     pub(super) fn apply_create_resource(&mut self, resource_id: ResourceId) -> CommandOutcome {
@@ -42,79 +40,7 @@ impl AllocDb {
         holder_id: HolderId,
         ttl_slots: u64,
     ) -> CommandOutcome {
-        if ttl_slots == 0 || ttl_slots > self.config.max_ttl_slots {
-            warn!(
-                "reserve rejected ttl_out_of_range resource_id={} ttl_slots={}",
-                resource_id.get(),
-                ttl_slots
-            );
-            return CommandOutcome::new(ResultCode::TtlOutOfRange);
-        }
-
-        let Some(resource) = self.resources.get(resource_id).copied() else {
-            warn!(
-                "reserve rejected resource_not_found resource_id={}",
-                resource_id.get()
-            );
-            return CommandOutcome::new(ResultCode::ResourceNotFound);
-        };
-
-        if resource.current_state != ResourceState::Available {
-            warn!(
-                "reserve rejected resource_busy resource_id={}",
-                resource_id.get()
-            );
-            return CommandOutcome::new(ResultCode::ResourceBusy);
-        }
-
-        if self.reservations.len()
-            == usize::try_from(self.config.max_reservations).expect("validated max_reservations")
-        {
-            warn!("reservation table is full");
-            return CommandOutcome::new(ResultCode::ReservationTableFull);
-        }
-
-        let reservation_id = self.reservation_id_from_lsn(context.lsn);
-        let deadline_slot = match Self::deadline_slot(context.request_slot, ttl_slots) {
-            Ok(deadline_slot) => deadline_slot,
-            Err(error) => return Self::slot_overflow_outcome("reserve", error),
-        };
-
-        if !self.schedule_expiration(reservation_id, deadline_slot) {
-            warn!(
-                "reserve rejected expiration_index_full resource_id={} deadline_slot={}",
-                resource_id.get(),
-                deadline_slot.get()
-            );
-            return CommandOutcome::new(ResultCode::ExpirationIndexFull);
-        }
-
-        self.insert_reservation(ReservationRecord {
-            reservation_id,
-            resource_id,
-            holder_id,
-            state: ReservationState::Reserved,
-            created_lsn: context.lsn,
-            deadline_slot,
-            released_lsn: None,
-            retire_after_slot: None,
-        });
-
-        let resource = self
-            .resources
-            .get_mut(resource_id)
-            .expect("existing resource must stay present");
-        resource.current_state = ResourceState::Reserved;
-        resource.current_reservation_id = Some(reservation_id);
-        resource.version += 1;
-
-        debug!(
-            "reserved resource_id={} reservation_id={} deadline_slot={}",
-            resource_id.get(),
-            reservation_id.get(),
-            deadline_slot.get()
-        );
-        CommandOutcome::with_reservation(ResultCode::Ok, reservation_id, deadline_slot)
+        self.apply_reserve_bundle(context, &[resource_id], holder_id, ttl_slots)
     }
 
     pub(super) fn apply_confirm(
@@ -159,7 +85,7 @@ impl AllocDb {
 
         assert!(
             self.resources.contains_key(reservation.resource_id),
-            "active reservation must reference an existing resource"
+            "active reservation anchor must reference an existing resource"
         );
 
         let removed = self.unschedule_expiration(reservation_id, reservation.deadline_slot);
@@ -173,14 +99,19 @@ impl AllocDb {
             .get_mut(reservation_id)
             .expect("reservation must stay present across confirm");
         reservation.state = ReservationState::Confirmed;
-        let resource_id = reservation.resource_id;
+        let member_count = reservation.member_count;
 
-        let resource = self
-            .resources
-            .get_mut(resource_id)
-            .expect("resource must stay present across confirm");
-        resource.current_state = ResourceState::Confirmed;
-        resource.version += 1;
+        for member_index in 0..member_count {
+            let member = self
+                .reservation_member(reservation_id, member_index)
+                .expect("reservation member must stay present across confirm");
+            let resource = self
+                .resources
+                .get_mut(member.resource_id)
+                .expect("resource must stay present across confirm");
+            resource.current_state = ResourceState::Confirmed;
+            resource.version += 1;
+        }
 
         debug!("confirmed reservation_id={}", reservation_id.get());
         CommandOutcome::new(ResultCode::Ok)
@@ -254,15 +185,20 @@ impl AllocDb {
         reservation.released_lsn = Some(context.lsn);
         reservation.retire_after_slot = Some(retire_after_slot);
         let queued_reservation_id = reservation.reservation_id;
-        let resource_id = reservation.resource_id;
+        let member_count = reservation.member_count;
 
-        let resource = self
-            .resources
-            .get_mut(resource_id)
-            .expect("resource must stay present across release");
-        resource.current_state = ResourceState::Available;
-        resource.current_reservation_id = None;
-        resource.version += 1;
+        for member_index in 0..member_count {
+            let member = self
+                .reservation_member(reservation_id, member_index)
+                .expect("reservation member must stay present across release");
+            let resource = self
+                .resources
+                .get_mut(member.resource_id)
+                .expect("resource must stay present across release");
+            resource.current_state = ResourceState::Available;
+            resource.current_reservation_id = None;
+            resource.version += 1;
+        }
 
         self.push_reservation_retirement(queued_reservation_id, retire_after_slot);
         debug!("released reservation_id={}", reservation_id.get());
@@ -331,15 +267,20 @@ impl AllocDb {
         reservation.released_lsn = Some(context.lsn);
         reservation.retire_after_slot = Some(retire_after_slot);
         let queued_reservation_id = reservation.reservation_id;
-        let resource_id = reservation.resource_id;
+        let member_count = reservation.member_count;
 
-        let resource = self
-            .resources
-            .get_mut(resource_id)
-            .expect("resource must stay present across expire");
-        resource.current_state = ResourceState::Available;
-        resource.current_reservation_id = None;
-        resource.version += 1;
+        for member_index in 0..member_count {
+            let member = self
+                .reservation_member(reservation_id, member_index)
+                .expect("reservation member must stay present across expire");
+            let resource = self
+                .resources
+                .get_mut(member.resource_id)
+                .expect("resource must stay present across expire");
+            resource.current_state = ResourceState::Available;
+            resource.current_reservation_id = None;
+            resource.version += 1;
+        }
 
         self.push_reservation_retirement(queued_reservation_id, retire_after_slot);
         debug!("expired reservation_id={}", reservation_id.get());

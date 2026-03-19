@@ -11,6 +11,7 @@ fn config() -> Config {
         shard_id: 0,
         max_resources: 8,
         max_reservations: 8,
+        max_bundle_size: 1,
         max_operations: 16,
         max_ttl_slots: 16,
         max_client_retry_window_slots: 8,
@@ -40,6 +41,7 @@ fn expired_reservation(reservation_id: u128) -> ReservationRecord {
         deadline_slot: Slot(5),
         released_lsn: Some(Lsn(reservation_lsn + 1)),
         retire_after_slot: Some(Slot(7)),
+        member_count: 1,
     }
 }
 
@@ -57,12 +59,22 @@ fn operation_record(operation_id: u128) -> OperationRecord {
     }
 }
 
-#[test]
-fn from_snapshot_rejects_duplicate_resource_ids() {
-    let snapshot = Snapshot {
+fn empty_snapshot() -> Snapshot {
+    Snapshot {
         last_applied_lsn: None,
         last_request_slot: None,
         max_retired_reservation_id: None,
+        resources: Vec::new(),
+        reservations: Vec::new(),
+        reservation_members: Vec::new(),
+        operations: Vec::new(),
+        wheel: vec![Vec::new(); config().wheel_len()],
+    }
+}
+
+#[test]
+fn from_snapshot_rejects_duplicate_resource_ids() {
+    let snapshot = Snapshot {
         resources: vec![
             available_resource(11),
             ResourceRecord {
@@ -70,9 +82,7 @@ fn from_snapshot_rejects_duplicate_resource_ids() {
                 ..available_resource(11)
             },
         ],
-        reservations: Vec::new(),
-        operations: Vec::new(),
-        wheel: vec![Vec::new(); config().wheel_len()],
+        ..empty_snapshot()
     };
 
     let restored = AllocDb::from_snapshot(config(), snapshot);
@@ -85,15 +95,10 @@ fn from_snapshot_rejects_duplicate_resource_ids() {
 #[test]
 fn from_snapshot_rejects_resource_table_over_capacity() {
     let snapshot = Snapshot {
-        last_applied_lsn: None,
-        last_request_slot: None,
-        max_retired_reservation_id: None,
         resources: (0..=config().max_resources)
             .map(|offset| available_resource(u128::from(offset) + 1))
             .collect(),
-        reservations: Vec::new(),
-        operations: Vec::new(),
-        wheel: vec![Vec::new(); config().wheel_len()],
+        ..empty_snapshot()
     };
 
     let restored = AllocDb::from_snapshot(config(), snapshot);
@@ -106,18 +111,13 @@ fn from_snapshot_rejects_resource_table_over_capacity() {
 #[test]
 fn from_snapshot_rejects_missing_active_reservation_reference() {
     let snapshot = Snapshot {
-        last_applied_lsn: None,
-        last_request_slot: None,
-        max_retired_reservation_id: None,
         resources: vec![ResourceRecord {
             resource_id: ResourceId(11),
             current_state: ResourceState::Reserved,
             current_reservation_id: Some(ReservationId(77)),
             version: 1,
         }],
-        reservations: Vec::new(),
-        operations: Vec::new(),
-        wheel: vec![Vec::new(); config().wheel_len()],
+        ..empty_snapshot()
     };
 
     let restored = AllocDb::from_snapshot(config(), snapshot);
@@ -135,9 +135,6 @@ fn from_snapshot_rejects_missing_active_reservation_reference() {
 #[test]
 fn from_snapshot_rejects_terminal_reservation_without_retirement() {
     let snapshot = Snapshot {
-        last_applied_lsn: None,
-        last_request_slot: None,
-        max_retired_reservation_id: None,
         resources: vec![ResourceRecord {
             version: 2,
             ..available_resource(11)
@@ -146,8 +143,7 @@ fn from_snapshot_rejects_terminal_reservation_without_retirement() {
             retire_after_slot: None,
             ..expired_reservation(2)
         }],
-        operations: Vec::new(),
-        wheel: vec![Vec::new(); config().wheel_len()],
+        ..empty_snapshot()
     };
 
     let restored = AllocDb::from_snapshot(config(), snapshot);
@@ -165,9 +161,6 @@ fn from_snapshot_rejects_terminal_reservation_without_retirement() {
 #[test]
 fn from_snapshot_rejects_duplicate_reservation_ids() {
     let snapshot = Snapshot {
-        last_applied_lsn: None,
-        last_request_slot: None,
-        max_retired_reservation_id: None,
         resources: vec![available_resource(11)],
         reservations: vec![
             expired_reservation(2),
@@ -176,8 +169,7 @@ fn from_snapshot_rejects_duplicate_reservation_ids() {
                 ..expired_reservation(2)
             },
         ],
-        operations: Vec::new(),
-        wheel: vec![Vec::new(); config().wheel_len()],
+        ..empty_snapshot()
     };
 
     let restored = AllocDb::from_snapshot(config(), snapshot);
@@ -190,15 +182,11 @@ fn from_snapshot_rejects_duplicate_reservation_ids() {
 #[test]
 fn from_snapshot_rejects_reservation_table_over_capacity() {
     let snapshot = Snapshot {
-        last_applied_lsn: None,
-        last_request_slot: None,
-        max_retired_reservation_id: None,
         resources: vec![available_resource(11)],
         reservations: (0..=config().max_reservations)
             .map(|offset| expired_reservation(u128::from(offset) + 1))
             .collect(),
-        operations: Vec::new(),
-        wheel: vec![Vec::new(); config().wheel_len()],
+        ..empty_snapshot()
     };
 
     let restored = AllocDb::from_snapshot(config(), snapshot);
@@ -211,11 +199,6 @@ fn from_snapshot_rejects_reservation_table_over_capacity() {
 #[test]
 fn from_snapshot_rejects_duplicate_operation_ids() {
     let snapshot = Snapshot {
-        last_applied_lsn: None,
-        last_request_slot: None,
-        max_retired_reservation_id: None,
-        resources: Vec::new(),
-        reservations: Vec::new(),
         operations: vec![
             operation_record(4),
             OperationRecord {
@@ -223,7 +206,7 @@ fn from_snapshot_rejects_duplicate_operation_ids() {
                 ..operation_record(4)
             },
         ],
-        wheel: vec![Vec::new(); config().wheel_len()],
+        ..empty_snapshot()
     };
 
     let restored = AllocDb::from_snapshot(config(), snapshot);
@@ -236,15 +219,10 @@ fn from_snapshot_rejects_duplicate_operation_ids() {
 #[test]
 fn from_snapshot_rejects_operation_table_over_capacity() {
     let snapshot = Snapshot {
-        last_applied_lsn: None,
-        last_request_slot: None,
-        max_retired_reservation_id: None,
-        resources: Vec::new(),
-        reservations: Vec::new(),
         operations: (0..=config().max_operations)
             .map(|offset| operation_record(u128::from(offset) + 1))
             .collect(),
-        wheel: vec![Vec::new(); config().wheel_len()],
+        ..empty_snapshot()
     };
 
     let restored = AllocDb::from_snapshot(config(), snapshot);
@@ -259,11 +237,7 @@ fn from_snapshot_rejects_inconsistent_progress_watermarks() {
     let snapshot = Snapshot {
         last_applied_lsn: Some(Lsn(3)),
         last_request_slot: None,
-        max_retired_reservation_id: None,
-        resources: Vec::new(),
-        reservations: Vec::new(),
-        operations: Vec::new(),
-        wheel: vec![Vec::new(); config().wheel_len()],
+        ..empty_snapshot()
     };
 
     let restored = AllocDb::from_snapshot(config(), snapshot);

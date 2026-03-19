@@ -26,6 +26,7 @@ fn config() -> Config {
         shard_id: 0,
         max_resources: 8,
         max_reservations: 8,
+        max_bundle_size: 1,
         max_operations: 16,
         max_ttl_slots: 16,
         max_client_retry_window_slots: 8,
@@ -34,7 +35,7 @@ fn config() -> Config {
     }
 }
 
-fn client_frame(lsn: u64, request_slot: u64, request: ClientRequest) -> Frame {
+fn client_frame(lsn: u64, request_slot: u64, request: &ClientRequest) -> Frame {
     Frame {
         lsn: Lsn(lsn),
         request_slot: Slot(request_slot),
@@ -55,7 +56,7 @@ fn recover_allocdb_rejects_client_slot_overflow_in_replayed_wal() {
     wal.append_frame(&client_frame(
         1,
         request_slot,
-        ClientRequest {
+        &ClientRequest {
             operation_id: OperationId(1),
             client_id: ClientId(7),
             command: Command::CreateResource {

@@ -4,10 +4,14 @@ use crate::fixed_map::{FixedMap, FixedMapError};
 use crate::ids::{HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use crate::result::{CommandOutcome, ResultCode};
 use crate::retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
-use log::warn;
 
 #[path = "state_machine_apply.rs"]
 mod apply;
+#[path = "state_machine_bundle.rs"]
+mod bundle;
+#[cfg(test)]
+#[path = "state_machine_bundle_tests.rs"]
+mod bundle_tests;
 #[path = "state_machine_execution.rs"]
 mod execution;
 #[path = "state_machine_invariants.rs"]
@@ -21,17 +25,25 @@ mod issue_32_tests;
 #[cfg(test)]
 #[path = "state_machine_issue_33_tests.rs"]
 mod issue_33_tests;
+#[path = "state_machine_members.rs"]
+mod members;
 #[path = "state_machine_metrics.rs"]
 mod metrics;
 #[cfg(test)]
 #[path = "state_machine_observe_tests.rs"]
 mod observe_tests;
+#[path = "state_machine_reservation_invariants.rs"]
+mod reservation_invariants;
 #[path = "state_machine_retire.rs"]
 mod retire;
+#[path = "state_machine_slots.rs"]
+mod slots;
 #[cfg(test)]
 #[path = "state_machine_tests.rs"]
 mod tests;
 pub use invariants::AllocDbInvariantError;
+pub(crate) use members::ReservationMemberKey;
+pub use members::ReservationMemberRecord;
 pub use metrics::HealthMetrics;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +79,7 @@ pub struct ReservationRecord {
     pub deadline_slot: Slot,
     pub released_lsn: Option<Lsn>,
     pub retire_after_slot: Option<Slot>,
+    pub member_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +118,7 @@ pub struct AllocDb {
     pub(crate) config: Config,
     pub(crate) resources: FixedMap<ResourceId, ResourceRecord>,
     pub(crate) reservations: FixedMap<ReservationId, ReservationRecord>,
+    pub(crate) reservation_members: FixedMap<ReservationMemberKey, ReservationMemberRecord>,
     pub(crate) operations: FixedMap<OperationId, OperationRecord>,
     pub(crate) max_retired_reservation_id: Option<ReservationId>,
     pub(crate) reservation_retire_queue: RetireQueue<ReservationId>,
@@ -144,6 +158,7 @@ impl AllocDb {
                 usize::try_from(config.max_reservations)
                     .expect("validated max_reservations must fit usize"),
             ),
+            reservation_members: FixedMap::with_capacity(config.max_reservation_members()),
             operations: FixedMap::with_capacity(
                 usize::try_from(config.max_operations)
                     .expect("validated max_operations must fit usize"),
@@ -172,6 +187,11 @@ impl AllocDb {
                 holder_id,
                 ttl_slots,
             } => self.apply_reserve(context, resource_id, holder_id, ttl_slots),
+            Command::ReserveBundle {
+                resource_ids,
+                holder_id,
+                ttl_slots,
+            } => self.apply_reserve_bundle(context, &resource_ids, holder_id, ttl_slots),
             Command::Confirm {
                 reservation_id,
                 holder_id,
@@ -203,7 +223,7 @@ impl AllocDb {
     pub fn validate_client_request_slot(
         &self,
         request_slot: Slot,
-        command: Command,
+        command: &Command,
     ) -> Result<(), SlotOverflowError> {
         self.validate_command_slot(request_slot, command)?;
         let _ = self.operation_retire_after_slot(request_slot)?;
@@ -217,38 +237,9 @@ impl AllocDb {
     pub fn validate_internal_request_slot(
         &self,
         request_slot: Slot,
-        command: Command,
+        command: &Command,
     ) -> Result<(), SlotOverflowError> {
         self.validate_command_slot(request_slot, command)
-    }
-
-    pub(crate) fn deadline_slot(
-        request_slot: Slot,
-        ttl_slots: u64,
-    ) -> Result<Slot, SlotOverflowError> {
-        Self::checked_slot_add(request_slot, ttl_slots, SlotOverflowKind::Deadline)
-    }
-
-    pub(crate) fn reservation_retire_after_slot(
-        &self,
-        request_slot: Slot,
-    ) -> Result<Slot, SlotOverflowError> {
-        Self::checked_slot_add(
-            request_slot,
-            self.config.reservation_history_window_slots,
-            SlotOverflowKind::ReservationHistory,
-        )
-    }
-
-    pub(crate) fn operation_retire_after_slot(
-        &self,
-        request_slot: Slot,
-    ) -> Result<Slot, SlotOverflowError> {
-        Self::checked_slot_add(
-            request_slot,
-            self.config.operation_window_slots(),
-            SlotOverflowKind::OperationWindow,
-        )
     }
 
     fn wheel_bucket_index(&self, slot: Slot) -> usize {
@@ -369,51 +360,5 @@ impl AllocDb {
         }
 
         reservation_id <= max_retired_reservation_id
-    }
-
-    pub(crate) fn slot_overflow_outcome(
-        operation: &'static str,
-        error: SlotOverflowError,
-    ) -> CommandOutcome {
-        warn!(
-            "{operation} rejected slot_overflow kind={:?} request_slot={} delta={}",
-            error.kind,
-            error.request_slot.get(),
-            error.delta,
-        );
-        CommandOutcome::new(ResultCode::SlotOverflow)
-    }
-
-    fn validate_command_slot(
-        &self,
-        request_slot: Slot,
-        command: Command,
-    ) -> Result<(), SlotOverflowError> {
-        match command {
-            Command::Reserve { ttl_slots, .. } => {
-                let _ = Self::deadline_slot(request_slot, ttl_slots)?;
-            }
-            Command::Release { .. } | Command::Expire { .. } => {
-                let _ = self.reservation_retire_after_slot(request_slot)?;
-            }
-            Command::CreateResource { .. } | Command::Confirm { .. } => {}
-        }
-        Ok(())
-    }
-
-    fn checked_slot_add(
-        request_slot: Slot,
-        delta: u64,
-        kind: SlotOverflowKind,
-    ) -> Result<Slot, SlotOverflowError> {
-        request_slot
-            .get()
-            .checked_add(delta)
-            .map(Slot)
-            .ok_or(SlotOverflowError {
-                kind,
-                request_slot,
-                delta,
-            })
     }
 }

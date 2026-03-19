@@ -9,11 +9,12 @@ pub enum CommandCodecError {
 }
 
 #[must_use]
-pub fn encode_client_request(request: ClientRequest) -> Vec<u8> {
+pub fn encode_client_request(request: impl AsRef<ClientRequest>) -> Vec<u8> {
+    let request = request.as_ref();
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&request.operation_id.get().to_le_bytes());
     bytes.extend_from_slice(&request.client_id.get().to_le_bytes());
-    encode_command(&mut bytes, request.command);
+    encode_command(&mut bytes, &request.command);
     bytes
 }
 
@@ -36,7 +37,8 @@ pub fn decode_client_request(bytes: &[u8]) -> Result<ClientRequest, CommandCodec
 }
 
 #[must_use]
-pub fn encode_internal_command(command: Command) -> Vec<u8> {
+pub fn encode_internal_command(command: impl AsRef<Command>) -> Vec<u8> {
+    let command = command.as_ref();
     let mut bytes = Vec::new();
     encode_command(&mut bytes, command);
     bytes
@@ -54,7 +56,7 @@ pub fn decode_internal_command(bytes: &[u8]) -> Result<Command, CommandCodecErro
     Ok(command)
 }
 
-fn encode_command(bytes: &mut Vec<u8>, command: Command) {
+fn encode_command(bytes: &mut Vec<u8>, command: &Command) {
     match command {
         Command::CreateResource { resource_id } => {
             bytes.push(1);
@@ -70,15 +72,24 @@ fn encode_command(bytes: &mut Vec<u8>, command: Command) {
             bytes.extend_from_slice(&holder_id.get().to_le_bytes());
             bytes.extend_from_slice(&ttl_slots.to_le_bytes());
         }
-        Command::Confirm {
-            reservation_id,
+        Command::ReserveBundle {
+            resource_ids,
             holder_id,
+            ttl_slots,
         } => {
             bytes.push(3);
-            bytes.extend_from_slice(&reservation_id.get().to_le_bytes());
+            bytes.extend_from_slice(
+                &u32::try_from(resource_ids.len())
+                    .expect("bundle len must fit u32")
+                    .to_le_bytes(),
+            );
+            for resource_id in resource_ids {
+                bytes.extend_from_slice(&resource_id.get().to_le_bytes());
+            }
             bytes.extend_from_slice(&holder_id.get().to_le_bytes());
+            bytes.extend_from_slice(&ttl_slots.to_le_bytes());
         }
-        Command::Release {
+        Command::Confirm {
             reservation_id,
             holder_id,
         } => {
@@ -86,11 +97,19 @@ fn encode_command(bytes: &mut Vec<u8>, command: Command) {
             bytes.extend_from_slice(&reservation_id.get().to_le_bytes());
             bytes.extend_from_slice(&holder_id.get().to_le_bytes());
         }
+        Command::Release {
+            reservation_id,
+            holder_id,
+        } => {
+            bytes.push(5);
+            bytes.extend_from_slice(&reservation_id.get().to_le_bytes());
+            bytes.extend_from_slice(&holder_id.get().to_le_bytes());
+        }
         Command::Expire {
             reservation_id,
             deadline_slot,
         } => {
-            bytes.push(5);
+            bytes.push(6);
             bytes.extend_from_slice(&reservation_id.get().to_le_bytes());
             bytes.extend_from_slice(&deadline_slot.get().to_le_bytes());
         }
@@ -107,15 +126,28 @@ fn decode_command(cursor: &mut Cursor<'_>) -> Result<Command, CommandCodecError>
             holder_id: HolderId(cursor.read_u128()?),
             ttl_slots: cursor.read_u64()?,
         }),
-        3 => Ok(Command::Confirm {
+        3 => {
+            let resource_count = usize::try_from(cursor.read_u32()?)
+                .map_err(|_| CommandCodecError::InvalidLayout)?;
+            let mut resource_ids = Vec::with_capacity(resource_count);
+            for _ in 0..resource_count {
+                resource_ids.push(ResourceId(cursor.read_u128()?));
+            }
+            Ok(Command::ReserveBundle {
+                resource_ids,
+                holder_id: HolderId(cursor.read_u128()?),
+                ttl_slots: cursor.read_u64()?,
+            })
+        }
+        4 => Ok(Command::Confirm {
             reservation_id: ReservationId(cursor.read_u128()?),
             holder_id: HolderId(cursor.read_u128()?),
         }),
-        4 => Ok(Command::Release {
+        5 => Ok(Command::Release {
             reservation_id: ReservationId(cursor.read_u128()?),
             holder_id: HolderId(cursor.read_u128()?),
         }),
-        5 => Ok(Command::Expire {
+        6 => Ok(Command::Expire {
             reservation_id: ReservationId(cursor.read_u128()?),
             deadline_slot: Slot(cursor.read_u64()?),
         }),
@@ -160,6 +192,10 @@ impl<'a> Cursor<'a> {
         Ok(u64::from_le_bytes(self.read_exact::<8>()?))
     }
 
+    fn read_u32(&mut self) -> Result<u32, CommandCodecError> {
+        Ok(u32::from_le_bytes(self.read_exact::<4>()?))
+    }
+
     fn read_u128(&mut self) -> Result<u128, CommandCodecError> {
         Ok(u128::from_le_bytes(self.read_exact::<16>()?))
     }
@@ -187,7 +223,7 @@ mod tests {
             },
         };
 
-        let decoded = decode_client_request(&encode_client_request(request)).unwrap();
+        let decoded = decode_client_request(&encode_client_request(&request)).unwrap();
         assert_eq!(decoded, request);
     }
 
@@ -198,8 +234,24 @@ mod tests {
             deadline_slot: Slot(42),
         };
 
-        let decoded = decode_internal_command(&encode_internal_command(command)).unwrap();
+        let decoded = decode_internal_command(&encode_internal_command(&command)).unwrap();
         assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn reserve_bundle_round_trips() {
+        let request = ClientRequest {
+            operation_id: OperationId(11),
+            client_id: ClientId(12),
+            command: Command::ReserveBundle {
+                resource_ids: vec![ResourceId(13), ResourceId(14)],
+                holder_id: HolderId(15),
+                ttl_slots: 16,
+            },
+        };
+
+        let decoded = decode_client_request(&encode_client_request(&request)).unwrap();
+        assert_eq!(decoded, request);
     }
 
     #[test]
@@ -211,7 +263,7 @@ mod tests {
                 resource_id: ResourceId(3),
             },
         };
-        let mut bytes = encode_client_request(request);
+        let mut bytes = encode_client_request(&request);
         bytes.pop();
 
         assert_eq!(

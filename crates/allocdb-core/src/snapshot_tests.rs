@@ -10,6 +10,7 @@ fn config() -> Config {
         shard_id: 0,
         max_resources: 8,
         max_reservations: 8,
+        max_bundle_size: 1,
         max_operations: 16,
         max_ttl_slots: 16,
         max_client_retry_window_slots: 8,
@@ -22,6 +23,19 @@ fn context(lsn: u64, request_slot: u64) -> CommandContext {
     CommandContext {
         lsn: Lsn(lsn),
         request_slot: Slot(request_slot),
+    }
+}
+
+fn empty_snapshot() -> Snapshot {
+    Snapshot {
+        last_applied_lsn: None,
+        last_request_slot: None,
+        max_retired_reservation_id: None,
+        resources: Vec::new(),
+        reservations: Vec::new(),
+        reservation_members: Vec::new(),
+        operations: Vec::new(),
+        wheel: vec![Vec::new(); config().wheel_len()],
     }
 }
 
@@ -60,17 +74,54 @@ fn snapshot_round_trips_allocator_state() {
 }
 
 #[test]
+fn snapshot_round_trips_bundle_state() {
+    let mut config = config();
+    config.max_bundle_size = 2;
+    let mut db = AllocDb::new(config.clone()).unwrap();
+    db.apply_client(
+        context(1, 1),
+        ClientRequest {
+            operation_id: OperationId(1),
+            client_id: ClientId(7),
+            command: Command::CreateResource {
+                resource_id: ResourceId(11),
+            },
+        },
+    );
+    db.apply_client(
+        context(2, 1),
+        ClientRequest {
+            operation_id: OperationId(2),
+            client_id: ClientId(7),
+            command: Command::CreateResource {
+                resource_id: ResourceId(12),
+            },
+        },
+    );
+    db.apply_client(
+        context(3, 2),
+        ClientRequest {
+            operation_id: OperationId(3),
+            client_id: ClientId(7),
+            command: Command::ReserveBundle {
+                resource_ids: vec![ResourceId(11), ResourceId(12)],
+                holder_id: HolderId(5),
+                ttl_slots: 3,
+            },
+        },
+    );
+
+    let snapshot = db.snapshot();
+    let encoded = snapshot.encode();
+    let decoded = Snapshot::decode(&encoded).unwrap();
+    let restored = AllocDb::from_snapshot(config, decoded).unwrap();
+
+    assert_eq!(restored.snapshot(), snapshot);
+}
+
+#[test]
 fn snapshot_decode_rejects_corruption() {
-    let mut bytes = Snapshot {
-        last_applied_lsn: None,
-        last_request_slot: None,
-        max_retired_reservation_id: None,
-        resources: Vec::new(),
-        reservations: Vec::new(),
-        operations: Vec::new(),
-        wheel: vec![Vec::new(); config().wheel_len()],
-    }
-    .encode();
+    let mut bytes = empty_snapshot().encode();
     bytes[0] = 0;
 
     assert!(matches!(
@@ -82,13 +133,8 @@ fn snapshot_decode_rejects_corruption() {
 #[test]
 fn from_snapshot_rejects_wheel_size_mismatch() {
     let snapshot = Snapshot {
-        last_applied_lsn: None,
-        last_request_slot: None,
-        max_retired_reservation_id: None,
-        resources: Vec::new(),
-        reservations: Vec::new(),
-        operations: Vec::new(),
         wheel: vec![Vec::new(); 1],
+        ..empty_snapshot()
     };
 
     let restored = AllocDb::from_snapshot(config(), snapshot);
@@ -160,41 +206,19 @@ fn snapshot_restores_retired_lookup_watermark() {
 #[test]
 fn snapshot_decode_accepts_legacy_v1_layout() {
     let snapshots = [
-        Snapshot {
-            last_applied_lsn: None,
-            last_request_slot: None,
-            max_retired_reservation_id: None,
-            resources: Vec::new(),
-            reservations: Vec::new(),
-            operations: Vec::new(),
-            wheel: vec![Vec::new(); config().wheel_len()],
-        },
+        Snapshot { ..empty_snapshot() },
         Snapshot {
             last_applied_lsn: Some(Lsn(7)),
-            last_request_slot: None,
-            max_retired_reservation_id: None,
-            resources: Vec::new(),
-            reservations: Vec::new(),
-            operations: Vec::new(),
-            wheel: vec![Vec::new(); config().wheel_len()],
+            ..empty_snapshot()
         },
         Snapshot {
-            last_applied_lsn: None,
             last_request_slot: Some(Slot(11)),
-            max_retired_reservation_id: None,
-            resources: Vec::new(),
-            reservations: Vec::new(),
-            operations: Vec::new(),
-            wheel: vec![Vec::new(); config().wheel_len()],
+            ..empty_snapshot()
         },
         Snapshot {
             last_applied_lsn: Some(Lsn(7)),
             last_request_slot: Some(Slot(11)),
-            max_retired_reservation_id: None,
-            resources: Vec::new(),
-            reservations: Vec::new(),
-            operations: Vec::new(),
-            wheel: vec![Vec::new(); config().wheel_len()],
+            ..empty_snapshot()
         },
     ];
 
@@ -205,6 +229,8 @@ fn snapshot_decode_accepts_legacy_v1_layout() {
             + encoded_optional_u64_len(snapshot.last_applied_lsn.map(Lsn::get))
             + encoded_optional_u64_len(snapshot.last_request_slot.map(Slot::get));
         bytes.remove(removal_index);
+        let reservation_member_count_index = removal_index + 8;
+        bytes.drain(reservation_member_count_index..reservation_member_count_index + 4);
 
         assert_eq!(Snapshot::decode(&bytes).unwrap(), snapshot);
     }
@@ -219,9 +245,6 @@ fn snapshot_round_trips_slot_overflow_operation_result() {
     let snapshot = Snapshot {
         last_applied_lsn: Some(Lsn(7)),
         last_request_slot: Some(Slot(9)),
-        max_retired_reservation_id: None,
-        resources: Vec::new(),
-        reservations: Vec::new(),
         operations: vec![OperationRecord {
             operation_id: OperationId(1),
             command_fingerprint: 42,
@@ -231,7 +254,7 @@ fn snapshot_round_trips_slot_overflow_operation_result() {
             applied_lsn: Lsn(7),
             retire_after_slot: Slot(12),
         }],
-        wheel: vec![Vec::new(); config().wheel_len()],
+        ..empty_snapshot()
     };
 
     let encoded = snapshot.encode();

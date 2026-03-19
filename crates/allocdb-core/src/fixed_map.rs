@@ -270,7 +270,7 @@ impl<K: FixedKey, V> FixedMap<K, V> {
     }
 }
 
-fn hash_u128(value: u128) -> u64 {
+pub(crate) fn hash_u128(value: u128) -> u64 {
     let bytes = value.to_le_bytes();
     let lower = u64::from_le_bytes(bytes[..8].try_into().expect("slice has exact size"));
     let upper = u64::from_le_bytes(bytes[8..].try_into().expect("slice has exact size"));

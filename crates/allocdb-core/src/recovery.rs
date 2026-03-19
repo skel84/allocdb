@@ -257,7 +257,7 @@ where
             RecordType::ClientCommand => {
                 let request = decode_client_request(&frame.payload)?;
                 validate_replay_slot_math(
-                    db.validate_client_request_slot(frame.request_slot, request.command),
+                    db.validate_client_request_slot(frame.request_slot, &request.command),
                     frame.lsn,
                 )?;
                 db.apply_client(context, request);
@@ -274,7 +274,7 @@ where
             RecordType::InternalCommand => {
                 let command = decode_internal_command(&frame.payload)?;
                 validate_replay_slot_math(
-                    db.validate_internal_request_slot(frame.request_slot, command),
+                    db.validate_internal_request_slot(frame.request_slot, &command),
                     frame.lsn,
                 )?;
                 db.apply_internal(context, command);

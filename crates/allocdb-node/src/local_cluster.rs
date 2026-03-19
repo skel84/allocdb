@@ -459,6 +459,7 @@ pub fn default_local_cluster_core_config() -> Config {
         shard_id: 0,
         max_resources: 1_024,
         max_reservations: 1_024,
+        max_bundle_size: 1,
         max_operations: 4_096,
         max_ttl_slots: 256,
         max_client_retry_window_slots: 128,
@@ -1016,6 +1017,10 @@ fn encode_layout(layout: &LocalClusterLayout) -> String {
             "core.max_reservations={}",
             layout.core_config.max_reservations
         ),
+        format!(
+            "core.max_bundle_size={}",
+            layout.core_config.max_bundle_size
+        ),
         format!("core.max_operations={}", layout.core_config.max_operations),
         format!("core.max_ttl_slots={}", layout.core_config.max_ttl_slots),
         format!(
@@ -1091,6 +1096,7 @@ fn decode_layout(bytes: &str) -> Result<LocalClusterLayout, LocalClusterLayoutEr
         shard_id: parse_required_u64(&fields, "core.shard_id")?,
         max_resources: parse_required_u32(&fields, "core.max_resources")?,
         max_reservations: parse_required_u32(&fields, "core.max_reservations")?,
+        max_bundle_size: parse_required_u32(&fields, "core.max_bundle_size")?,
         max_operations: parse_required_u32(&fields, "core.max_operations")?,
         max_ttl_slots: parse_required_u64(&fields, "core.max_ttl_slots")?,
         max_client_retry_window_slots: parse_required_u64(

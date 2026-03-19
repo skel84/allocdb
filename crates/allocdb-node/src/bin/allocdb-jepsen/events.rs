@@ -677,6 +677,7 @@ mod tests {
                         shard_id: 1,
                         max_resources: 64,
                         max_reservations: 64,
+                        max_bundle_size: 1,
                         max_operations: 256,
                         max_ttl_slots: 64,
                         max_client_retry_window_slots: 64,
