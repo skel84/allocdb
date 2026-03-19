@@ -24,6 +24,7 @@ pub enum JepsenWorkloadFamily {
     AmbiguousWriteRetry,
     FailoverReadFences,
     ExpirationAndRecovery,
+    LeaseSafety,
 }
 
 impl JepsenWorkloadFamily {
@@ -34,6 +35,7 @@ impl JepsenWorkloadFamily {
             Self::AmbiguousWriteRetry => "ambiguous_write_retry",
             Self::FailoverReadFences => "failover_read_fences",
             Self::ExpirationAndRecovery => "expiration_and_recovery",
+            Self::LeaseSafety => "lease_safety",
         }
     }
 
@@ -49,6 +51,7 @@ impl JepsenWorkloadFamily {
             "ambiguous_write_retry" => Ok(Self::AmbiguousWriteRetry),
             "failover_read_fences" => Ok(Self::FailoverReadFences),
             "expiration_and_recovery" => Ok(Self::ExpirationAndRecovery),
+            "lease_safety" => Ok(Self::LeaseSafety),
             other => Err(JepsenCodecError::InvalidField {
                 field: String::from("workload"),
                 value: String::from(other),
@@ -153,11 +156,41 @@ pub fn release_gate_plan() -> Vec<JepsenRunSpec> {
     runs
 }
 
+#[must_use]
+pub fn lease_coverage_plan() -> Vec<JepsenRunSpec> {
+    vec![
+        JepsenRunSpec {
+            run_id: String::from("lease_safety-control"),
+            workload: JepsenWorkloadFamily::LeaseSafety,
+            nemesis: JepsenNemesisFamily::None,
+            minimum_fault_window_secs: None,
+            release_blocking: false,
+        },
+        JepsenRunSpec {
+            run_id: String::from("lease_safety-crash-restart"),
+            workload: JepsenWorkloadFamily::LeaseSafety,
+            nemesis: JepsenNemesisFamily::CrashRestart,
+            minimum_fault_window_secs: Some(30 * 60),
+            release_blocking: false,
+        },
+    ]
+}
+
+#[must_use]
+pub fn supported_run_plan() -> Vec<JepsenRunSpec> {
+    let mut runs = release_gate_plan();
+    runs.extend(lease_coverage_plan());
+    runs
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JepsenOperationKind {
     Reserve,
+    ReserveBundle,
     Confirm,
     Release,
+    Revoke,
+    Reclaim,
     TickExpirations,
     GetResource,
     GetReservation,
@@ -168,8 +201,11 @@ impl JepsenOperationKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Reserve => "reserve",
+            Self::ReserveBundle => "reserve_bundle",
             Self::Confirm => "confirm",
             Self::Release => "release",
+            Self::Revoke => "revoke",
+            Self::Reclaim => "reclaim",
             Self::TickExpirations => "tick_expirations",
             Self::GetResource => "get_resource",
             Self::GetReservation => "get_reservation",
@@ -185,8 +221,11 @@ impl JepsenOperationKind {
     pub fn parse(value: &str) -> Result<Self, JepsenCodecError> {
         match value {
             "reserve" => Ok(Self::Reserve),
+            "reserve_bundle" => Ok(Self::ReserveBundle),
             "confirm" => Ok(Self::Confirm),
             "release" => Ok(Self::Release),
+            "revoke" => Ok(Self::Revoke),
+            "reclaim" => Ok(Self::Reclaim),
             "tick_expirations" => Ok(Self::TickExpirations),
             "get_resource" => Ok(Self::GetResource),
             "get_reservation" => Ok(Self::GetReservation),
@@ -201,7 +240,13 @@ impl JepsenOperationKind {
     pub const fn is_mutating(self) -> bool {
         matches!(
             self,
-            Self::Reserve | Self::Confirm | Self::Release | Self::TickExpirations
+            Self::Reserve
+                | Self::ReserveBundle
+                | Self::Confirm
+                | Self::Release
+                | Self::Revoke
+                | Self::Reclaim
+                | Self::TickExpirations
         )
     }
 }
@@ -211,8 +256,10 @@ pub struct JepsenOperation {
     pub kind: JepsenOperationKind,
     pub operation_id: Option<u128>,
     pub resource_id: Option<ResourceId>,
+    pub resource_ids: Vec<ResourceId>,
     pub reservation_id: Option<u128>,
     pub holder_id: Option<u128>,
+    pub lease_epoch: Option<u64>,
     pub required_lsn: Option<Lsn>,
     pub request_slot: Option<Slot>,
     pub ttl_slots: Option<u64>,
@@ -267,12 +314,14 @@ impl JepsenOutcomeKind {
 pub enum JepsenWriteResult {
     Reserved {
         resource_id: ResourceId,
+        lease_epoch: u64,
         holder_id: u128,
         reservation_id: u128,
         expires_at_slot: Slot,
     },
     Confirmed {
         resource_id: ResourceId,
+        lease_epoch: u64,
         holder_id: u128,
         reservation_id: u128,
     },
@@ -281,6 +330,12 @@ pub enum JepsenWriteResult {
         holder_id: u128,
         reservation_id: u128,
         released_lsn: Option<Lsn>,
+    },
+    Revoked {
+        reservation_id: u128,
+    },
+    Reclaimed {
+        reservation_id: u128,
     },
     TickExpired {
         expired: Vec<JepsenExpiredReservation>,
@@ -294,6 +349,8 @@ impl JepsenWriteResult {
             Self::Reserved { .. } => "reserved",
             Self::Confirmed { .. } => "confirmed",
             Self::Released { .. } => "released",
+            Self::Revoked { .. } => "revoked",
+            Self::Reclaimed { .. } => "reclaimed",
             Self::TickExpired { .. } => "tick_expired",
         }
     }
@@ -418,6 +475,7 @@ pub struct JepsenSuccessfulRead {
 pub enum JepsenDefiniteFailure {
     Busy,
     Conflict,
+    StaleEpoch,
     NotFound,
     Retired,
     FenceNotApplied,
@@ -432,6 +490,7 @@ impl JepsenDefiniteFailure {
         match self {
             Self::Busy => "busy",
             Self::Conflict => "conflict",
+            Self::StaleEpoch => "stale_epoch",
             Self::NotFound => "not_found",
             Self::Retired => "retired",
             Self::FenceNotApplied => "fence_not_applied",
@@ -451,6 +510,7 @@ impl JepsenDefiniteFailure {
         match value {
             "busy" => Ok(Self::Busy),
             "conflict" => Ok(Self::Conflict),
+            "stale_epoch" => Ok(Self::StaleEpoch),
             "not_found" => Ok(Self::NotFound),
             "retired" => Ok(Self::Retired),
             "fence_not_applied" => Ok(Self::FenceNotApplied),
@@ -566,6 +626,12 @@ pub enum JepsenBlockingIssue {
         existing_operation_id: u128,
         conflicting_operation_id: u128,
     },
+    StaleHolderNotRejected {
+        reservation_id: u128,
+        operation_id: u128,
+        attempted_epoch: u64,
+        current_epoch: u64,
+    },
     StaleSuccessfulRead(JepsenReadViolation),
     EarlyExpirationRelease {
         resource_id: ResourceId,
@@ -633,12 +699,14 @@ impl fmt::Display for JepsenCodecError {
 
 impl std::error::Error for JepsenCodecError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedFingerprint {
     pub applied_lsn: Lsn,
     pub resource_id: Option<ResourceId>,
+    pub resource_ids: Vec<ResourceId>,
     pub reservation_id: Option<u128>,
     pub holder_id: Option<u128>,
+    pub lease_epoch: Option<u64>,
     pub released_lsn: Option<Lsn>,
     pub expires_at_slot: Option<Slot>,
 }
@@ -744,6 +812,7 @@ pub fn persist_artifact_manifest(
 pub fn analyze_history(events: &[JepsenHistoryEvent]) -> JepsenAnalysisReport {
     let (builders, committed, mut blockers) = collect_mutating_attempts(events);
     blockers.extend(check_successful_reads(events));
+    blockers.extend(check_stale_holder_rejection(events));
     blockers.extend(unresolved_ambiguity_blockers(&builders));
     blockers.extend(check_committed_release_blockers(committed));
     JepsenAnalysisReport {
@@ -839,51 +908,72 @@ fn encode_history_event(event: &JepsenHistoryEvent) -> String {
         format!("time_millis={}", event.time_millis),
         format!("operation={}", event.operation.kind.as_str()),
     ];
-    if let Some(operation_id) = event.operation.operation_id {
+    encode_operation_tokens(&event.operation, &mut tokens);
+    tokens.push(format!("outcome={}", event.outcome.kind().as_str()));
+    encode_outcome_tokens(&event.outcome, &mut tokens);
+    tokens.join(" ")
+}
+
+fn encode_operation_tokens(operation: &JepsenOperation, tokens: &mut Vec<String>) {
+    if let Some(operation_id) = operation.operation_id {
         tokens.push(format!("operation_id={operation_id}"));
     }
-    if let Some(resource_id) = event.operation.resource_id {
+    if let Some(resource_id) = operation.resource_id {
         tokens.push(format!("resource_id={}", resource_id.get()));
     }
-    if let Some(reservation_id) = event.operation.reservation_id {
+    if !operation.resource_ids.is_empty() {
+        tokens.push(format!(
+            "resource_ids={}",
+            encode_resource_ids(&operation.resource_ids)
+        ));
+    }
+    if let Some(reservation_id) = operation.reservation_id {
         tokens.push(format!("reservation_id={reservation_id}"));
     }
-    if let Some(holder_id) = event.operation.holder_id {
+    if let Some(holder_id) = operation.holder_id {
         tokens.push(format!("holder_id={holder_id}"));
     }
-    if let Some(required_lsn) = event.operation.required_lsn {
+    if let Some(lease_epoch) = operation.lease_epoch {
+        tokens.push(format!("lease_epoch={lease_epoch}"));
+    }
+    if let Some(required_lsn) = operation.required_lsn {
         tokens.push(format!("required_lsn={}", required_lsn.get()));
     }
-    if let Some(request_slot) = event.operation.request_slot {
+    if let Some(request_slot) = operation.request_slot {
         tokens.push(format!("request_slot={}", request_slot.get()));
     }
-    if let Some(ttl_slots) = event.operation.ttl_slots {
+    if let Some(ttl_slots) = operation.ttl_slots {
         tokens.push(format!("ttl_slots={ttl_slots}"));
     }
+}
 
-    tokens.push(format!("outcome={}", event.outcome.kind().as_str()));
-    match &event.outcome {
+fn encode_outcome_tokens(outcome: &JepsenEventOutcome, tokens: &mut Vec<String>) {
+    match outcome {
         JepsenEventOutcome::CommittedWrite(write) => {
             tokens.push(format!("applied_lsn={}", write.applied_lsn.get()));
             tokens.push(format!("write_result={}", write.result.as_str()));
             match &write.result {
                 JepsenWriteResult::Reserved {
                     reservation_id,
+                    lease_epoch,
                     holder_id,
                     expires_at_slot,
                     ..
                 } => {
                     tokens.push(format!("committed_reservation_id={reservation_id}"));
                     tokens.push(format!("committed_holder_id={holder_id}"));
+                    tokens.push(format!("committed_lease_epoch={lease_epoch}"));
                     tokens.push(format!("expires_at_slot={}", expires_at_slot.get()));
                 }
                 JepsenWriteResult::Confirmed {
                     reservation_id,
+                    lease_epoch,
                     holder_id,
                     ..
                 } => {
                     tokens.push(format!("committed_reservation_id={reservation_id}"));
                     tokens.push(format!("committed_holder_id={holder_id}"));
+                    tokens.push(format!("committed_lease_epoch={lease_epoch}"));
                 }
                 JepsenWriteResult::Released {
                     reservation_id,
@@ -897,6 +987,10 @@ fn encode_history_event(event: &JepsenHistoryEvent) -> String {
                         "released_lsn={}",
                         released_lsn.map_or(String::from("none"), |lsn| lsn.get().to_string())
                     ));
+                }
+                JepsenWriteResult::Revoked { reservation_id }
+                | JepsenWriteResult::Reclaimed { reservation_id } => {
+                    tokens.push(format!("committed_reservation_id={reservation_id}"));
                 }
                 JepsenWriteResult::TickExpired { expired } => {
                     tokens.push(format!("expired={}", encode_expired_reservations(expired)));
@@ -931,7 +1025,6 @@ fn encode_history_event(event: &JepsenHistoryEvent) -> String {
             tokens.push(format!("reason={}", reason.as_str()));
         }
     }
-    tokens.join(" ")
 }
 
 fn decode_history_event(
@@ -942,8 +1035,10 @@ fn decode_history_event(
         kind,
         operation_id: optional_u128_field(fields, "operation_id")?,
         resource_id: optional_resource_id_field(fields, "resource_id")?,
+        resource_ids: optional_resource_ids_field(fields, "resource_ids")?,
         reservation_id: optional_u128_field(fields, "reservation_id")?,
         holder_id: optional_u128_field(fields, "holder_id")?,
+        lease_epoch: optional_u64_field(fields, "lease_epoch")?,
         required_lsn: optional_lsn_field(fields, "required_lsn")?,
         request_slot: optional_slot_field(fields, "request_slot")?,
         ttl_slots: optional_u64_field(fields, "ttl_slots")?,
@@ -990,6 +1085,7 @@ fn decode_write_result(
             resource_id: operation
                 .resource_id
                 .ok_or_else(|| JepsenCodecError::MissingField(String::from("resource_id")))?,
+            lease_epoch: parse_required_u64(fields, "committed_lease_epoch")?,
             holder_id: parse_required_u128(fields, "committed_holder_id")?,
             reservation_id: parse_required_u128(fields, "committed_reservation_id")?,
             expires_at_slot: parse_required_slot(fields, "expires_at_slot")?,
@@ -998,6 +1094,7 @@ fn decode_write_result(
             resource_id: operation
                 .resource_id
                 .ok_or_else(|| JepsenCodecError::MissingField(String::from("resource_id")))?,
+            lease_epoch: parse_required_u64(fields, "committed_lease_epoch")?,
             holder_id: parse_required_u128(fields, "committed_holder_id")?,
             reservation_id: parse_required_u128(fields, "committed_reservation_id")?,
         }),
@@ -1008,6 +1105,12 @@ fn decode_write_result(
             holder_id: parse_required_u128(fields, "committed_holder_id")?,
             reservation_id: parse_required_u128(fields, "committed_reservation_id")?,
             released_lsn: optional_lsn_field(fields, "released_lsn")?,
+        }),
+        "revoked" => Ok(JepsenWriteResult::Revoked {
+            reservation_id: parse_required_u128(fields, "committed_reservation_id")?,
+        }),
+        "reclaimed" => Ok(JepsenWriteResult::Reclaimed {
+            reservation_id: parse_required_u128(fields, "committed_reservation_id")?,
         }),
         "tick_expired" => Ok(JepsenWriteResult::TickExpired {
             expired: decode_expired_reservations(required_field(fields, "expired")?)?,
@@ -1177,6 +1280,18 @@ fn optional_resource_id_field(
         .transpose()
 }
 
+fn optional_resource_ids_field(
+    fields: &BTreeMap<String, String>,
+    field: &str,
+) -> Result<Vec<ResourceId>, JepsenCodecError> {
+    fields.get(field).map_or(Ok(Vec::new()), |value| {
+        decode_resource_ids(value).map_err(|_| JepsenCodecError::InvalidField {
+            field: String::from(field),
+            value: value.clone(),
+        })
+    })
+}
+
 fn parse_optional_lsn(field: &str, value: &str) -> Result<Option<Lsn>, JepsenCodecError> {
     if value == "none" {
         return Ok(None);
@@ -1218,6 +1333,24 @@ fn encode_expired_reservations(expired: &[JepsenExpiredReservation]) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn encode_resource_ids(resource_ids: &[ResourceId]) -> String {
+    resource_ids
+        .iter()
+        .map(|resource_id| resource_id.get().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn decode_resource_ids(value: &str) -> Result<Vec<ResourceId>, std::num::ParseIntError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|entry| entry.parse::<u128>().map(ResourceId))
+        .collect()
 }
 
 fn decode_expired_reservations(
@@ -1450,26 +1583,32 @@ fn fingerprint_write(write: &JepsenCommittedWrite) -> CommittedFingerprint {
     match &write.result {
         JepsenWriteResult::Reserved {
             resource_id,
+            lease_epoch,
             holder_id,
             reservation_id,
             expires_at_slot,
         } => CommittedFingerprint {
             applied_lsn: write.applied_lsn,
             resource_id: Some(*resource_id),
+            resource_ids: Vec::new(),
             reservation_id: Some(*reservation_id),
             holder_id: Some(*holder_id),
+            lease_epoch: Some(*lease_epoch),
             released_lsn: None,
             expires_at_slot: Some(*expires_at_slot),
         },
         JepsenWriteResult::Confirmed {
             resource_id,
+            lease_epoch,
             holder_id,
             reservation_id,
         } => CommittedFingerprint {
             applied_lsn: write.applied_lsn,
             resource_id: Some(*resource_id),
+            resource_ids: Vec::new(),
             reservation_id: Some(*reservation_id),
             holder_id: Some(*holder_id),
+            lease_epoch: Some(*lease_epoch),
             released_lsn: None,
             expires_at_slot: None,
         },
@@ -1481,16 +1620,31 @@ fn fingerprint_write(write: &JepsenCommittedWrite) -> CommittedFingerprint {
         } => CommittedFingerprint {
             applied_lsn: write.applied_lsn,
             resource_id: Some(*resource_id),
+            resource_ids: Vec::new(),
             reservation_id: Some(*reservation_id),
             holder_id: Some(*holder_id),
+            lease_epoch: None,
             released_lsn: *released_lsn,
+            expires_at_slot: None,
+        },
+        JepsenWriteResult::Revoked { reservation_id }
+        | JepsenWriteResult::Reclaimed { reservation_id } => CommittedFingerprint {
+            applied_lsn: write.applied_lsn,
+            resource_id: None,
+            resource_ids: Vec::new(),
+            reservation_id: Some(*reservation_id),
+            holder_id: None,
+            lease_epoch: None,
+            released_lsn: None,
             expires_at_slot: None,
         },
         JepsenWriteResult::TickExpired { .. } => CommittedFingerprint {
             applied_lsn: write.applied_lsn,
             resource_id: None,
+            resource_ids: Vec::new(),
             reservation_id: None,
             holder_id: None,
+            lease_epoch: None,
             released_lsn: None,
             expires_at_slot: None,
         },
@@ -1524,6 +1678,14 @@ fn render_blocker(blocker: &JepsenBlockingIssue) -> String {
         } => format!(
             "blocker=double_allocation resource_id={} existing_operation_id={existing_operation_id} conflicting_operation_id={conflicting_operation_id}",
             resource_id.get()
+        ),
+        JepsenBlockingIssue::StaleHolderNotRejected {
+            reservation_id,
+            operation_id,
+            attempted_epoch,
+            current_epoch,
+        } => format!(
+            "blocker=stale_holder_not_rejected reservation_id={reservation_id} operation_id={operation_id} attempted_epoch={attempted_epoch} current_epoch={current_epoch}"
         ),
         JepsenBlockingIssue::StaleSuccessfulRead(violation) => format!(
             "blocker=stale_successful_read replica_id={} role={} required_lsn={} observed_lsn={}",
@@ -1570,6 +1732,12 @@ struct ResourceLeaseState {
     operation_id: u128,
     reservation_id: u128,
     expires_at_slot: Slot,
+}
+
+#[derive(Clone, Debug)]
+struct ReservationLeaseState {
+    member_resource_ids: Vec<ResourceId>,
+    lease_epoch: u64,
 }
 
 fn collect_mutating_attempts(
@@ -1628,9 +1796,12 @@ fn record_committed_attempt(
     operation: JepsenOperation,
     write: JepsenCommittedWrite,
 ) {
-    let fingerprint = fingerprint_write(&write);
-    if let Some(existing) = builder.committed_result {
-        if existing != fingerprint {
+    let mut fingerprint = fingerprint_write(&write);
+    if !operation.resource_ids.is_empty() {
+        fingerprint.resource_ids.clone_from(&operation.resource_ids);
+    }
+    if let Some(existing) = &builder.committed_result {
+        if *existing != fingerprint {
             blockers.push(JepsenBlockingIssue::DuplicateCommittedExecution {
                 operation_id,
                 first_lsn: existing.applied_lsn,
@@ -1705,100 +1876,132 @@ fn check_committed_release_blockers(
 ) -> Vec<JepsenBlockingIssue> {
     let mut blockers = Vec::new();
     let mut resources = BTreeMap::<u128, ResourceLeaseState>::new();
+    let mut reservations = BTreeMap::<u128, ReservationLeaseState>::new();
     for record in committed.into_values() {
-        apply_committed_record(&mut resources, &mut blockers, &record);
+        apply_committed_record(&mut resources, &mut reservations, &mut blockers, &record);
     }
     blockers
 }
 
 fn apply_committed_record(
     resources: &mut BTreeMap<u128, ResourceLeaseState>,
+    reservations: &mut BTreeMap<u128, ReservationLeaseState>,
     blockers: &mut Vec<JepsenBlockingIssue>,
     record: &CommittedRecord,
 ) {
     match &record.write.result {
         JepsenWriteResult::Reserved {
-            resource_id,
             reservation_id,
             expires_at_slot,
+            lease_epoch,
             ..
         } => record_reserved_write(
             resources,
+            reservations,
             blockers,
-            *resource_id,
+            record,
             *reservation_id,
             *expires_at_slot,
-            record.operation_id,
+            *lease_epoch,
         ),
-        JepsenWriteResult::Confirmed {
-            resource_id,
-            reservation_id,
-            ..
-        } => record_confirmed_write(
-            resources,
-            blockers,
-            *resource_id,
-            *reservation_id,
-            record.operation_id,
-        ),
-        JepsenWriteResult::Released {
-            resource_id,
-            reservation_id,
-            ..
-        } => {
-            remove_matching_reservation(resources, *resource_id, *reservation_id);
+        JepsenWriteResult::Confirmed { reservation_id, .. } => {
+            record_confirmed_write(
+                resources,
+                reservations,
+                blockers,
+                *reservation_id,
+                record.operation_id,
+            );
+        }
+        JepsenWriteResult::Released { reservation_id, .. }
+        | JepsenWriteResult::Reclaimed { reservation_id } => {
+            remove_matching_reservation(resources, reservations, *reservation_id);
+        }
+        JepsenWriteResult::Revoked { reservation_id } => {
+            record_revoked_write(reservations, *reservation_id);
         }
         JepsenWriteResult::TickExpired { expired } => {
-            record_tick_expiration(resources, blockers, &record.operation, expired);
+            record_tick_expiration(
+                resources,
+                reservations,
+                blockers,
+                &record.operation,
+                expired,
+            );
         }
     }
 }
 
 fn record_reserved_write(
     resources: &mut BTreeMap<u128, ResourceLeaseState>,
+    reservations: &mut BTreeMap<u128, ReservationLeaseState>,
     blockers: &mut Vec<JepsenBlockingIssue>,
-    resource_id: ResourceId,
+    record: &CommittedRecord,
     reservation_id: u128,
     expires_at_slot: Slot,
-    operation_id: u128,
+    lease_epoch: u64,
 ) {
-    if let Some(existing) = resources.get(&resource_id.get()) {
-        blockers.push(JepsenBlockingIssue::DoubleAllocation {
-            resource_id,
-            existing_operation_id: existing.operation_id,
-            conflicting_operation_id: operation_id,
-        });
+    let member_resource_ids = record_bundle_resource_ids(record);
+    for resource_id in &member_resource_ids {
+        if let Some(existing) = resources.get(&resource_id.get()) {
+            blockers.push(JepsenBlockingIssue::DoubleAllocation {
+                resource_id: *resource_id,
+                existing_operation_id: existing.operation_id,
+                conflicting_operation_id: record.operation_id,
+            });
+        }
+        resources.insert(
+            resource_id.get(),
+            ResourceLeaseState {
+                operation_id: record.operation_id,
+                reservation_id,
+                expires_at_slot,
+            },
+        );
     }
-    resources.insert(
-        resource_id.get(),
-        ResourceLeaseState {
-            operation_id,
-            reservation_id,
-            expires_at_slot,
+    reservations.insert(
+        reservation_id,
+        ReservationLeaseState {
+            member_resource_ids,
+            lease_epoch,
         },
     );
 }
 
 fn record_confirmed_write(
     resources: &BTreeMap<u128, ResourceLeaseState>,
+    reservations: &mut BTreeMap<u128, ReservationLeaseState>,
     blockers: &mut Vec<JepsenBlockingIssue>,
-    resource_id: ResourceId,
     reservation_id: u128,
     operation_id: u128,
 ) {
-    if let Some(existing) = resources.get(&resource_id.get()) {
-        if existing.reservation_id != reservation_id {
-            blockers.push(JepsenBlockingIssue::DoubleAllocation {
-                resource_id,
-                existing_operation_id: existing.operation_id,
-                conflicting_operation_id: operation_id,
-            });
+    if let Some(existing_reservation) = reservations.get(&reservation_id).cloned() {
+        for resource_id in existing_reservation.member_resource_ids {
+            if let Some(existing) = resources.get(&resource_id.get()) {
+                if existing.reservation_id != reservation_id {
+                    blockers.push(JepsenBlockingIssue::DoubleAllocation {
+                        resource_id,
+                        existing_operation_id: existing.operation_id,
+                        conflicting_operation_id: operation_id,
+                    });
+                }
+            }
         }
+    }
+}
+
+fn record_revoked_write(
+    reservations: &mut BTreeMap<u128, ReservationLeaseState>,
+    reservation_id: u128,
+) {
+    if let Some(reservation) = reservations.get_mut(&reservation_id) {
+        reservation.lease_epoch = reservation.lease_epoch.saturating_add(1);
     }
 }
 
 fn record_tick_expiration(
     resources: &mut BTreeMap<u128, ResourceLeaseState>,
+    reservations: &mut BTreeMap<u128, ReservationLeaseState>,
     blockers: &mut Vec<JepsenBlockingIssue>,
     operation: &JepsenOperation,
     expired: &[JepsenExpiredReservation],
@@ -1817,7 +2020,11 @@ fn record_tick_expiration(
                         released_at_slot: release_slot,
                     });
                 }
-                resources.remove(&expired_reservation.resource_id.get());
+                remove_matching_reservation(
+                    resources,
+                    reservations,
+                    expired_reservation.reservation_id,
+                );
             }
         }
     }
@@ -1825,15 +2032,96 @@ fn record_tick_expiration(
 
 fn remove_matching_reservation(
     resources: &mut BTreeMap<u128, ResourceLeaseState>,
-    resource_id: ResourceId,
+    reservations: &mut BTreeMap<u128, ReservationLeaseState>,
     reservation_id: u128,
 ) {
-    if resources
-        .get(&resource_id.get())
-        .is_some_and(|existing| existing.reservation_id == reservation_id)
-    {
-        resources.remove(&resource_id.get());
+    if let Some(reservation) = reservations.remove(&reservation_id) {
+        for resource_id in reservation.member_resource_ids {
+            if resources
+                .get(&resource_id.get())
+                .is_some_and(|existing| existing.reservation_id == reservation_id)
+            {
+                resources.remove(&resource_id.get());
+            }
+        }
     }
+}
+
+fn record_bundle_resource_ids(record: &CommittedRecord) -> Vec<ResourceId> {
+    if record.operation.resource_ids.is_empty() {
+        record
+            .operation
+            .resource_id
+            .into_iter()
+            .collect::<Vec<ResourceId>>()
+    } else {
+        record.operation.resource_ids.clone()
+    }
+}
+
+fn check_stale_holder_rejection(events: &[JepsenHistoryEvent]) -> Vec<JepsenBlockingIssue> {
+    let mut blockers = Vec::new();
+    let mut current_epochs = BTreeMap::<u128, u64>::new();
+
+    for event in events {
+        if let (Some(reservation_id), Some(attempted_epoch)) =
+            (event.operation.reservation_id, event.operation.lease_epoch)
+        {
+            if matches!(
+                event.operation.kind,
+                JepsenOperationKind::Confirm | JepsenOperationKind::Release
+            ) {
+                if let Some(current_epoch) = current_epochs.get(&reservation_id) {
+                    if attempted_epoch < *current_epoch
+                        && !matches!(
+                            event.outcome,
+                            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::StaleEpoch)
+                        )
+                    {
+                        blockers.push(JepsenBlockingIssue::StaleHolderNotRejected {
+                            reservation_id,
+                            operation_id: event.operation.operation_id.unwrap_or(0),
+                            attempted_epoch,
+                            current_epoch: *current_epoch,
+                        });
+                    }
+                }
+            }
+        }
+
+        if let JepsenEventOutcome::CommittedWrite(write) = &event.outcome {
+            match &write.result {
+                JepsenWriteResult::Reserved {
+                    reservation_id,
+                    lease_epoch,
+                    ..
+                }
+                | JepsenWriteResult::Confirmed {
+                    reservation_id,
+                    lease_epoch,
+                    ..
+                } => {
+                    current_epochs.insert(*reservation_id, *lease_epoch);
+                }
+                JepsenWriteResult::Released { reservation_id, .. }
+                | JepsenWriteResult::Reclaimed { reservation_id } => {
+                    current_epochs.remove(reservation_id);
+                }
+                JepsenWriteResult::Revoked { reservation_id } => {
+                    if let Some(current_epoch) = current_epochs.get_mut(reservation_id) {
+                        *current_epoch = current_epoch.saturating_add(1);
+                    }
+                }
+                JepsenWriteResult::TickExpired { expired } => {
+                    for expired_reservation in expired {
+                        current_epochs.remove(&expired_reservation.reservation_id);
+                    }
+                }
+            }
+        }
+    }
+
+    blockers
 }
 
 fn summarize_logical_commands(

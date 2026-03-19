@@ -2,7 +2,7 @@ use std::path::Path;
 
 use allocdb_core::ids::ResourceId;
 use allocdb_node::jepsen::{
-    analyze_history, load_history, release_gate_plan, render_analysis_report,
+    analyze_history, load_history, render_analysis_report, supported_run_plan,
 };
 use allocdb_node::kubevirt_testbed::KubevirtTestbedLayout;
 use allocdb_node::local_cluster::LocalClusterLayout;
@@ -103,7 +103,7 @@ impl ExternalTestbed for KubevirtTestbedLayout {
 }
 
 pub(super) fn print_release_gate_plan() {
-    for run in release_gate_plan() {
+    for run in supported_run_plan() {
         println!(
             "run_id={} workload={} nemesis={} minimum_fault_window_secs={} release_blocking={}",
             run.run_id,

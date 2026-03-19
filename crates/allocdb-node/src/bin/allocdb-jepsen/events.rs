@@ -42,6 +42,7 @@ pub(super) enum ResourceReadObservation {
 pub(super) struct ReserveCommit {
     pub(super) applied_lsn: Lsn,
     pub(super) reservation_id: ReservationId,
+    pub(super) lease_epoch: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -51,6 +52,35 @@ pub(super) struct ReserveEventSpec {
     pub(super) holder_id: HolderId,
     pub(super) request_slot: Slot,
     pub(super) ttl_slots: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ReserveBundleEventSpec<'a> {
+    pub(super) operation_id: OperationId,
+    pub(super) resource_ids: &'a [ResourceId],
+    pub(super) holder_id: HolderId,
+    pub(super) request_slot: Slot,
+    pub(super) ttl_slots: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct HolderLeaseEventSpec<'a> {
+    pub(super) kind: JepsenOperationKind,
+    pub(super) operation_id: OperationId,
+    pub(super) reservation_id: ReservationId,
+    pub(super) resource_id: ResourceId,
+    pub(super) resource_ids: &'a [ResourceId],
+    pub(super) holder_id: HolderId,
+    pub(super) lease_epoch: u64,
+    pub(super) request_slot: Slot,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct AdminLeaseEventSpec {
+    pub(super) kind: JepsenOperationKind,
+    pub(super) operation_id: OperationId,
+    pub(super) reservation_id: ReservationId,
+    pub(super) request_slot: Slot,
 }
 
 #[derive(Clone, Copy)]
@@ -100,8 +130,10 @@ pub(super) fn reserve_event<T: ExternalTestbed>(
         kind: JepsenOperationKind::Reserve,
         operation_id: Some(spec.operation_id.get()),
         resource_id: Some(spec.resource_id),
+        resource_ids: Vec::new(),
         reservation_id: None,
         holder_id: Some(spec.holder_id.get()),
+        lease_epoch: None,
         required_lsn: None,
         request_slot: Some(spec.request_slot),
         ttl_slots: Some(spec.ttl_slots),
@@ -135,6 +167,57 @@ pub(super) fn reserve_event<T: ExternalTestbed>(
     }
 }
 
+pub(super) fn reserve_bundle_event<T: ExternalTestbed>(
+    layout: &T,
+    replica: &LocalClusterReplicaConfig,
+    context: &RunExecutionContext,
+    spec: ReserveBundleEventSpec<'_>,
+) -> Result<(JepsenOperation, JepsenEventOutcome, Option<ReserveCommit>), String> {
+    let anchor_resource_id = *spec
+        .resource_ids
+        .first()
+        .ok_or_else(|| String::from("reserve_bundle requires at least one resource"))?;
+    let operation = JepsenOperation {
+        kind: JepsenOperationKind::ReserveBundle,
+        operation_id: Some(spec.operation_id.get()),
+        resource_id: Some(anchor_resource_id),
+        resource_ids: spec.resource_ids.to_vec(),
+        reservation_id: None,
+        holder_id: Some(spec.holder_id.get()),
+        lease_epoch: None,
+        required_lsn: None,
+        request_slot: Some(spec.request_slot),
+        ttl_slots: Some(spec.ttl_slots),
+    };
+    let request = ApiRequest::Submit(SubmitRequest::from_client_request(
+        context.slot(spec.request_slot.get()),
+        context.client_request(
+            spec.operation_id,
+            AllocCommand::ReserveBundle {
+                resource_ids: spec.resource_ids.to_vec(),
+                holder_id: spec.holder_id,
+                ttl_slots: spec.ttl_slots,
+            },
+        ),
+    ));
+    match send_replica_api_request(layout, replica, &request)? {
+        RemoteApiOutcome::Api(ApiResponse::Submit(response)) => {
+            map_reserve_submit_response(operation, anchor_resource_id, spec.holder_id, response)
+        }
+        RemoteApiOutcome::Api(other) => Err(format!(
+            "reserve_bundle returned unexpected response {other:?}"
+        )),
+        RemoteApiOutcome::Text(text) if response_text_is_not_primary(&text) => Ok((
+            operation,
+            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::NotPrimary),
+            None,
+        )),
+        RemoteApiOutcome::Text(text) => Err(format!(
+            "reserve_bundle returned undecodable response {text}"
+        )),
+    }
+}
+
 pub(super) fn tick_expirations_event<T: ExternalTestbed>(
     layout: &T,
     replica: &LocalClusterReplicaConfig,
@@ -148,8 +231,10 @@ pub(super) fn tick_expirations_event<T: ExternalTestbed>(
         kind: JepsenOperationKind::TickExpirations,
         operation_id: Some(operation_id.get()),
         resource_id: None,
+        resource_ids: Vec::new(),
         reservation_id: None,
         holder_id: None,
+        lease_epoch: None,
         required_lsn: None,
         request_slot: Some(current_wall_clock_slot),
         ttl_slots: None,
@@ -212,8 +297,10 @@ pub(super) fn reservation_read_event<T: ExternalTestbed>(
         kind: JepsenOperationKind::GetReservation,
         operation_id: None,
         resource_id: None,
+        resource_ids: Vec::new(),
         reservation_id: Some(reservation_id.get()),
         holder_id: None,
+        lease_epoch: None,
         required_lsn,
         request_slot: Some(current_slot),
         ttl_slots: None,
@@ -380,6 +467,31 @@ pub(super) fn outcome_from_submission_failure(failure: &SubmissionFailure) -> Je
     JepsenEventOutcome::DefiniteFailure(failure)
 }
 
+fn definite_failure_from_result_code(result_code: ResultCode) -> Option<JepsenDefiniteFailure> {
+    match result_code {
+        ResultCode::ResourceBusy => Some(JepsenDefiniteFailure::Busy),
+        ResultCode::OperationConflict
+        | ResultCode::InvalidState
+        | ResultCode::HolderMismatch
+        | ResultCode::BundleTooLarge
+        | ResultCode::TtlOutOfRange
+        | ResultCode::ResourceTableFull
+        | ResultCode::ReservationTableFull
+        | ResultCode::ReservationMemberTableFull
+        | ResultCode::ExpirationIndexFull
+        | ResultCode::OperationTableFull
+        | ResultCode::SlotOverflow
+        | ResultCode::AlreadyExists
+        | ResultCode::Noop => Some(JepsenDefiniteFailure::Conflict),
+        ResultCode::StaleEpoch => Some(JepsenDefiniteFailure::StaleEpoch),
+        ResultCode::ResourceNotFound | ResultCode::ReservationNotFound => {
+            Some(JepsenDefiniteFailure::NotFound)
+        }
+        ResultCode::ReservationRetired => Some(JepsenDefiniteFailure::Retired),
+        ResultCode::Ok => None,
+    }
+}
+
 pub(super) fn primary_process_name(replica: &LocalClusterReplicaConfig) -> String {
     format!("primary-{}", replica.replica_id.get())
 }
@@ -412,6 +524,9 @@ fn map_reserve_submit_response(
                 let reservation_id = response
                     .lease_id
                     .ok_or_else(|| String::from("reserve commit missing reservation_id"))?;
+                let lease_epoch = response
+                    .lease_epoch
+                    .ok_or_else(|| String::from("reserve commit missing lease_epoch"))?;
                 let expires_at_slot = response
                     .deadline_slot
                     .ok_or_else(|| String::from("reserve commit missing deadline_slot"))?;
@@ -421,6 +536,7 @@ fn map_reserve_submit_response(
                         applied_lsn: response.applied_lsn,
                         result: JepsenWriteResult::Reserved {
                             resource_id,
+                            lease_epoch,
                             holder_id: holder_id.get(),
                             reservation_id: reservation_id.get(),
                             expires_at_slot,
@@ -429,33 +545,226 @@ fn map_reserve_submit_response(
                     Some(ReserveCommit {
                         applied_lsn: response.applied_lsn,
                         reservation_id,
+                        lease_epoch,
                     }),
                 ))
             }
-            ResultCode::ResourceBusy => Ok((
-                operation,
-                JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::Busy),
-                None,
-            )),
-            ResultCode::OperationConflict => Ok((
-                operation,
-                JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::Conflict),
-                None,
-            )),
-            ResultCode::ResourceNotFound | ResultCode::ReservationNotFound => Ok((
-                operation,
-                JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::NotFound),
-                None,
-            )),
-            ResultCode::ReservationRetired => Ok((
-                operation,
-                JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::Retired),
-                None,
-            )),
-            other => Err(format!("unexpected reserve result code {other:?}")),
+            other => definite_failure_from_result_code(other)
+                .map(|failure| {
+                    (
+                        operation,
+                        JepsenEventOutcome::DefiniteFailure(failure),
+                        None,
+                    )
+                })
+                .ok_or_else(|| format!("unexpected reserve result code {other:?}")),
         },
         SubmitResponse::Rejected(failure) => {
             Ok((operation, outcome_from_submission_failure(&failure), None))
+        }
+    }
+}
+
+pub(super) fn holder_lease_event<T: ExternalTestbed>(
+    layout: &T,
+    replica: &LocalClusterReplicaConfig,
+    context: &RunExecutionContext,
+    spec: HolderLeaseEventSpec<'_>,
+) -> Result<(JepsenOperation, JepsenEventOutcome), String> {
+    let operation = JepsenOperation {
+        kind: spec.kind,
+        operation_id: Some(spec.operation_id.get()),
+        resource_id: Some(spec.resource_id),
+        resource_ids: spec.resource_ids.to_vec(),
+        reservation_id: Some(spec.reservation_id.get()),
+        holder_id: Some(spec.holder_id.get()),
+        lease_epoch: Some(spec.lease_epoch),
+        required_lsn: None,
+        request_slot: Some(spec.request_slot),
+        ttl_slots: None,
+    };
+    let command = match spec.kind {
+        JepsenOperationKind::Confirm => AllocCommand::Confirm {
+            reservation_id: spec.reservation_id,
+            holder_id: spec.holder_id,
+            lease_epoch: spec.lease_epoch,
+        },
+        JepsenOperationKind::Release => AllocCommand::Release {
+            reservation_id: spec.reservation_id,
+            holder_id: spec.holder_id,
+            lease_epoch: spec.lease_epoch,
+        },
+        _ => {
+            return Err(format!(
+                "holder_lease_event does not support operation {:?}",
+                spec.kind
+            ));
+        }
+    };
+    let request = ApiRequest::Submit(SubmitRequest::from_client_request(
+        context.slot(spec.request_slot.get()),
+        context.client_request(spec.operation_id, command),
+    ));
+    match send_replica_api_request(layout, replica, &request)? {
+        RemoteApiOutcome::Api(ApiResponse::Submit(response)) => {
+            map_holder_submit_response(operation, response)
+        }
+        RemoteApiOutcome::Api(other) => Err(format!(
+            "holder lease operation returned unexpected response {other:?}"
+        )),
+        RemoteApiOutcome::Text(text) if response_text_is_not_primary(&text) => Ok((
+            operation,
+            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::NotPrimary),
+        )),
+        RemoteApiOutcome::Text(text) => Err(format!(
+            "holder lease operation returned undecodable response {text}"
+        )),
+    }
+}
+
+pub(super) fn admin_lease_event<T: ExternalTestbed>(
+    layout: &T,
+    replica: &LocalClusterReplicaConfig,
+    context: &RunExecutionContext,
+    spec: AdminLeaseEventSpec,
+) -> Result<(JepsenOperation, JepsenEventOutcome), String> {
+    let operation = JepsenOperation {
+        kind: spec.kind,
+        operation_id: Some(spec.operation_id.get()),
+        resource_id: None,
+        resource_ids: Vec::new(),
+        reservation_id: Some(spec.reservation_id.get()),
+        holder_id: None,
+        lease_epoch: None,
+        required_lsn: None,
+        request_slot: Some(spec.request_slot),
+        ttl_slots: None,
+    };
+    let command = match spec.kind {
+        JepsenOperationKind::Revoke => AllocCommand::Revoke {
+            reservation_id: spec.reservation_id,
+        },
+        JepsenOperationKind::Reclaim => AllocCommand::Reclaim {
+            reservation_id: spec.reservation_id,
+        },
+        _ => {
+            return Err(format!(
+                "admin_lease_event does not support operation {:?}",
+                spec.kind
+            ));
+        }
+    };
+    let request = ApiRequest::Submit(SubmitRequest::from_client_request(
+        context.slot(spec.request_slot.get()),
+        context.client_request(spec.operation_id, command),
+    ));
+    match send_replica_api_request(layout, replica, &request)? {
+        RemoteApiOutcome::Api(ApiResponse::Submit(response)) => {
+            map_admin_submit_response(operation, response)
+        }
+        RemoteApiOutcome::Api(other) => Err(format!(
+            "admin lease operation returned unexpected response {other:?}"
+        )),
+        RemoteApiOutcome::Text(text) if response_text_is_not_primary(&text) => Ok((
+            operation,
+            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::NotPrimary),
+        )),
+        RemoteApiOutcome::Text(text) => Err(format!(
+            "admin lease operation returned undecodable response {text}"
+        )),
+    }
+}
+
+fn map_holder_submit_response(
+    operation: JepsenOperation,
+    response: SubmitResponse,
+) -> Result<(JepsenOperation, JepsenEventOutcome), String> {
+    match response {
+        SubmitResponse::Committed(response) => match response.result_code {
+            ResultCode::Ok => {
+                let reservation_id = ReservationId(
+                    operation
+                        .reservation_id
+                        .ok_or_else(|| String::from("holder operation missing reservation_id"))?,
+                );
+                let holder_id = operation
+                    .holder_id
+                    .ok_or_else(|| String::from("holder operation missing holder_id"))?;
+                let resource_id = operation
+                    .resource_id
+                    .ok_or_else(|| String::from("holder operation missing resource_id"))?;
+                let result = match operation.kind {
+                    JepsenOperationKind::Confirm => JepsenWriteResult::Confirmed {
+                        resource_id,
+                        lease_epoch: operation
+                            .lease_epoch
+                            .ok_or_else(|| String::from("confirm missing lease_epoch"))?,
+                        holder_id,
+                        reservation_id: reservation_id.get(),
+                    },
+                    JepsenOperationKind::Release => JepsenWriteResult::Released {
+                        resource_id,
+                        holder_id,
+                        reservation_id: reservation_id.get(),
+                        released_lsn: Some(response.applied_lsn),
+                    },
+                    other => {
+                        return Err(format!(
+                            "holder operation mapper does not support result for {other:?}"
+                        ));
+                    }
+                };
+                Ok((
+                    operation,
+                    JepsenEventOutcome::CommittedWrite(JepsenCommittedWrite {
+                        applied_lsn: response.applied_lsn,
+                        result,
+                    }),
+                ))
+            }
+            other => definite_failure_from_result_code(other)
+                .map(|failure| (operation, JepsenEventOutcome::DefiniteFailure(failure)))
+                .ok_or_else(|| format!("unexpected holder result code {other:?}")),
+        },
+        SubmitResponse::Rejected(failure) => {
+            Ok((operation, outcome_from_submission_failure(&failure)))
+        }
+    }
+}
+
+fn map_admin_submit_response(
+    operation: JepsenOperation,
+    response: SubmitResponse,
+) -> Result<(JepsenOperation, JepsenEventOutcome), String> {
+    match response {
+        SubmitResponse::Committed(response) => match response.result_code {
+            ResultCode::Ok => {
+                let reservation_id = operation
+                    .reservation_id
+                    .ok_or_else(|| String::from("admin operation missing reservation_id"))?;
+                let result = match operation.kind {
+                    JepsenOperationKind::Revoke => JepsenWriteResult::Revoked { reservation_id },
+                    JepsenOperationKind::Reclaim => JepsenWriteResult::Reclaimed { reservation_id },
+                    other => {
+                        return Err(format!(
+                            "admin operation mapper does not support result for {other:?}"
+                        ));
+                    }
+                };
+                Ok((
+                    operation,
+                    JepsenEventOutcome::CommittedWrite(JepsenCommittedWrite {
+                        applied_lsn: response.applied_lsn,
+                        result,
+                    }),
+                ))
+            }
+            other => definite_failure_from_result_code(other)
+                .map(|failure| (operation, JepsenEventOutcome::DefiniteFailure(failure)))
+                .ok_or_else(|| format!("unexpected admin result code {other:?}")),
+        },
+        SubmitResponse::Rejected(failure) => {
+            Ok((operation, outcome_from_submission_failure(&failure)))
         }
     }
 }
@@ -558,8 +867,10 @@ fn resource_available_event<T: ExternalTestbed>(
         kind: JepsenOperationKind::GetResource,
         operation_id: None,
         resource_id: Some(resource_id),
+        resource_ids: Vec::new(),
         reservation_id: None,
         holder_id: None,
+        lease_epoch: None,
         required_lsn,
         request_slot: None,
         ttl_slots: None,
@@ -733,8 +1044,10 @@ mod tests {
             kind: JepsenOperationKind::Reserve,
             operation_id: Some(9),
             resource_id: Some(ResourceId(7)),
+            resource_ids: Vec::new(),
             reservation_id: None,
             holder_id: Some(11),
+            lease_epoch: None,
             required_lsn: None,
             request_slot: Some(Slot(3)),
             ttl_slots: Some(5),
@@ -756,9 +1069,10 @@ mod tests {
             SubmitResponse::Committed(
                 SubmissionResult {
                     applied_lsn: Lsn(21),
-                    outcome: CommandOutcome::with_reservation(
+                    outcome: CommandOutcome::with_reservation_epoch(
                         ResultCode::Ok,
                         ReservationId(31),
+                        1,
                         Slot(99),
                     ),
                     from_retry_cache: false,
@@ -805,6 +1119,123 @@ mod tests {
         assert_eq!(
             retired.1,
             JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::Retired)
+        );
+    }
+
+    #[test]
+    fn map_holder_submit_response_maps_confirm_and_stale_epoch() {
+        let operation = JepsenOperation {
+            kind: JepsenOperationKind::Confirm,
+            operation_id: Some(19),
+            resource_id: Some(ResourceId(7)),
+            resource_ids: vec![ResourceId(7), ResourceId(8)],
+            reservation_id: Some(31),
+            holder_id: Some(11),
+            lease_epoch: Some(2),
+            required_lsn: None,
+            request_slot: Some(Slot(5)),
+            ttl_slots: None,
+        };
+
+        let committed = map_holder_submit_response(
+            operation.clone(),
+            SubmitResponse::Committed(
+                SubmissionResult {
+                    applied_lsn: Lsn(21),
+                    outcome: CommandOutcome::new(ResultCode::Ok),
+                    from_retry_cache: false,
+                }
+                .into(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            committed.1,
+            JepsenEventOutcome::CommittedWrite(JepsenCommittedWrite {
+                applied_lsn: Lsn(21),
+                result: JepsenWriteResult::Confirmed {
+                    resource_id: ResourceId(7),
+                    lease_epoch: 2,
+                    holder_id: 11,
+                    reservation_id: 31,
+                },
+            })
+        );
+
+        let stale = map_holder_submit_response(
+            operation,
+            SubmitResponse::Committed(
+                SubmissionResult {
+                    applied_lsn: Lsn(22),
+                    outcome: CommandOutcome::new(ResultCode::StaleEpoch),
+                    from_retry_cache: false,
+                }
+                .into(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            stale.1,
+            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::StaleEpoch)
+        );
+    }
+
+    #[test]
+    fn map_admin_submit_response_maps_revoke_and_reclaim() {
+        let revoke_operation = JepsenOperation {
+            kind: JepsenOperationKind::Revoke,
+            operation_id: Some(29),
+            resource_id: None,
+            resource_ids: Vec::new(),
+            reservation_id: Some(41),
+            holder_id: None,
+            lease_epoch: None,
+            required_lsn: None,
+            request_slot: Some(Slot(6)),
+            ttl_slots: None,
+        };
+
+        let revoke = map_admin_submit_response(
+            revoke_operation.clone(),
+            SubmitResponse::Committed(
+                SubmissionResult {
+                    applied_lsn: Lsn(31),
+                    outcome: CommandOutcome::new(ResultCode::Ok),
+                    from_retry_cache: false,
+                }
+                .into(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            revoke.1,
+            JepsenEventOutcome::CommittedWrite(JepsenCommittedWrite {
+                applied_lsn: Lsn(31),
+                result: JepsenWriteResult::Revoked { reservation_id: 41 },
+            })
+        );
+
+        let reclaim = map_admin_submit_response(
+            JepsenOperation {
+                kind: JepsenOperationKind::Reclaim,
+                ..revoke_operation
+            },
+            SubmitResponse::Committed(
+                SubmissionResult {
+                    applied_lsn: Lsn(32),
+                    outcome: CommandOutcome::new(ResultCode::Ok),
+                    from_retry_cache: false,
+                }
+                .into(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            reclaim.1,
+            JepsenEventOutcome::CommittedWrite(JepsenCommittedWrite {
+                applied_lsn: Lsn(32),
+                result: JepsenWriteResult::Reclaimed { reservation_id: 41 },
+            })
         );
     }
 

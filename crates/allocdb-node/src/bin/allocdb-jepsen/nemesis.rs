@@ -58,6 +58,9 @@ pub(super) fn execute_partition_heal_run<T: ExternalTestbed>(
             base_id,
             context,
         ),
+        JepsenWorkloadFamily::LeaseSafety => Err(String::from(
+            "partition-heal runs are not defined for lease_safety",
+        )),
     }
 }
 
@@ -98,6 +101,9 @@ pub(super) fn execute_mixed_failover_run<T: ExternalTestbed>(
             base_id,
             context,
         ),
+        JepsenWorkloadFamily::LeaseSafety => Err(String::from(
+            "mixed failover runs are not defined for lease_safety",
+        )),
     }
 }
 

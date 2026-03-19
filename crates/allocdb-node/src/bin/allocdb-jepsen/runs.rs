@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use allocdb_node::jepsen::{
     JepsenHistoryEvent, JepsenNemesisFamily, JepsenRunSpec, analyze_history,
-    create_artifact_bundle, load_history, persist_history, release_gate_plan,
-    render_analysis_report,
+    create_artifact_bundle, load_history, persist_history, render_analysis_report,
+    supported_run_plan,
 };
 
 use super::kubevirt::{load_kubevirt_layout, prepare_kubevirt_helper};
@@ -59,7 +59,7 @@ pub(super) fn archive_kubevirt_run(
 }
 
 pub(super) fn resolve_run_spec(run_id: &str) -> Result<JepsenRunSpec, String> {
-    release_gate_plan()
+    supported_run_plan()
         .into_iter()
         .find(|candidate| candidate.run_id == run_id)
         .ok_or_else(|| format!("unknown Jepsen run id `{run_id}`"))

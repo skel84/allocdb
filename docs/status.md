@@ -14,7 +14,7 @@
   - `M6` replication design: implemented
   - `M7` replicated core prototype: in progress
   - `M8` external cluster validation: in progress
-  - `M9` generic lease-kernel follow-on: `T10` merged, `T11` broader regression coverage in progress
+  - `M9` generic lease-kernel follow-on: implementation merged on `main`
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -102,10 +102,12 @@
   - deterministic cluster-simulation plan that extends seeded simulation to partitions, primary
     crash, and rejoin without a mock semantics layer
   - Jepsen gate with explicit contention, ambiguity, failover, and expiration workloads
+  - supplementary Jepsen lease-safety coverage for bundle reserve, revoke/reclaim, and stale-holder rejection without changing the documented release-gate matrix
   - retry-aware history interpretation and release-blocking invariants for duplicate execution,
-    stale successful reads, double allocation, and early reuse
+    stale successful reads, double allocation, early reuse, and stale-holder acceptance
 - Host-side Jepsen harness slice:
   - one release-gate matrix planner, one retry-aware history codec/analyzer, one host-side artifact bundler for duplicate-execution, double-allocation, stale-read, early-expiration, unresolved-ambiguity, and fetched external-cluster log checks, plus explicit `verify-qemu-surface` and `verify-kubevirt-surface` probes that exercise one real metrics round trip on every replica and one real primary submit/read round trip through the live replicated protocol surface
+  - one supplementary `lease_safety` workload family with control and crash-restart runs that exercises bundle reserve, explicit revoke/reclaim, and stale-holder release against the live Jepsen surface without promoting that workload into the release-blocking matrix yet
   - one real `run-qemu` and one real `run-kubevirt` executor for the full documented release-gate matrix, with persisted histories and artifact bundles for control, crash-restart, partition-heal, and mixed-failover runs, plus host-side failover/rejoin orchestration built from replica workspace export/import and staged `ReplicaNode::recover(...)` rewrites
   - one `capture-kubevirt-layout` helper that records the live KubeVirt VM IPs, namespace, helper-pod settings, and SSH key path needed to drive the matrix from the host
 - Replicated node scaffolding:
@@ -198,23 +200,14 @@
 - PR `#82` merged the `#70` maintainability follow-up, including live KubeVirt `reservation_contention-control`
   and full `1800s` `reservation_contention-crash-restart` reruns on `allocdb-a` with `blockers=0`
 - `M9-T01` through `M9-T05` are merged on `main` via PR `#81`, and the planning issues are closed on the `AllocDB` project
-- PR `#89` merged `M9-T06` on `main`: the trusted core now supports atomic bundle reservation,
-  explicit bundle membership records, bundle-aware confirm/release/expire, and bundle-aware
-  snapshot/codec coverage while preserving the existing reservation compatibility surface
-- PR `#90` merged `M9-T07` on `main`: lease epochs now flow through holder-authorized commands and
-  command outcomes, the core rejects stale holder epochs deterministically, and read/retry
-  surfaces expose the current authority token for active reservations
-- PR `#92` merged `M9-T08` on `main`: the trusted core now has explicit `revoke` / `reclaim`
-  commands, `revoking` and `revoked` states, and deterministic duplicate/recovery handling
-- PR `#93` merged `M9-T09` on `main`: the node API and wire codec now expose the approved
-  lease-centric surface with `get_lease`, flattened committed results, `current_lease_id`, and
-  ordered `member_resource_ids`, while keeping the trusted-core naming and apply path intact
-- PR `#94` merged `M9-T10` on `main`: replication and failover now preserve committed bundle
-  membership plus stale-holder rejection without introducing a second apply path
-- issue `#88` / `M9-T11` is the active implementation slice on the current branch: broaden
-  deterministic simulation and replicated regression coverage for bundle retries, revoke races,
-  stale-holder rejection, crash recovery, and failover
-- targeted validation on the active `#88` branch currently centers on `cargo test -p allocdb-node simulation -- --nocapture`,
-  `cargo test -p allocdb-node replicated_simulation -- --nocapture`, and `./scripts/preflight.sh`
-- the active `#88` branch is the final planned `M9` code-bearing slice before any new milestone
-  planning
+- PRs `#89`, `#90`, `#92`, `#93`, `#94`, and `#95` merged the full `M9-T06` through `M9-T11`
+  implementation chain on `main`: bundle commit, lease-epoch fencing, explicit `revoke` /
+  `reclaim`, lease-shaped node API exposure, replication-preserved failover behavior, and broader
+  simulation coverage are now all in the mainline implementation
+- issue `#96` is the active follow-on validation slice on the current branch: extend Jepsen
+  history generation and analysis for bundle reserve, revoke/reclaim, and stale-holder lease
+  paths, then run a small live KubeVirt matrix for that workload
+- targeted validation on the active `#96` branch currently centers on `cargo test -p allocdb-node jepsen -- --nocapture`,
+  `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, and `./scripts/preflight.sh`
+- the next recommended step after `#96` is either live KubeVirt lease-safety validation or new
+  milestone planning beyond `M9`, not more unplanned lease-kernel semantics work
