@@ -43,6 +43,27 @@ impl AllocDb {
             .copied()
     }
 
+    #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics if `reservation.member_count` cannot fit `usize` on the current platform or if the
+    /// trusted core has lost one of the live member records required by `reservation`.
+    pub fn reservation_member_resource_ids(
+        &self,
+        reservation: ReservationRecord,
+    ) -> Vec<ResourceId> {
+        let mut resource_ids =
+            Vec::with_capacity(usize::try_from(reservation.member_count).expect("u32 fits usize"));
+        for member_index in 0..reservation.member_count {
+            let member = self
+                .reservation_member(reservation.reservation_id, member_index)
+                .expect("live reservation must retain all member records");
+            resource_ids.push(member.resource_id);
+        }
+        resource_ids
+    }
+
     pub(crate) fn reservation_contains_resource(
         &self,
         reservation: ReservationRecord,

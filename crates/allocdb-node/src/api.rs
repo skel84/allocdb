@@ -3,10 +3,10 @@ use allocdb_core::command_codec::{
     CommandCodecError, decode_client_request, encode_client_request,
 };
 use allocdb_core::ids::{HolderId, Lsn, ReservationId, ResourceId, Slot};
-use allocdb_core::result::CommandOutcome;
+use allocdb_core::result::ResultCode;
 use allocdb_core::{
-    ReservationLookupError, ReservationRecord, ReservationState, ResourceRecord, ResourceState,
-    SlotOverflowKind,
+    AllocDb, ReservationLookupError, ReservationRecord, ReservationState, ResourceRecord,
+    ResourceState, SlotOverflowKind,
 };
 
 use crate::engine::{
@@ -26,7 +26,7 @@ pub use codec::{ApiCodecError, decode_request, decode_response, encode_request, 
 pub enum ApiRequest {
     Submit(SubmitRequest),
     GetResource(ResourceRequest),
-    GetReservation(ReservationRequest),
+    GetLease(LeaseRequest),
     GetMetrics(MetricsRequest),
     TickExpirations(TickExpirationsRequest),
 }
@@ -63,8 +63,8 @@ pub struct ResourceRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReservationRequest {
-    pub reservation_id: ReservationId,
+pub struct LeaseRequest {
+    pub lease_id: ReservationId,
     pub current_slot: Slot,
     pub required_lsn: Option<Lsn>,
 }
@@ -83,12 +83,12 @@ pub struct TickExpirationsRequest {
 pub enum ApiResponse {
     Submit(SubmitResponse),
     GetResource(ResourceResponse),
-    GetReservation(ReservationResponse),
+    GetLease(LeaseResponse),
     GetMetrics(MetricsResponse),
     TickExpirations(TickExpirationsResponse),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubmitResponse {
     Committed(SubmissionCommitted),
     Rejected(SubmissionFailure),
@@ -97,7 +97,10 @@ pub enum SubmitResponse {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SubmissionCommitted {
     pub applied_lsn: Lsn,
-    pub outcome: CommandOutcome,
+    pub result_code: ResultCode,
+    pub lease_id: Option<ReservationId>,
+    pub lease_epoch: Option<u64>,
+    pub deadline_slot: Option<Slot>,
     pub from_retry_cache: bool,
 }
 
@@ -105,13 +108,16 @@ impl From<SubmissionResult> for SubmissionCommitted {
     fn from(value: SubmissionResult) -> Self {
         Self {
             applied_lsn: value.applied_lsn,
-            outcome: value.outcome,
+            result_code: value.outcome.result_code,
+            lease_id: value.outcome.reservation_id,
+            lease_epoch: value.outcome.lease_epoch,
+            deadline_slot: value.outcome.deadline_slot,
             from_retry_cache: value.from_retry_cache,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubmissionFailure {
     pub category: SubmissionErrorCategory,
     pub code: SubmissionFailureCode,
@@ -206,7 +212,7 @@ impl InvalidRequestReason {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResourceResponse {
     Found(ResourceView),
     NotFound,
@@ -218,10 +224,29 @@ pub enum ResourceResponse {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceViewState {
+    Available,
+    Reserved,
+    Active,
+    Revoking,
+}
+
+impl From<ResourceState> for ResourceViewState {
+    fn from(value: ResourceState) -> Self {
+        match value {
+            ResourceState::Available => Self::Available,
+            ResourceState::Reserved => Self::Reserved,
+            ResourceState::Confirmed => Self::Active,
+            ResourceState::Revoking => Self::Revoking,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourceView {
     pub resource_id: ResourceId,
-    pub state: ResourceState,
-    pub current_reservation_id: Option<ReservationId>,
+    pub state: ResourceViewState,
+    pub current_lease_id: Option<ReservationId>,
     pub version: u64,
 }
 
@@ -229,16 +254,39 @@ impl From<ResourceRecord> for ResourceView {
     fn from(value: ResourceRecord) -> Self {
         Self {
             resource_id: value.resource_id,
-            state: value.current_state,
-            current_reservation_id: value.current_reservation_id,
+            state: value.current_state.into(),
+            current_lease_id: value.current_reservation_id,
             version: value.version,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReservationResponse {
-    Found(ReservationView),
+pub enum LeaseViewState {
+    Reserved,
+    Active,
+    Revoking,
+    Released,
+    Expired,
+    Revoked,
+}
+
+impl From<ReservationState> for LeaseViewState {
+    fn from(value: ReservationState) -> Self {
+        match value {
+            ReservationState::Reserved => Self::Reserved,
+            ReservationState::Confirmed => Self::Active,
+            ReservationState::Revoking => Self::Revoking,
+            ReservationState::Released => Self::Released,
+            ReservationState::Expired => Self::Expired,
+            ReservationState::Revoked => Self::Revoked,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LeaseResponse {
+    Found(LeaseView),
     NotFound,
     Retired,
     EngineHalted,
@@ -248,31 +296,32 @@ pub enum ReservationResponse {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReservationView {
-    pub reservation_id: ReservationId,
-    pub resource_id: ResourceId,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseView {
+    pub lease_id: ReservationId,
     pub holder_id: HolderId,
+    pub state: LeaseViewState,
     pub lease_epoch: u64,
-    pub state: ReservationState,
     pub created_lsn: Lsn,
-    pub deadline_slot: Slot,
+    pub deadline_slot: Option<Slot>,
     pub released_lsn: Option<Lsn>,
     pub retire_after_slot: Option<Slot>,
+    pub member_resource_ids: Vec<ResourceId>,
 }
 
-impl From<ReservationRecord> for ReservationView {
-    fn from(value: ReservationRecord) -> Self {
+impl LeaseView {
+    #[must_use]
+    pub fn from_db(db: &AllocDb, value: ReservationRecord) -> Self {
         Self {
-            reservation_id: value.reservation_id,
-            resource_id: value.resource_id,
+            lease_id: value.reservation_id,
             holder_id: value.holder_id,
+            state: value.state.into(),
             lease_epoch: value.lease_epoch,
-            state: value.state,
             created_lsn: value.created_lsn,
-            deadline_slot: value.deadline_slot,
+            deadline_slot: Some(value.deadline_slot),
             released_lsn: value.released_lsn,
             retire_after_slot: value.retire_after_slot,
+            member_resource_ids: db.reservation_member_resource_ids(value),
         }
     }
 }
@@ -282,7 +331,7 @@ pub struct MetricsResponse {
     pub metrics: EngineMetrics,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TickExpirationsResponse {
     Applied(TickExpirationsApplied),
     Rejected(SubmissionFailure),
@@ -314,8 +363,8 @@ impl SingleNodeEngine {
             ApiRequest::GetResource(request) => {
                 ApiResponse::GetResource(self.handle_resource_request(request))
             }
-            ApiRequest::GetReservation(request) => {
-                ApiResponse::GetReservation(self.handle_reservation_request(request))
+            ApiRequest::GetLease(request) => {
+                ApiResponse::GetLease(self.handle_lease_request(request))
             }
             ApiRequest::GetMetrics(request) => ApiResponse::GetMetrics(MetricsResponse {
                 metrics: self.metrics(request.current_wall_clock_slot),
@@ -367,14 +416,14 @@ impl SingleNodeEngine {
             })
     }
 
-    fn handle_reservation_request(&self, request: ReservationRequest) -> ReservationResponse {
+    fn handle_lease_request(&self, request: LeaseRequest) -> LeaseResponse {
         if let Some(error) = self.read_error(request.required_lsn) {
             return match error {
-                ReadError::EngineHalted => ReservationResponse::EngineHalted,
+                ReadError::EngineHalted => LeaseResponse::EngineHalted,
                 ReadError::RequiredLsnNotApplied {
                     required_lsn,
                     last_applied_lsn,
-                } => ReservationResponse::FenceNotApplied {
+                } => LeaseResponse::FenceNotApplied {
                     required_lsn,
                     last_applied_lsn,
                 },
@@ -383,11 +432,11 @@ impl SingleNodeEngine {
 
         match self
             .db()
-            .reservation(request.reservation_id, request.current_slot)
+            .reservation(request.lease_id, request.current_slot)
         {
-            Ok(record) => ReservationResponse::Found(record.into()),
-            Err(ReservationLookupError::NotFound) => ReservationResponse::NotFound,
-            Err(ReservationLookupError::Retired) => ReservationResponse::Retired,
+            Ok(record) => LeaseResponse::Found(LeaseView::from_db(self.db(), record)),
+            Err(ReservationLookupError::NotFound) => LeaseResponse::NotFound,
+            Err(ReservationLookupError::Retired) => LeaseResponse::Retired,
         }
     }
 

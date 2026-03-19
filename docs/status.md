@@ -206,15 +206,15 @@
 - PR `#90` merged `M9-T07` on `main`: lease epochs now flow through holder-authorized commands and
   command outcomes, the core rejects stale holder epochs deterministically, and read/retry
   surfaces expose the current authority token for active reservations
-- issue `#85` / `M9-T08` is the active implementation slice on the current branch: the trusted
-  core now has explicit `revoke` / `reclaim` commands, `revoking` and `revoked` states, minimum
-  command/snapshot/API codec support for those states, and deterministic duplicate/recovery
-  handling on the branch
-- targeted validation on the active `#85` branch currently includes
-  `cargo test -p allocdb-core -- --nocapture`,
-  `cargo test -p allocdb-node api -- --nocapture`, and
-  `cargo test -p allocdb-node replicated_simulation -- --nocapture`
-- the active `#85` branch still keeps the `T08` / `T09` boundary explicit: it adds only the
-  revoke/reclaim persistence and replay support needed for the current path, while broader WAL,
-  transport, and replicated-surface cleanup stays deferred to `M9-T09` and `M9-T10`
-- the next planned code-bearing slices after `#85` remain `M9-T09` persistence and transport extension, `M9-T10` replication preservation, and `M9-T11` broader regression coverage
+- PR `#92` merged `M9-T08` on `main`: the trusted core now has explicit `revoke` / `reclaim`
+  commands, `revoking` and `revoked` states, and deterministic duplicate/recovery handling
+- issue `#86` / `M9-T09` is the active implementation slice on the current branch: the node API
+  and wire codec now expose the approved lease-centric surface with `get_lease`, flattened
+  committed results, `current_lease_id`, and ordered `member_resource_ids`, while keeping the
+  trusted-core naming and apply path intact
+- targeted validation on the active `#86` branch currently includes
+  `cargo test -p allocdb-node api -- --nocapture`
+- the active `#86` branch keeps the `T09` / `T10` boundary explicit: it finishes the lease
+  transport/read/recovery surface without adding new replication or view-change behavior
+- the next planned code-bearing slices after `#86` remain `M9-T10` replication preservation and
+  `M9-T11` broader regression coverage
