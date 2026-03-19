@@ -14,7 +14,7 @@
   - `M6` replication design: implemented
   - `M7` replicated core prototype: in progress
   - `M8` external cluster validation: in progress
-  - `M9` generic lease-kernel follow-on: `T06` in progress on issue branch
+  - `M9` generic lease-kernel follow-on: `T07` merged, `T08` planning in progress on issue branch
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -32,8 +32,9 @@
     with divergent prepared-suffix discard; promoted partition and primary-crash scenarios that
     preserve fail-closed behavior and retry/read continuity after failover; the local
     three-replica cluster runner, fault-control harness, and QEMU testbed around the real replica
-    daemon; and the first trusted-core bundle-commit slice with bundle membership, bundle-aware
-    confirm/release/expire, and bundle regression coverage
+    daemon; the first trusted-core bundle-commit slice with bundle membership, bundle-aware
+    confirm/release/expire, and bundle regression coverage; and the first fencing slice with
+    lease-epoch propagation, stale-holder rejection, and epoch-aware retry/read coverage
 
 ## What Exists
 
@@ -85,9 +86,11 @@
   - one draft lease-kernel design-decision document that chooses a first-class lease authority
     object, bundle size `1` as the single-resource semantic special case, a lease-scoped fencing
     token, and a two-stage `revoke -> reclaim` safety model
-  - one active authoritative-docs pass under issue `#80` that is rewriting semantics, API,
+  - one merged authoritative-docs pass under issue `#80` that rewrote semantics, API,
     architecture, and fault-model docs to the approved lease-centric contract while keeping the
     current reservation-centric implementation explicitly marked as compatibility surface
+  - one active `M9-T08` planning note that narrows revoke/reclaim implementation scope before the
+    next code-bearing lease-kernel branch
 - Replication design draft:
   - VSR-style primary/backup replicated log with fixed membership and majority quorums
   - primary-only reads in the first replicated release
@@ -198,13 +201,15 @@
 - PR `#89` merged `M9-T06` on `main`: the trusted core now supports atomic bundle reservation,
   explicit bundle membership records, bundle-aware confirm/release/expire, and bundle-aware
   snapshot/codec coverage while preserving the existing reservation compatibility surface
-- issue `#84` / `M9-T07` is the active implementation slice on the current branch: lease epochs
-  now flow through holder-authorized commands and command outcomes, the core rejects stale holder
-  epochs deterministically, and read/retry surfaces expose the current authority token for active
-  reservations
-- validation for the active `#84` branch currently includes
-  `cargo test -p allocdb-core -- --nocapture`, `cargo test -p allocdb-node api -- --nocapture`,
-  `cargo test -p allocdb-node engine -- --nocapture`, and
-  `cargo test --workspace --no-run`
-- the next planned slices after `#84` remain `M9-T08` revoke/safe reuse, `M9-T09` persistence and
-  transport extension, `M9-T10` replication preservation, and `M9-T11` broader regression coverage
+- PR `#90` merged `M9-T07` on `main`: lease epochs now flow through holder-authorized commands and
+  command outcomes, the core rejects stale holder epochs deterministically, and read/retry
+  surfaces expose the current authority token for active reservations
+- issue `#85` / `M9-T08` is the active planning slice on the current branch: the local scope is
+  being narrowed to explicit `revoke` and `reclaim`, `revoking` as the only non-reusable
+  post-authority state, and the minimum replay-safe bridge from the reservation-era implementation
+  to the accepted lease-centric semantics
+- the active `#85` planning branch is defining exactly what belongs in revoke/reclaim now versus
+  what stays deferred to `M9-T09` through `M9-T11`, especially around WAL/snapshot broadening,
+  transport cleanup, and replication preservation
+- the next planned code-bearing slices after `#85` remain `M9-T09` persistence and transport
+  extension, `M9-T10` replication preservation, and `M9-T11` broader regression coverage
