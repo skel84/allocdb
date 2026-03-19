@@ -125,6 +125,11 @@ fn assert_schedule_submit_operation_ids_match_actions(
     transcript: &[ScheduleObservation],
     actions: &[ScheduleAction],
 ) {
+    assert_eq!(
+        transcript.len(),
+        actions.len(),
+        "schedule transcript must contain one observation per input action"
+    );
     for observation in transcript {
         let Some(action) = actions
             .iter()
@@ -133,6 +138,27 @@ fn assert_schedule_submit_operation_ids_match_actions(
             panic!(
                 "schedule transcript label {} must come from one input action",
                 observation.label
+            );
+        };
+        match (&observation.outcome, &action.action) {
+            (ScheduleObservationKind::Submit(submit), ScheduleActionKind::Submit(request)) => {
+                assert_eq!(submit.operation_id, request.operation_id);
+            }
+            (ScheduleObservationKind::Tick(_), ScheduleActionKind::TickExpirations) => {}
+            (ScheduleObservationKind::Submit(_), ScheduleActionKind::TickExpirations)
+            | (ScheduleObservationKind::Tick(_), ScheduleActionKind::Submit(_)) => {
+                panic!("schedule transcript outcome must match the action kind")
+            }
+        }
+    }
+    for action in actions {
+        let Some(observation) = transcript
+            .iter()
+            .find(|observation| observation.label == action.label)
+        else {
+            panic!(
+                "schedule action label {} must appear exactly once in the transcript",
+                action.label
             );
         };
         match (&observation.outcome, &action.action) {

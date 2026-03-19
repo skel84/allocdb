@@ -2,7 +2,7 @@ use crate::command::{ClientRequest, Command, CommandContext};
 use crate::config::Config;
 use crate::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use crate::result::ResultCode;
-use crate::state_machine::{AllocDb, ReservationState, ResourceState};
+use crate::state_machine::{AllocDb, ReservationMemberRecord, ReservationState, ResourceState};
 
 fn bundle_config() -> Config {
     Config {
@@ -61,6 +61,22 @@ fn reserve_bundle_acquires_all_resources_atomically() {
     assert_eq!(outcome.deadline_slot, Some(Slot(9)));
     assert_eq!(db.reservations.len(), 1);
     assert_eq!(db.reservation_members.len(), 2);
+    assert_eq!(
+        db.reservation_member(ReservationId(3), 0).unwrap(),
+        ReservationMemberRecord {
+            reservation_id: ReservationId(3),
+            resource_id: ResourceId(11),
+            member_index: 0,
+        }
+    );
+    assert_eq!(
+        db.reservation_member(ReservationId(3), 1).unwrap(),
+        ReservationMemberRecord {
+            reservation_id: ReservationId(3),
+            resource_id: ResourceId(12),
+            member_index: 1,
+        }
+    );
 
     let reservation = db.reservation(ReservationId(3), Slot(5)).unwrap();
     assert_eq!(reservation.member_count, 2);
@@ -101,7 +117,7 @@ fn reserve_bundle_leaves_no_partial_state_on_conflict() {
             operation_id: OperationId(4),
             client_id: ClientId(8),
             command: Command::ReserveBundle {
-                resource_ids: vec![ResourceId(11), ResourceId(12)],
+                resource_ids: vec![ResourceId(12), ResourceId(11)],
                 holder_id: HolderId(2),
                 ttl_slots: 3,
             },
@@ -343,14 +359,11 @@ fn confirm_and_release_update_every_bundle_member() {
         },
     );
     assert_eq!(released.result_code, ResultCode::Ok);
-    assert_eq!(
-        db.resource(ResourceId(11)).unwrap().current_state,
-        ResourceState::Available
-    );
-    assert_eq!(
-        db.resource(ResourceId(12)).unwrap().current_state,
-        ResourceState::Available
-    );
+    for resource_id in [ResourceId(11), ResourceId(12)] {
+        let resource = db.resource(resource_id).unwrap();
+        assert_eq!(resource.current_state, ResourceState::Available);
+        assert_eq!(resource.current_reservation_id, None);
+    }
     assert_eq!(
         db.reservation(ReservationId(3), Slot(5)).unwrap().state,
         ReservationState::Released
@@ -386,14 +399,11 @@ fn expire_releases_every_bundle_member() {
     );
 
     assert_eq!(outcome.result_code, ResultCode::Ok);
-    assert_eq!(
-        db.resource(ResourceId(11)).unwrap().current_state,
-        ResourceState::Available
-    );
-    assert_eq!(
-        db.resource(ResourceId(12)).unwrap().current_state,
-        ResourceState::Available
-    );
+    for resource_id in [ResourceId(11), ResourceId(12)] {
+        let resource = db.resource(resource_id).unwrap();
+        assert_eq!(resource.current_state, ResourceState::Available);
+        assert_eq!(resource.current_reservation_id, None);
+    }
     assert_eq!(
         db.reservation(ReservationId(3), Slot(5)).unwrap().state,
         ReservationState::Expired

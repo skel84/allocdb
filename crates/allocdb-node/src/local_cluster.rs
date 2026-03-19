@@ -1607,6 +1607,27 @@ mod tests {
     }
 
     #[test]
+    fn decode_layout_rejects_malformed_bundle_limit_value() {
+        let layout = fixture_layout();
+        let encoded = encode_layout(&layout);
+        let malformed_encoded = encoded.replacen(
+            &format!(
+                "core.max_bundle_size={}",
+                layout.core_config.max_bundle_size
+            ),
+            "core.max_bundle_size=not-a-u32",
+            1,
+        );
+
+        let error = decode_layout(&malformed_encoded).unwrap_err();
+        assert!(matches!(
+            error,
+            LocalClusterLayoutError::InvalidField { field, value }
+                if field == "core.max_bundle_size" && value == "not-a-u32"
+        ));
+    }
+
+    #[test]
     fn status_response_round_trips_through_text_encoding() {
         let status = fixture_status();
 
