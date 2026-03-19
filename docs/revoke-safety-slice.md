@@ -23,7 +23,8 @@ The implementation question for `M9-T08` is narrower than the full lease-model t
 ## Slice Goal
 
 Implement the minimum revoke/reclaim behavior needed to preserve the late-not-early reuse rule in
-the current single-node execution path.
+the current execution path, including the already-approved crash/retry/failover safety contract for
+`M9-T08`.
 
 For this slice, "done" means:
 
@@ -40,16 +41,19 @@ For this slice, "done" means:
 2. one explicit reclaim command in the trusted core
 3. one live non-terminal state for revoked-but-not-yet-reusable ownership
 4. one terminal revoked outcome that preserves history after reclaim
-5. the minimum executor and WAL-path plumbing needed for live apply and replay of those commands
+5. the minimum executor, persistence, and replay plumbing needed so committed revoke/reclaim
+   outcomes survive live apply, restart, and the existing failover contract
 6. invariant, negative-path, retry, and crash-recovery tests for the new safety rule
 
 ## Out Of Scope
 
 `M9-T08` should not expand into:
 
-- replication or failover work
-- snapshot schema broadening beyond what is strictly needed for this slice
-- broader public API and transport cleanup beyond the minimum already required by the live path
+- new replication protocol design, failover refactors, or replicated-surface expansion beyond what
+  is needed to preserve committed revoke/reclaim outcomes under the existing path
+- WAL or snapshot reshaping beyond the exact command/state support required for revoke/reclaim
+- broader public API and transport cleanup beyond the narrow compatibility bridge already required
+  by this slice
 - heartbeat ingestion or wall-clock reclaim logic inside the state machine
 - policy reasons or operator metadata attached to revoke/reclaim
 - holder transfer or shared-resource semantics
@@ -150,14 +154,18 @@ The slice should be built in this order:
 
 1. add core state and command variants for revoke/reclaim
 2. apply revoke/reclaim through the same executor path already used by reserve/confirm/release
-3. keep WAL replay on the same apply logic as live execution
-4. add resource-state and lease-state invariants for `revoking` and `revoked`
-5. add retry and stale-holder regression coverage
+3. add only the exact codec, snapshot, and recovery support required so live apply and replay
+   preserve committed revoke/reclaim outcomes
+4. preserve the current no-early-reuse contract under crash, retry, and failover without broadening
+   the replication surface in this slice
+5. add resource-state and lease-state invariants for `revoking` and `revoked`
+6. add retry and stale-holder regression coverage
 
 Important boundary:
 
-- if broader snapshot, transport, or replicated-surface work becomes necessary, keep the minimum
-  unblocker here and defer the broader cleanup to `M9-T09` and `M9-T10`
+- if broader WAL/snapshot cleanup, transport normalization, or replication-surface redesign becomes
+  necessary, keep only the revoke/reclaim unblocker here and defer the broader cleanup to `M9-T09`
+  and `M9-T10`
 
 ## Tests This Slice Should Add
 
@@ -171,6 +179,8 @@ Minimum test set:
 - exact duplicate revoke and reclaim requests return cached committed results
 - reserved, active, and revoking resources cannot be reused early
 - crash/restart replay preserves `revoking` vs `revoked` outcomes
+- committed revoke/reclaim outcomes preserve the same no-early-reuse behavior across the current
+  failover path
 
 ## Exit Condition
 
@@ -179,4 +189,6 @@ Minimum test set:
 - the exact revoke/reclaim behavior above is implemented or explicitly mapped to narrower code
   tasks
 - `docs/status.md` points at `#85` instead of stale `#84` language
+- the slice still satisfies the existing `M9-T08` crash/retry/failover acceptance criteria without
+  silently expanding into broader `M9-T09` or `M9-T10` cleanup
 - later work is cleanly reserved for `M9-T09` through `M9-T11`
