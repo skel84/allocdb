@@ -81,14 +81,11 @@ fn reserve_bundle_acquires_all_resources_atomically() {
     let reservation = db.reservation(ReservationId(3), Slot(5)).unwrap();
     assert_eq!(reservation.member_count, 2);
     assert_eq!(reservation.resource_id, ResourceId(11));
-    assert_eq!(
-        db.resource(ResourceId(11)).unwrap().current_reservation_id,
-        Some(ReservationId(3))
-    );
-    assert_eq!(
-        db.resource(ResourceId(12)).unwrap().current_reservation_id,
-        Some(ReservationId(3))
-    );
+    for resource_id in [ResourceId(11), ResourceId(12)] {
+        let resource = db.resource(resource_id).unwrap();
+        assert_eq!(resource.current_state, ResourceState::Reserved);
+        assert_eq!(resource.current_reservation_id, Some(ReservationId(3)));
+    }
 }
 
 #[test]
@@ -127,6 +124,15 @@ fn reserve_bundle_leaves_no_partial_state_on_conflict() {
     assert_eq!(outcome.result_code, ResultCode::ResourceBusy);
     assert_eq!(db.reservations.len(), 1);
     assert_eq!(db.reservation_members.len(), 1);
+    assert_eq!(
+        db.reservation_member(ReservationId(3), 0).unwrap(),
+        ReservationMemberRecord {
+            reservation_id: ReservationId(3),
+            resource_id: ResourceId(11),
+            member_index: 0,
+        }
+    );
+    assert!(db.reservation_member(ReservationId(4), 0).is_none());
     assert_eq!(
         db.resource(ResourceId(11)).unwrap().current_reservation_id,
         Some(ReservationId(3))
@@ -239,11 +245,12 @@ fn single_resource_bundle_matches_plain_reserve() {
         plain.resource(ResourceId(11)).unwrap()
     );
     assert_eq!(
-        bundled
-            .reservation_member(ReservationId(2), 0)
-            .unwrap()
-            .resource_id,
-        ResourceId(11)
+        bundled.reservation_members.len(),
+        plain.reservation_members.len()
+    );
+    assert_eq!(
+        bundled.reservation_member(ReservationId(2), 0).unwrap(),
+        plain.reservation_member(ReservationId(2), 0).unwrap()
     );
 }
 
@@ -274,6 +281,10 @@ fn reserve_bundle_rejects_duplicate_resource_ids() {
         db.resource(ResourceId(11)).unwrap().current_state,
         ResourceState::Available
     );
+    assert_eq!(
+        db.resource(ResourceId(11)).unwrap().current_reservation_id,
+        None
+    );
 }
 
 #[test]
@@ -302,6 +313,10 @@ fn reserve_bundle_rejects_mixed_existing_and_missing_resources() {
     assert_eq!(
         db.resource(ResourceId(11)).unwrap().current_state,
         ResourceState::Available
+    );
+    assert_eq!(
+        db.resource(ResourceId(11)).unwrap().current_reservation_id,
+        None
     );
     assert!(db.resource(ResourceId(99)).is_none());
 }
@@ -338,14 +353,11 @@ fn confirm_and_release_update_every_bundle_member() {
         },
     );
     assert_eq!(confirmed.result_code, ResultCode::Ok);
-    assert_eq!(
-        db.resource(ResourceId(11)).unwrap().current_state,
-        ResourceState::Confirmed
-    );
-    assert_eq!(
-        db.resource(ResourceId(12)).unwrap().current_state,
-        ResourceState::Confirmed
-    );
+    for resource_id in [ResourceId(11), ResourceId(12)] {
+        let resource = db.resource(resource_id).unwrap();
+        assert_eq!(resource.current_state, ResourceState::Confirmed);
+        assert_eq!(resource.current_reservation_id, Some(ReservationId(3)));
+    }
 
     let released = db.apply_client(
         context(5, 2),
