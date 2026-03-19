@@ -58,14 +58,6 @@ impl AllocDb {
             return CommandOutcome::new(ResultCode::ReservationNotFound);
         };
 
-        if reservation.retire_after_slot.is_some() {
-            warn!(
-                "confirm rejected reservation_retired reservation_id={}",
-                reservation_id.get()
-            );
-            return CommandOutcome::new(ResultCode::ReservationRetired);
-        }
-
         if reservation.holder_id != holder_id {
             warn!(
                 "confirm rejected holder_mismatch reservation_id={} holder_id={}",
@@ -84,6 +76,14 @@ impl AllocDb {
                 lease_epoch
             );
             return CommandOutcome::new(ResultCode::StaleEpoch);
+        }
+
+        if reservation.retire_after_slot.is_some() {
+            warn!(
+                "confirm rejected reservation_retired reservation_id={}",
+                reservation_id.get()
+            );
+            return CommandOutcome::new(ResultCode::ReservationRetired);
         }
 
         if reservation.state != ReservationState::Reserved {
@@ -148,14 +148,6 @@ impl AllocDb {
             return CommandOutcome::new(ResultCode::ReservationNotFound);
         };
 
-        if reservation.retire_after_slot.is_some() {
-            warn!(
-                "release rejected reservation_retired reservation_id={}",
-                reservation_id.get()
-            );
-            return CommandOutcome::new(ResultCode::ReservationRetired);
-        }
-
         if reservation.holder_id != holder_id {
             warn!(
                 "release rejected holder_mismatch reservation_id={} holder_id={}",
@@ -174,6 +166,14 @@ impl AllocDb {
                 lease_epoch
             );
             return CommandOutcome::new(ResultCode::StaleEpoch);
+        }
+
+        if reservation.retire_after_slot.is_some() {
+            warn!(
+                "release rejected reservation_retired reservation_id={}",
+                reservation_id.get()
+            );
+            return CommandOutcome::new(ResultCode::ReservationRetired);
         }
 
         match reservation.state {

@@ -178,3 +178,43 @@ fn release_rejects_stale_epoch_without_mutating_state() {
         ResourceState::Reserved
     );
 }
+
+#[test]
+fn release_rejects_stale_epoch_even_after_retirement() {
+    let mut db = AllocDb::new(config()).unwrap();
+    db.apply_client(context(1, 1), create(11));
+    db.apply_client(
+        context(2, 2),
+        ClientRequest {
+            operation_id: OperationId(2),
+            client_id: ClientId(7),
+            command: Command::Reserve {
+                resource_id: ResourceId(11),
+                holder_id: HolderId(1),
+                ttl_slots: 1,
+            },
+        },
+    );
+    db.apply_internal(
+        context(3, 3),
+        Command::Expire {
+            reservation_id: ReservationId(2),
+            deadline_slot: Slot(3),
+        },
+    );
+
+    let stale = db.apply_client(
+        context(4, 4),
+        ClientRequest {
+            operation_id: OperationId(4),
+            client_id: ClientId(7),
+            command: Command::Release {
+                reservation_id: ReservationId(2),
+                holder_id: HolderId(1),
+                lease_epoch: 1,
+            },
+        },
+    );
+
+    assert_eq!(stale.result_code, ResultCode::StaleEpoch);
+}

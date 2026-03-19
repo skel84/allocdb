@@ -84,10 +84,7 @@ fn stale_confirm_cannot_confirm_a_newer_reservation() {
         },
     );
 
-    assert!(matches!(
-        stale_confirm.result_code,
-        ResultCode::StaleEpoch | ResultCode::ReservationRetired
-    ));
+    assert_eq!(stale_confirm.result_code, ResultCode::StaleEpoch);
     assert_eq!(
         db.resource(ResourceId(11)).unwrap().current_reservation_id,
         Some(ReservationId(4))
