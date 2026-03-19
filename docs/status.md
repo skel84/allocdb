@@ -1,7 +1,8 @@
 # AllocDB Status
 
 ## Current State
-- Phase: replicated implementation with external Jepsen gate closed and M9 core follow-on active
+- Phase: replicated implementation with external Jepsen gate closed and M9 core follow-on
+  implemented and live-validated
 - Planning IDs: tasks use `M#-T#`; spikes use `M#-S#`
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
@@ -34,9 +35,12 @@
     three-replica cluster runner, fault-control harness, and QEMU testbed around the real replica
     daemon; the first trusted-core bundle-commit slice with bundle membership, bundle-aware
     confirm/release/expire, and bundle regression coverage; the first fencing slice with
-    lease-epoch propagation, stale-holder rejection, and epoch-aware retry/read coverage; plus
-    replicated preservation for committed bundle membership and stale-holder rejection across
-    failover and suffix/snapshot rejoin
+    lease-epoch propagation, stale-holder rejection, and epoch-aware retry/read coverage; explicit
+    revoke/reclaim with late-not-early reuse preserved across replay and failover; lease-shaped
+    node API exposure for bundle membership and authority state; replicated preservation for
+    committed bundle membership and stale-holder rejection across failover and suffix/snapshot
+    rejoin; and live KubeVirt Jepsen lease-safety control and `1800s` crash-restart runs with
+    `blockers=0`
 
 ## What Exists
 
@@ -197,17 +201,18 @@
   - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
 ## Current Focus
-- PR `#82` merged the `#70` maintainability follow-up, including live KubeVirt `reservation_contention-control`
-  and full `1800s` `reservation_contention-crash-restart` reruns on `allocdb-a` with `blockers=0`
-- `M9-T01` through `M9-T05` are merged on `main` via PR `#81`, and the planning issues are closed on the `AllocDB` project
+- PR `#82` merged the `#70` maintainability follow-up, including live KubeVirt
+  `reservation_contention-control` and full `1800s`
+  `reservation_contention-crash-restart` reruns on `allocdb-a` with `blockers=0`
+- `M9-T01` through `M9-T05` are merged on `main` via PR `#81`, and the planning issues are
+  closed on the `AllocDB` project
 - PRs `#89`, `#90`, `#92`, `#93`, `#94`, and `#95` merged the full `M9-T06` through `M9-T11`
   implementation chain on `main`: bundle commit, lease-epoch fencing, explicit `revoke` /
   `reclaim`, lease-shaped node API exposure, replication-preserved failover behavior, and broader
   simulation coverage are now all in the mainline implementation
-- issue `#96` is the active follow-on validation slice on the current branch: extend Jepsen
-  history generation and analysis for bundle reserve, revoke/reclaim, and stale-holder lease
-  paths, then run a small live KubeVirt matrix for that workload
-- targeted validation on the active `#96` branch currently centers on `cargo test -p allocdb-node jepsen -- --nocapture`,
-  `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, and `./scripts/preflight.sh`
-- the next recommended step after `#96` is either live KubeVirt lease-safety validation or new
-  milestone planning beyond `M9`, not more unplanned lease-kernel semantics work
+- PR `#97` merged issue `#96`, extending Jepsen history generation and analysis for bundle
+  reserve, revoke/reclaim, and stale-holder lease paths, then closing the loop with live KubeVirt
+  `lease_safety-control` and full `1800s` `lease_safety-crash-restart` evidence on `allocdb-a`,
+  both with `blockers=0`
+- the next recommended step is milestone planning beyond `M9` or downstream integration work such
+  as `gpu_control_plane`, not more unplanned lease-kernel semantics work
