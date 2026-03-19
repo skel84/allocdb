@@ -14,7 +14,7 @@
   - `M6` replication design: implemented
   - `M7` replicated core prototype: in progress
   - `M8` external cluster validation: in progress
-  - `M9` generic lease-kernel follow-on: `T07` merged, `T08` implementation in progress on issue branch
+  - `M9` generic lease-kernel follow-on: `T10` merged, `T11` broader regression coverage in progress
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -34,9 +34,9 @@
     three-replica cluster runner, fault-control harness, and QEMU testbed around the real replica
     daemon; the first trusted-core bundle-commit slice with bundle membership, bundle-aware
     confirm/release/expire, and bundle regression coverage; the first fencing slice with
-    lease-epoch propagation, stale-holder rejection, and epoch-aware retry/read coverage; and the
-    active revoke/reclaim slice on the issue branch with `revoking` / `revoked` lifecycle support,
-    replay-safe recovery, and one replicated failover regression for no-early-reuse preservation
+    lease-epoch propagation, stale-holder rejection, and epoch-aware retry/read coverage; plus
+    replicated preservation for committed bundle membership and stale-holder rejection across
+    failover and suffix/snapshot rejoin
 
 ## What Exists
 
@@ -195,11 +195,9 @@
   - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
 ## Current Focus
-- PR `#82` merged the `#70` maintainability follow-up, including live KubeVirt
-  `reservation_contention-control` and full `1800s` `reservation_contention-crash-restart`
-  reruns on `allocdb-a` with `blockers=0`
-- `M9-T01` through `M9-T05` are merged on `main` via PR `#81`, and the planning issues are closed
-  on the `AllocDB` project
+- PR `#82` merged the `#70` maintainability follow-up, including live KubeVirt `reservation_contention-control`
+  and full `1800s` `reservation_contention-crash-restart` reruns on `allocdb-a` with `blockers=0`
+- `M9-T01` through `M9-T05` are merged on `main` via PR `#81`, and the planning issues are closed on the `AllocDB` project
 - PR `#89` merged `M9-T06` on `main`: the trusted core now supports atomic bundle reservation,
   explicit bundle membership records, bundle-aware confirm/release/expire, and bundle-aware
   snapshot/codec coverage while preserving the existing reservation compatibility surface
@@ -211,10 +209,12 @@
 - PR `#93` merged `M9-T09` on `main`: the node API and wire codec now expose the approved
   lease-centric surface with `get_lease`, flattened committed results, `current_lease_id`, and
   ordered `member_resource_ids`, while keeping the trusted-core naming and apply path intact
-- issue `#87` / `M9-T10` is the active implementation slice on the current branch: preserve
-  bundle ownership, fencing outcomes, and revoke safety across replication, failover, and replica
-  rejoin without introducing a second apply path
-- targeted validation on the active `#87` branch currently centers on `cargo test -p allocdb-node replicated_simulation -- --nocapture`,
-  `cargo test -p allocdb-node replica -- --nocapture`, and `./scripts/preflight.sh`
-- the active `#87` branch keeps the `T10` / `T11` boundary explicit: it proves replicated-path preservation for the approved lease primitives, while broader scenario expansion stays in `M9-T11`
-- the next planned code-bearing slice after `#87` remains `M9-T11` broader regression coverage
+- PR `#94` merged `M9-T10` on `main`: replication and failover now preserve committed bundle
+  membership plus stale-holder rejection without introducing a second apply path
+- issue `#88` / `M9-T11` is the active implementation slice on the current branch: broaden
+  deterministic simulation and replicated regression coverage for bundle retries, revoke races,
+  stale-holder rejection, crash recovery, and failover
+- targeted validation on the active `#88` branch currently centers on `cargo test -p allocdb-node simulation -- --nocapture`,
+  `cargo test -p allocdb-node replicated_simulation -- --nocapture`, and `./scripts/preflight.sh`
+- the active `#88` branch is the final planned `M9` code-bearing slice before any new milestone
+  planning
