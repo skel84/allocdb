@@ -153,6 +153,144 @@ fn reserve_bundle_rejects_requests_beyond_configured_limit() {
 }
 
 #[test]
+fn reserve_bundle_rejects_empty_resource_sets() {
+    let mut config = bundle_config();
+    config.max_bundle_size = 2;
+    let mut db = AllocDb::new(config).unwrap();
+
+    let outcome = db.apply_client(
+        context(1, 2),
+        ClientRequest {
+            operation_id: OperationId(1),
+            client_id: ClientId(7),
+            command: Command::ReserveBundle {
+                resource_ids: Vec::new(),
+                holder_id: HolderId(5),
+                ttl_slots: 3,
+            },
+        },
+    );
+
+    assert_eq!(outcome.result_code, ResultCode::BundleTooLarge);
+    assert_eq!(db.reservations.len(), 0);
+    assert_eq!(db.reservation_members.len(), 0);
+}
+
+#[test]
+fn single_resource_bundle_matches_plain_reserve() {
+    let mut config = bundle_config();
+    config.max_bundle_size = 2;
+
+    let mut plain = AllocDb::new(config.clone()).unwrap();
+    plain.apply_client(context(1, 1), create(11));
+
+    let plain_outcome = plain.apply_client(
+        context(2, 5),
+        ClientRequest {
+            operation_id: OperationId(2),
+            client_id: ClientId(7),
+            command: Command::Reserve {
+                resource_id: ResourceId(11),
+                holder_id: HolderId(9),
+                ttl_slots: 4,
+            },
+        },
+    );
+
+    let mut bundled = AllocDb::new(config).unwrap();
+    bundled.apply_client(context(1, 1), create(11));
+
+    let bundled_outcome = bundled.apply_client(
+        context(2, 5),
+        ClientRequest {
+            operation_id: OperationId(2),
+            client_id: ClientId(7),
+            command: Command::ReserveBundle {
+                resource_ids: vec![ResourceId(11)],
+                holder_id: HolderId(9),
+                ttl_slots: 4,
+            },
+        },
+    );
+
+    assert_eq!(bundled_outcome, plain_outcome);
+    assert_eq!(
+        bundled.reservation(ReservationId(2), Slot(5)).unwrap(),
+        plain.reservation(ReservationId(2), Slot(5)).unwrap()
+    );
+    assert_eq!(
+        bundled.resource(ResourceId(11)).unwrap(),
+        plain.resource(ResourceId(11)).unwrap()
+    );
+    assert_eq!(
+        bundled
+            .reservation_member(ReservationId(2), 0)
+            .unwrap()
+            .resource_id,
+        ResourceId(11)
+    );
+}
+
+#[test]
+fn reserve_bundle_rejects_duplicate_resource_ids() {
+    let mut config = bundle_config();
+    config.max_bundle_size = 2;
+    let mut db = AllocDb::new(config).unwrap();
+    db.apply_client(context(1, 1), create(11));
+
+    let outcome = db.apply_client(
+        context(2, 2),
+        ClientRequest {
+            operation_id: OperationId(2),
+            client_id: ClientId(7),
+            command: Command::ReserveBundle {
+                resource_ids: vec![ResourceId(11), ResourceId(11)],
+                holder_id: HolderId(9),
+                ttl_slots: 3,
+            },
+        },
+    );
+
+    assert_eq!(outcome.result_code, ResultCode::ResourceBusy);
+    assert_eq!(db.reservations.len(), 0);
+    assert_eq!(db.reservation_members.len(), 0);
+    assert_eq!(
+        db.resource(ResourceId(11)).unwrap().current_state,
+        ResourceState::Available
+    );
+}
+
+#[test]
+fn reserve_bundle_rejects_mixed_existing_and_missing_resources() {
+    let mut config = bundle_config();
+    config.max_bundle_size = 2;
+    let mut db = AllocDb::new(config).unwrap();
+    db.apply_client(context(1, 1), create(11));
+
+    let outcome = db.apply_client(
+        context(2, 2),
+        ClientRequest {
+            operation_id: OperationId(2),
+            client_id: ClientId(7),
+            command: Command::ReserveBundle {
+                resource_ids: vec![ResourceId(11), ResourceId(99)],
+                holder_id: HolderId(9),
+                ttl_slots: 3,
+            },
+        },
+    );
+
+    assert_eq!(outcome.result_code, ResultCode::ResourceNotFound);
+    assert_eq!(db.reservations.len(), 0);
+    assert_eq!(db.reservation_members.len(), 0);
+    assert_eq!(
+        db.resource(ResourceId(11)).unwrap().current_state,
+        ResourceState::Available
+    );
+    assert!(db.resource(ResourceId(99)).is_none());
+}
+
+#[test]
 fn confirm_and_release_update_every_bundle_member() {
     let mut config = bundle_config();
     config.max_bundle_size = 2;
