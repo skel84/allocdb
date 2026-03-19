@@ -2,7 +2,8 @@ use crate::config::{Config, ConfigError};
 use crate::fixed_map::FixedMapError;
 use crate::ids::{Lsn, ReservationId, Slot};
 use crate::state_machine::{
-    AllocDb, AllocDbInvariantError, OperationRecord, ReservationRecord, ResourceRecord,
+    AllocDb, AllocDbInvariantError, OperationRecord, ReservationMemberRecord, ReservationRecord,
+    ResourceRecord,
 };
 
 #[path = "snapshot_codec.rs"]
@@ -17,7 +18,7 @@ mod issue_30_tests;
 mod tests;
 
 const MAGIC: u32 = 0x4144_4253;
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
@@ -26,6 +27,7 @@ pub struct Snapshot {
     pub max_retired_reservation_id: Option<ReservationId>,
     pub resources: Vec<ResourceRecord>,
     pub reservations: Vec<ReservationRecord>,
+    pub reservation_members: Vec<ReservationMemberRecord>,
     pub operations: Vec<OperationRecord>,
     pub wheel: Vec<Vec<crate::ids::ReservationId>>,
 }
@@ -50,12 +52,20 @@ pub enum SnapshotError {
         count: usize,
         max: usize,
     },
+    ReservationMemberTableOverCapacity {
+        count: usize,
+        max: usize,
+    },
     OperationTableOverCapacity {
         count: usize,
         max: usize,
     },
     DuplicateResourceId(crate::ids::ResourceId),
     DuplicateReservationId(crate::ids::ReservationId),
+    DuplicateReservationMember {
+        reservation_id: crate::ids::ReservationId,
+        member_index: u32,
+    },
     DuplicateOperationId(crate::ids::OperationId),
     Invariant(AllocDbInvariantError),
     Config(ConfigError),
@@ -104,6 +114,10 @@ impl AllocDb {
         let mut reservations: Vec<_> = self.reservations.iter().copied().collect();
         reservations.sort_unstable_by_key(|record| record.reservation_id.get());
 
+        let mut reservation_members: Vec<_> = self.reservation_members.iter().copied().collect();
+        reservation_members
+            .sort_unstable_by_key(|record| (record.reservation_id.get(), record.member_index));
+
         let mut operations: Vec<_> = self.operations.iter().copied().collect();
         operations.sort_unstable_by_key(|record| record.operation_id.get());
 
@@ -113,6 +127,7 @@ impl AllocDb {
             max_retired_reservation_id: self.max_retired_reservation_id,
             resources,
             reservations,
+            reservation_members,
             operations,
             wheel: self.wheel.clone(),
         }
@@ -135,6 +150,7 @@ impl AllocDb {
             max_retired_reservation_id,
             resources,
             reservations,
+            reservation_members,
             operations,
             wheel,
         } = snapshot;
@@ -149,6 +165,7 @@ impl AllocDb {
             usize::try_from(db.config.max_resources).expect("validated max_resources must fit");
         let max_reservations = usize::try_from(db.config.max_reservations)
             .expect("validated max_reservations must fit");
+        let max_reservation_members = db.config.max_reservation_members();
         let max_operations =
             usize::try_from(db.config.max_operations).expect("validated max_operations must fit");
 
@@ -158,6 +175,11 @@ impl AllocDb {
         ensure_snapshot_capacity(reservations.len(), max_reservations, |count, max| {
             SnapshotError::ReservationTableOverCapacity { count, max }
         })?;
+        ensure_snapshot_capacity(
+            reservation_members.len(),
+            max_reservation_members,
+            |count, max| SnapshotError::ReservationMemberTableOverCapacity { count, max },
+        )?;
         ensure_snapshot_capacity(operations.len(), max_operations, |count, max| {
             SnapshotError::OperationTableOverCapacity { count, max }
         })?;
@@ -165,6 +187,7 @@ impl AllocDb {
         restore_resources(&mut db, resources, max_resources)?;
         let mut reservation_retire_entries =
             restore_reservations(&mut db, reservations, max_reservations)?;
+        restore_reservation_members(&mut db, reservation_members, max_reservation_members)?;
         let mut operation_retire_entries = restore_operations(&mut db, operations, max_operations)?;
         db.rebuild_retire_queues(
             &mut reservation_retire_entries,
@@ -256,6 +279,33 @@ fn restore_reservations(
     }
 
     Ok(reservation_retire_entries)
+}
+
+fn restore_reservation_members(
+    db: &mut AllocDb,
+    reservation_members: Vec<ReservationMemberRecord>,
+    max_reservation_members: usize,
+) -> Result<(), SnapshotError> {
+    for record in reservation_members {
+        let key = AllocDb::reservation_member_key(record.reservation_id, record.member_index);
+        match db.reservation_members.insert(key, record) {
+            Ok(()) => {}
+            Err(FixedMapError::DuplicateKey) => {
+                return Err(SnapshotError::DuplicateReservationMember {
+                    reservation_id: record.reservation_id,
+                    member_index: record.member_index,
+                });
+            }
+            Err(FixedMapError::Full) => {
+                return Err(SnapshotError::ReservationMemberTableOverCapacity {
+                    count: max_reservation_members.saturating_add(1),
+                    max: max_reservation_members,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn restore_operations(

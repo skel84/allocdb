@@ -51,7 +51,7 @@ pub(crate) struct TickObservation {
     pub expirations: Vec<ExpirationObservation>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ScheduleActionKind {
     Submit(ClientRequest),
     TickExpirations,
@@ -144,7 +144,7 @@ impl SimulatedSlotDriver {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ResolvedScheduleAction {
     label: &'static str,
     slot: Slot,
@@ -204,10 +204,11 @@ impl SimulationHarness {
         while !pending.is_empty() {
             let index = self.slot_driver.choose_index(pending.len());
             let request = pending.remove(index);
+            let operation_id = request.operation_id;
             let result = self.submit(request)?;
             transcript.push(SimulationObservation {
                 slot: self.current_slot(),
-                operation_id: request.operation_id,
+                operation_id,
                 applied_lsn: result.applied_lsn,
                 result_code: result.outcome.result_code,
                 from_retry_cache: result.from_retry_cache,
@@ -238,7 +239,7 @@ impl SimulationHarness {
             pending.push(ResolvedScheduleAction {
                 label: action.label,
                 slot,
-                action: action.action,
+                action: action.action.clone(),
             });
         }
 
@@ -348,10 +349,11 @@ impl SimulationHarness {
     ) -> Result<ScheduleObservation, SubmissionError> {
         let outcome = match action.action {
             ScheduleActionKind::Submit(request) => {
+                let operation_id = request.operation_id;
                 let result = self.submit(request)?;
                 ScheduleObservationKind::Submit(SimulationObservation {
                     slot: self.current_slot(),
-                    operation_id: request.operation_id,
+                    operation_id,
                     applied_lsn: result.applied_lsn,
                     result_code: result.outcome.result_code,
                     from_retry_cache: result.from_retry_cache,

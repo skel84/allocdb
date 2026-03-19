@@ -32,6 +32,7 @@ fn core_config() -> Config {
         shard_id: 0,
         max_resources: 8,
         max_reservations: 8,
+        max_bundle_size: 1,
         max_operations: 16,
         max_ttl_slots: 16,
         max_client_retry_window_slots: 8,
@@ -247,7 +248,7 @@ fn duplicate_retry_returns_cached_result_without_wal_growth() {
     let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
     let request = create(11, 1);
 
-    let first = engine.submit(Slot(1), request).unwrap();
+    let first = engine.submit(Slot(1), request.clone()).unwrap();
     let wal_len = fs::metadata(&wal_path).unwrap().len();
     let second = engine.submit(Slot(2), request).unwrap();
 
@@ -265,9 +266,9 @@ fn queued_duplicate_retry_reuses_original_submission() {
     let wal_path = test_path("queued-retry-cache");
     let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
     let request = create(11, 1);
-    let expected_wal_len = u64::try_from(31 + encode_client_request(request).len()).unwrap();
+    let expected_wal_len = u64::try_from(31 + encode_client_request(&request).len()).unwrap();
 
-    let queued = engine.enqueue_client(Slot(1), request).unwrap();
+    let queued = engine.enqueue_client(Slot(1), request.clone()).unwrap();
     assert_eq!(queued, EnqueueResult::Queued);
 
     let retry = engine.submit(Slot(2), request).unwrap();

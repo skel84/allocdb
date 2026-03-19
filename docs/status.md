@@ -1,7 +1,7 @@
 # AllocDB Status
 
 ## Current State
-- Phase: replicated implementation with Jepsen maintainability follow-up and M9 docs freeze
+- Phase: replicated implementation with external Jepsen gate closed and M9 core follow-on active
 - Planning IDs: tasks use `M#-T#`; spikes use `M#-S#`
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
@@ -14,7 +14,7 @@
   - `M6` replication design: implemented
   - `M7` replicated core prototype: in progress
   - `M8` external cluster validation: in progress
-  - `M9` generic lease-kernel follow-on: docs freeze merged; implementation pending
+  - `M9` generic lease-kernel follow-on: `T06` in progress on issue branch
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -30,9 +30,10 @@
     fail-closed faulted-state entry; majority-backed quorum writes with primary-only reads,
     quorum-loss demotion, and higher-view takeover; suffix and snapshot-based stale-replica rejoin
     with divergent prepared-suffix discard; promoted partition and primary-crash scenarios that
-    preserve fail-closed behavior and retry/read continuity after failover; and the first local
+    preserve fail-closed behavior and retry/read continuity after failover; the local
     three-replica cluster runner, fault-control harness, and QEMU testbed around the real replica
-    daemon
+    daemon; and the first trusted-core bundle-commit slice with bundle membership, bundle-aware
+    confirm/release/expire, and bundle regression coverage
 
 ## What Exists
 
@@ -189,25 +190,17 @@
   - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
 ## Current Focus
-- `M8-T04` now has one real external Jepsen executor for the documented release-gate matrix across both QEMU and KubeVirt: the live runtime surface covers replicated `submit`, strict reads, and `tick_expirations`, while `allocdb-jepsen` can now capture one KubeVirt layout, verify the KubeVirt surface, execute real KubeVirt control runs with archived histories and host-side failover/rejoin cutovers, and expose both one single-lane watcher and one multi-lane KubeVirt fleet watcher for live phase/replica progress during the run
-- Jepsen run isolation is now stronger on persistent clusters: each `allocdb-jepsen` invocation uses one distinct client/slot namespace instead of reusing the same request identity across separate runs
-- multi-lane external Jepsen staging is now lane-scoped on the host, and faulted iterations repair the cluster back to one primary plus two backups before the next slice starts, so KubeVirt partition-heal and mixed-failover waves do not inherit temp-path collisions or a partially recovered lane
-- server-side debugging is stronger now: the replica daemon initializes structured `log` output on KubeVirt guests, replica role/view transitions are logged inside `ReplicaNode`, and the authoritative trace now lives in guest-local `/var/log/allocdb/replica-{1,2,3}.log`
-- the expiration-and-recovery Jepsen scenarios now drain bounded expiration backlog explicitly on
-  long-lived lanes by issuing follow-up ticks until the target resource becomes `Available`, so
-  one committed tick batch does not get misclassified as a target expiration when earlier due
-  reservations still remain ahead of it
-- the rebuilt KubeVirt release-gate profile is now proven end to end: `3` spread lanes on
-  `longhorn-strict-local-wffc` completed the full documented `15`-run Jepsen matrix, and every
-  control, crash-restart, partition-heal, and mixed-failover run finished with
-  `release_gate_passed=true` and `blockers=0`
-- the immediate maintainability follow-up is issue `#70`: split `allocdb-jepsen.rs` into
-  focused bin-local modules first, then re-evaluate a dedicated validation crate or Hetzner
-  follow-on once the existing KubeVirt path is easier to maintain
-- `M9-T01` through `M9-T05` are now merged on `main` via PR `#81`, and the corresponding planning
-  issues are closed on the `AllocDB` project
-- the immediate maintainability follow-up is issue `#70`: keep `allocdb-jepsen` thin and
-  bin-local by moving remaining bulk, including the binary test module, out of
-  `allocdb-jepsen.rs`
-- the next `M9` implementation slice after `#70` is `M9-T06`: atomic bundle commit in the trusted
-  core, followed by fencing, revoke, persistence, replication, and regression coverage
+- PR `#82` merged the `#70` maintainability follow-up, and the closing evidence included the live
+  KubeVirt `reservation_contention-control` and full `1800s`
+  `reservation_contention-crash-restart` reruns on `allocdb-a` with `blockers=0`
+- `M9-T01` through `M9-T05` are merged on `main` via PR `#81`, and the planning issues are closed
+  on the `AllocDB` project
+- issue `#83` / `M9-T06` is the active implementation slice on the current branch: the trusted
+  core now has atomic bundle reservation, explicit bundle membership records, bundle-aware
+  confirm/release/expire, and bundle-aware snapshot/codec coverage while preserving the existing
+  reservation compatibility surface
+- validation for the `#83` branch currently includes `cargo test -p allocdb-core -- --nocapture`
+  plus full workspace test compilation via `cargo test --workspace --no-run`
+- the next planned slices after `#83` remain `M9-T07` fencing, `M9-T08` revoke/safe reuse,
+  `M9-T09` persistence and transport extension, `M9-T10` replication preservation, and
+  `M9-T11` broader regression coverage

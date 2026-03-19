@@ -24,6 +24,8 @@ impl AllocDb {
                     removed.is_some(),
                     "queued reservation retirement must remove one entry"
                 );
+                let removed = removed.expect("removed reservation must be present");
+                self.remove_reservation_members(removed.reservation_id, removed.member_count);
                 self.record_retired_reservation_id(entry.key);
             }
         }

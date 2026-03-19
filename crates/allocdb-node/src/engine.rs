@@ -575,7 +575,7 @@ impl SingleNodeEngine {
         request_slot: Slot,
         request: ClientRequest,
     ) -> Result<EnqueueResult, SubmissionError> {
-        let encoded = encode_client_request(request);
+        let encoded = encode_client_request(&request);
         self.enqueue_validated(request_slot, request, encoded)
     }
 
@@ -613,7 +613,7 @@ impl SingleNodeEngine {
 
         self.validate_bytes(encoded)?;
         let request = decode_client_request(encoded).map_err(SubmissionError::InvalidRequest)?;
-        self.validate_client_request_slot(request_slot, request.command)
+        self.validate_client_request_slot(request_slot, &request.command)
     }
 
     /// Processes one queued submission by assigning an LSN, appending it to the WAL, syncing, and
@@ -785,7 +785,7 @@ impl SingleNodeEngine {
 
         self.validate_bytes(&encoded)?;
 
-        if let Some(existing) = self.lookup_existing(request_slot, request) {
+        if let Some(existing) = self.lookup_existing(request_slot, &request) {
             return Ok(EnqueueResult::Published(existing));
         }
 
@@ -804,7 +804,7 @@ impl SingleNodeEngine {
             return Err(error);
         }
 
-        self.validate_client_request_slot(request_slot, request.command)?;
+        self.validate_client_request_slot(request_slot, &request.command)?;
 
         self.queue
             .push(PendingSubmission {
@@ -836,7 +836,7 @@ impl SingleNodeEngine {
 
         self.validate_bytes(encoded)?;
         let command = decode_internal_command(encoded).map_err(SubmissionError::InvalidRequest)?;
-        self.validate_internal_request_slot(request_slot, command)
+        self.validate_internal_request_slot(request_slot, &command)
     }
 
     fn process_one(&mut self) -> Result<Option<ProcessedSubmission>, SubmissionError> {
@@ -1014,7 +1014,14 @@ impl SingleNodeEngine {
             return Err(error);
         }
 
-        self.validate_internal_request_slot(request_slot, command)?;
+        self.validate_internal_request_slot(request_slot, &command)?;
+        let expire_log = match &command {
+            Command::Expire {
+                reservation_id,
+                deadline_slot,
+            } => Some((*reservation_id, *deadline_slot)),
+            _ => None,
+        };
 
         let applied_lsn = Lsn(self.next_lsn);
         let injected_failure = self.take_injected_persist_failure();
@@ -1034,7 +1041,7 @@ impl SingleNodeEngine {
             lsn: applied_lsn,
             request_slot,
             record_type: RecordType::InternalCommand,
-            payload: encode_internal_command(command),
+            payload: encode_internal_command(&command),
         };
 
         if let Err(error) = self.wal.append_frame(&frame) {
@@ -1079,11 +1086,7 @@ impl SingleNodeEngine {
             },
             command,
         );
-        if let Command::Expire {
-            reservation_id,
-            deadline_slot,
-        } = command
-        {
+        if let Some((reservation_id, deadline_slot)) = expire_log {
             info!(
                 "applied internal expiration command: request_slot={} reservation_id={} deadline_slot={} applied_lsn={} result_code={:?}",
                 request_slot.get(),
@@ -1134,7 +1137,7 @@ impl SingleNodeEngine {
     fn lookup_existing(
         &self,
         request_slot: Slot,
-        request: ClientRequest,
+        request: &ClientRequest,
     ) -> Option<SubmissionResult> {
         let fingerprint = request.command.fingerprint();
         self.db
@@ -1172,7 +1175,7 @@ impl SingleNodeEngine {
     fn validate_client_request_slot(
         &self,
         request_slot: Slot,
-        command: Command,
+        command: &Command,
     ) -> Result<(), SubmissionError> {
         self.db
             .validate_client_request_slot(request_slot, command)
@@ -1182,7 +1185,7 @@ impl SingleNodeEngine {
     fn validate_internal_request_slot(
         &self,
         request_slot: Slot,
-        command: Command,
+        command: &Command,
     ) -> Result<(), SubmissionError> {
         self.db
             .validate_internal_request_slot(request_slot, command)

@@ -27,6 +27,7 @@ const REPLICA_RUN_DIR_NAME: &str = "run";
 const REPLICA_METADATA_FILE_NAME: &str = "replica.metadata";
 const REPLICA_SNAPSHOT_FILE_NAME: &str = "state.snapshot";
 const REPLICA_WAL_FILE_NAME: &str = "state.wal";
+const DEFAULT_LOCAL_CLUSTER_MAX_BUNDLE_SIZE: u32 = 1;
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_millis(250);
 const CONTROL_STATUS_RETRY_DELAY: Duration = Duration::from_millis(10);
 const CONTROL_STATUS_MAX_ATTEMPTS: usize = 3;
@@ -459,6 +460,7 @@ pub fn default_local_cluster_core_config() -> Config {
         shard_id: 0,
         max_resources: 1_024,
         max_reservations: 1_024,
+        max_bundle_size: DEFAULT_LOCAL_CLUSTER_MAX_BUNDLE_SIZE,
         max_operations: 4_096,
         max_ttl_slots: 256,
         max_client_retry_window_slots: 128,
@@ -1016,6 +1018,10 @@ fn encode_layout(layout: &LocalClusterLayout) -> String {
             "core.max_reservations={}",
             layout.core_config.max_reservations
         ),
+        format!(
+            "core.max_bundle_size={}",
+            layout.core_config.max_bundle_size
+        ),
         format!("core.max_operations={}", layout.core_config.max_operations),
         format!("core.max_ttl_slots={}", layout.core_config.max_ttl_slots),
         format!(
@@ -1091,6 +1097,11 @@ fn decode_layout(bytes: &str) -> Result<LocalClusterLayout, LocalClusterLayoutEr
         shard_id: parse_required_u64(&fields, "core.shard_id")?,
         max_resources: parse_required_u32(&fields, "core.max_resources")?,
         max_reservations: parse_required_u32(&fields, "core.max_reservations")?,
+        max_bundle_size: parse_u32_or_default(
+            &fields,
+            "core.max_bundle_size",
+            DEFAULT_LOCAL_CLUSTER_MAX_BUNDLE_SIZE,
+        )?,
         max_operations: parse_required_u32(&fields, "core.max_operations")?,
         max_ttl_slots: parse_required_u64(&fields, "core.max_ttl_slots")?,
         max_client_retry_window_slots: parse_required_u64(
@@ -1212,6 +1223,22 @@ fn parse_required_u32(
     key: &str,
 ) -> Result<u32, LocalClusterLayoutError> {
     parse_required(fields, key)
+}
+
+fn parse_u32_or_default(
+    fields: &BTreeMap<String, String>,
+    key: &str,
+    default: u32,
+) -> Result<u32, LocalClusterLayoutError> {
+    match fields.get(key) {
+        Some(value) => value
+            .parse::<u32>()
+            .map_err(|_| LocalClusterLayoutError::InvalidField {
+                field: key.to_owned(),
+                value: value.to_owned(),
+            }),
+        None => Ok(default),
+    }
 }
 
 fn parse_required_u64(
@@ -1559,6 +1586,45 @@ mod tests {
         let encoded = encode_layout(&layout);
         let decoded = decode_layout(&encoded).unwrap();
         assert_eq!(decoded, layout);
+    }
+
+    #[test]
+    fn decode_layout_defaults_missing_bundle_limit_for_legacy_payloads() {
+        let layout = fixture_layout();
+        let encoded = encode_layout(&layout);
+        let legacy_encoded = encoded
+            .lines()
+            .filter(|line| !line.starts_with("core.max_bundle_size="))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let decoded = decode_layout(&legacy_encoded).unwrap();
+        assert_eq!(
+            decoded.core_config.max_bundle_size,
+            DEFAULT_LOCAL_CLUSTER_MAX_BUNDLE_SIZE
+        );
+        assert_eq!(decoded, layout);
+    }
+
+    #[test]
+    fn decode_layout_rejects_malformed_bundle_limit_value() {
+        let layout = fixture_layout();
+        let encoded = encode_layout(&layout);
+        let malformed_encoded = encoded.replacen(
+            &format!(
+                "core.max_bundle_size={}",
+                layout.core_config.max_bundle_size
+            ),
+            "core.max_bundle_size=not-a-u32",
+            1,
+        );
+
+        let error = decode_layout(&malformed_encoded).unwrap_err();
+        assert!(matches!(
+            error,
+            LocalClusterLayoutError::InvalidField { field, value }
+                if field == "core.max_bundle_size" && value == "not-a-u32"
+        ));
     }
 
     #[test]

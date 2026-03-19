@@ -27,6 +27,7 @@ fn config() -> Config {
         shard_id: 0,
         max_resources: 8,
         max_reservations: 8,
+        max_bundle_size: 1,
         max_operations: 16,
         max_ttl_slots: 16,
         max_client_retry_window_slots: 8,
@@ -42,7 +43,7 @@ fn context(lsn: u64, request_slot: u64) -> CommandContext {
     }
 }
 
-fn client_frame(lsn: u64, request_slot: u64, request: ClientRequest) -> Frame {
+fn client_frame(lsn: u64, request_slot: u64, request: &ClientRequest) -> Frame {
     Frame {
         lsn: Lsn(lsn),
         request_slot: Slot(request_slot),
@@ -51,7 +52,7 @@ fn client_frame(lsn: u64, request_slot: u64, request: ClientRequest) -> Frame {
     }
 }
 
-fn internal_frame(lsn: u64, request_slot: u64, command: Command) -> Frame {
+fn internal_frame(lsn: u64, request_slot: u64, command: &Command) -> Frame {
     Frame {
         lsn: Lsn(lsn),
         request_slot: Slot(request_slot),
@@ -84,10 +85,10 @@ fn recover_allocdb_replays_wal_without_snapshot() {
         },
     };
 
-    live.apply_client(context(1, 1), create);
-    live.apply_client(context(2, 2), reserve);
-    wal.append_frame(&client_frame(1, 1, create)).unwrap();
-    wal.append_frame(&client_frame(2, 2, reserve)).unwrap();
+    live.apply_client(context(1, 1), create.clone());
+    live.apply_client(context(2, 2), reserve.clone());
+    wal.append_frame(&client_frame(1, 1, &create)).unwrap();
+    wal.append_frame(&client_frame(2, 2, &reserve)).unwrap();
     wal.sync().unwrap();
 
     let snapshot_file = SnapshotFile::new(&snapshot_path);
@@ -136,14 +137,14 @@ fn recover_allocdb_skips_frames_covered_by_snapshot() {
     };
 
     let mut live = AllocDb::new(config()).unwrap();
-    live.apply_client(context(1, 1), create);
+    live.apply_client(context(1, 1), create.clone());
     snapshot_file.write_snapshot(&live.snapshot()).unwrap();
-    live.apply_client(context(2, 2), reserve);
-    live.apply_client(context(3, 2), confirm);
+    live.apply_client(context(2, 2), reserve.clone());
+    live.apply_client(context(3, 2), confirm.clone());
 
-    wal.append_frame(&client_frame(1, 1, create)).unwrap();
-    wal.append_frame(&client_frame(2, 2, reserve)).unwrap();
-    wal.append_frame(&client_frame(3, 2, confirm)).unwrap();
+    wal.append_frame(&client_frame(1, 1, &create)).unwrap();
+    wal.append_frame(&client_frame(2, 2, &reserve)).unwrap();
+    wal.append_frame(&client_frame(3, 2, &confirm)).unwrap();
     wal.sync().unwrap();
 
     let recovered = recover_allocdb(config(), &snapshot_file, &wal).unwrap();
@@ -182,8 +183,8 @@ fn recover_allocdb_truncates_torn_tail() {
         },
     };
 
-    wal.append_frame(&client_frame(1, 1, create)).unwrap();
-    let torn = client_frame(2, 2, reserve).encode();
+    wal.append_frame(&client_frame(1, 1, &create)).unwrap();
+    let torn = client_frame(2, 2, &reserve).encode();
     fs::OpenOptions::new()
         .append(true)
         .open(&wal_path)
@@ -255,9 +256,9 @@ fn recover_allocdb_replays_internal_commands() {
         deadline_slot: Slot(5),
     };
 
-    wal.append_frame(&client_frame(1, 1, create)).unwrap();
-    wal.append_frame(&client_frame(2, 2, reserve)).unwrap();
-    wal.append_frame(&internal_frame(3, 5, expire)).unwrap();
+    wal.append_frame(&client_frame(1, 1, &create)).unwrap();
+    wal.append_frame(&client_frame(2, 2, &reserve)).unwrap();
+    wal.append_frame(&internal_frame(3, 5, &expire)).unwrap();
     wal.sync().unwrap();
 
     let recovered = recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &wal).unwrap();
@@ -296,12 +297,12 @@ fn recover_allocdb_fails_closed_on_mid_log_corruption() {
         },
     };
 
-    wal.append_frame(&client_frame(1, 1, create)).unwrap();
-    wal.append_frame(&client_frame(2, 2, reserve)).unwrap();
+    wal.append_frame(&client_frame(1, 1, &create)).unwrap();
+    wal.append_frame(&client_frame(2, 2, &reserve)).unwrap();
     wal.sync().unwrap();
 
     let mut bytes = fs::read(&wal_path).unwrap();
-    let first_len = client_frame(1, 1, create).encode().len();
+    let first_len = client_frame(1, 1, &create).encode().len();
     let last_index = bytes.len() - 1;
     bytes[last_index] ^= 0xff;
     fs::write(&wal_path, bytes).unwrap();

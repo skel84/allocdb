@@ -130,6 +130,7 @@ mod tests {
             shard_id: 0,
             max_resources: 8,
             max_reservations: 8,
+            max_bundle_size: 1,
             max_operations: 16,
             max_ttl_slots: 16,
             max_client_retry_window_slots: 8,
@@ -221,6 +222,7 @@ mod tests {
             max_retired_reservation_id: None,
             resources: Vec::new(),
             reservations: Vec::new(),
+            reservation_members: Vec::new(),
             operations: Vec::new(),
             wheel: vec![Vec::new(); config().wheel_len()],
         };

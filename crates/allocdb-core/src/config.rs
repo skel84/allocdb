@@ -3,6 +3,7 @@ pub struct Config {
     pub shard_id: u64,
     pub max_resources: u32,
     pub max_reservations: u32,
+    pub max_bundle_size: u32,
     pub max_operations: u32,
     pub max_ttl_slots: u64,
     pub max_client_retry_window_slots: u64,
@@ -16,6 +17,8 @@ pub enum ConfigError {
     HistoryWindowTooLarge,
     OperationWindowTooLarge,
     BucketCapacityTooLarge,
+    BundleSizeTooLarge,
+    ReservationMemberTableTooLarge,
     WheelTooLarge,
 }
 
@@ -31,6 +34,18 @@ impl Config {
         self.max_ttl_slots
             .checked_add(self.max_client_retry_window_slots)
             .expect("validated operation window must fit in u64")
+    }
+
+    /// Returns the fixed-capacity reservation-member table size.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called before [`Self::validate`] has confirmed that the derived table size fits
+    /// `usize`.
+    #[must_use]
+    pub fn max_reservation_members(&self) -> usize {
+        usize::try_from(u64::from(self.max_reservations) * u64::from(self.max_bundle_size))
+            .expect("validated reservation-member table size must fit usize")
     }
 
     /// Validates that the configured capacities and retention windows are internally consistent.
@@ -52,12 +67,20 @@ impl Config {
             return Err(ConfigError::ZeroCapacity("max_operations"));
         }
 
+        if self.max_bundle_size == 0 {
+            return Err(ConfigError::ZeroCapacity("max_bundle_size"));
+        }
+
         if self.max_ttl_slots == 0 {
             return Err(ConfigError::ZeroCapacity("max_ttl_slots"));
         }
 
         if self.max_expiration_bucket_len == 0 {
             return Err(ConfigError::ZeroCapacity("max_expiration_bucket_len"));
+        }
+
+        if self.max_bundle_size > self.max_resources {
+            return Err(ConfigError::BundleSizeTooLarge);
         }
 
         if self.reservation_history_window_slots > self.max_ttl_slots {
@@ -73,6 +96,16 @@ impl Config {
 
         if self.max_expiration_bucket_len > self.max_reservations {
             return Err(ConfigError::BucketCapacityTooLarge);
+        }
+
+        let Some(max_reservation_members) =
+            u64::from(self.max_reservations).checked_mul(u64::from(self.max_bundle_size))
+        else {
+            return Err(ConfigError::ReservationMemberTableTooLarge);
+        };
+
+        if usize::try_from(max_reservation_members).is_err() {
+            return Err(ConfigError::ReservationMemberTableTooLarge);
         }
 
         let Some(_) = self.max_ttl_slots.checked_add(1) else {

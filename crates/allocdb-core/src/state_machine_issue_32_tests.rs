@@ -9,6 +9,7 @@ fn config() -> Config {
         shard_id: 0,
         max_resources: 8,
         max_reservations: 8,
+        max_bundle_size: 1,
         max_operations: 4,
         max_ttl_slots: 2,
         max_client_retry_window_slots: 0,

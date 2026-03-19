@@ -41,16 +41,33 @@ pub enum AllocDbInvariantError {
         resource_id: ResourceId,
         reservation_id: ReservationId,
     },
-    ResourceReservationMismatch {
+    ActiveResourceMissingReservationMember {
         resource_id: ResourceId,
         reservation_id: ReservationId,
-        reservation_resource_id: ResourceId,
     },
     ResourceReservationStateMismatch {
         resource_id: ResourceId,
         reservation_id: ReservationId,
         resource_state: ResourceState,
         reservation_state: ReservationState,
+    },
+    ReservationHasNoMembers {
+        reservation_id: ReservationId,
+    },
+    ReservationMissingMember {
+        reservation_id: ReservationId,
+        member_index: u32,
+    },
+    ReservationAnchorMismatch {
+        reservation_id: ReservationId,
+        reservation_resource_id: ResourceId,
+        member_resource_id: ResourceId,
+    },
+    ReservationDuplicateMemberResource {
+        reservation_id: ReservationId,
+        first_member_index: u32,
+        second_member_index: u32,
+        resource_id: ResourceId,
     },
     ReservationMissingResource {
         reservation_id: ReservationId,
@@ -85,6 +102,16 @@ pub enum AllocDbInvariantError {
         reservation_id: ReservationId,
         resource_id: ResourceId,
     },
+    OrphanedReservationMember {
+        reservation_id: ReservationId,
+        member_index: u32,
+        resource_id: ResourceId,
+    },
+    ReservationMemberIndexOutOfRange {
+        reservation_id: ReservationId,
+        member_index: u32,
+        member_count: u32,
+    },
 }
 
 impl AllocDb {
@@ -98,6 +125,7 @@ impl AllocDb {
         self.validate_wheel_invariants()?;
         self.validate_resource_invariants()?;
         self.validate_reservation_invariants()?;
+        self.validate_reservation_member_invariants()?;
         Ok(())
     }
 
@@ -179,12 +207,13 @@ impl AllocDb {
                             reservation_id,
                         });
                     };
-                    if reservation.resource_id != resource.resource_id {
-                        return Err(AllocDbInvariantError::ResourceReservationMismatch {
-                            resource_id: resource.resource_id,
-                            reservation_id,
-                            reservation_resource_id: reservation.resource_id,
-                        });
+                    if !self.reservation_contains_resource(reservation, resource.resource_id) {
+                        return Err(
+                            AllocDbInvariantError::ActiveResourceMissingReservationMember {
+                                resource_id: resource.resource_id,
+                                reservation_id,
+                            },
+                        );
                     }
 
                     let expected_reservation_state = match resource.current_state {
@@ -209,99 +238,40 @@ impl AllocDb {
 
     fn validate_reservation_invariants(&self) -> Result<(), AllocDbInvariantError> {
         for reservation in self.reservations.iter() {
-            let Some(resource) = self.resources.get(reservation.resource_id).copied() else {
-                return Err(AllocDbInvariantError::ReservationMissingResource {
-                    reservation_id: reservation.reservation_id,
-                    resource_id: reservation.resource_id,
-                });
-            };
             let bucket_index = self.wheel_bucket_index(reservation.deadline_slot);
             let scheduled = self.wheel[bucket_index]
                 .binary_search(&reservation.reservation_id)
                 .is_ok();
 
-            match reservation.state {
-                ReservationState::Reserved | ReservationState::Confirmed => {
-                    if let Some(retire_after_slot) = reservation.retire_after_slot {
-                        return Err(AllocDbInvariantError::ActiveReservationHasRetireAfterSlot {
-                            reservation_id: reservation.reservation_id,
-                            reservation_state: reservation.state,
-                            retire_after_slot,
-                        });
-                    }
-                }
-                ReservationState::Released | ReservationState::Expired => {
-                    if reservation.retire_after_slot.is_none() {
-                        return Err(
-                            AllocDbInvariantError::TerminalReservationMissingRetireAfterSlot {
-                                reservation_id: reservation.reservation_id,
-                                reservation_state: reservation.state,
-                            },
-                        );
-                    }
-                }
+            if reservation.member_count == 0 {
+                return Err(AllocDbInvariantError::ReservationHasNoMembers {
+                    reservation_id: reservation.reservation_id,
+                });
             }
 
-            match reservation.state {
-                ReservationState::Reserved => {
-                    if resource.current_state != ResourceState::Reserved
-                        || resource.current_reservation_id != Some(reservation.reservation_id)
-                    {
-                        return Err(AllocDbInvariantError::ReservationResourceStateMismatch {
-                            reservation_id: reservation.reservation_id,
-                            resource_id: reservation.resource_id,
-                            reservation_state: reservation.state,
-                            resource_state: resource.current_state,
-                            resource_current_reservation_id: resource.current_reservation_id,
-                        });
-                    }
+            Self::validate_reservation_lifecycle_invariants(*reservation, scheduled)?;
+            self.validate_reservation_member_invariants_for(*reservation)?;
+        }
 
-                    if !scheduled {
-                        return Err(AllocDbInvariantError::ActiveReservationNotScheduled {
-                            reservation_id: reservation.reservation_id,
-                            deadline_slot: reservation.deadline_slot,
-                        });
-                    }
-                }
-                ReservationState::Confirmed => {
-                    if resource.current_state != ResourceState::Confirmed
-                        || resource.current_reservation_id != Some(reservation.reservation_id)
-                    {
-                        return Err(AllocDbInvariantError::ReservationResourceStateMismatch {
-                            reservation_id: reservation.reservation_id,
-                            resource_id: reservation.resource_id,
-                            reservation_state: reservation.state,
-                            resource_state: resource.current_state,
-                            resource_current_reservation_id: resource.current_reservation_id,
-                        });
-                    }
+        Ok(())
+    }
 
-                    if scheduled {
-                        return Err(AllocDbInvariantError::InactiveReservationStillScheduled {
-                            reservation_id: reservation.reservation_id,
-                            deadline_slot: reservation.deadline_slot,
-                            reservation_state: reservation.state,
-                        });
-                    }
-                }
-                ReservationState::Released | ReservationState::Expired => {
-                    if resource.current_reservation_id == Some(reservation.reservation_id) {
-                        return Err(
-                            AllocDbInvariantError::TerminalReservationStillActiveOnResource {
-                                reservation_id: reservation.reservation_id,
-                                resource_id: reservation.resource_id,
-                            },
-                        );
-                    }
+    fn validate_reservation_member_invariants(&self) -> Result<(), AllocDbInvariantError> {
+        for member in self.reservation_members.iter() {
+            let Some(reservation) = self.reservations.get(member.reservation_id).copied() else {
+                return Err(AllocDbInvariantError::OrphanedReservationMember {
+                    reservation_id: member.reservation_id,
+                    member_index: member.member_index,
+                    resource_id: member.resource_id,
+                });
+            };
 
-                    if scheduled {
-                        return Err(AllocDbInvariantError::InactiveReservationStillScheduled {
-                            reservation_id: reservation.reservation_id,
-                            deadline_slot: reservation.deadline_slot,
-                            reservation_state: reservation.state,
-                        });
-                    }
-                }
+            if member.member_index >= reservation.member_count {
+                return Err(AllocDbInvariantError::ReservationMemberIndexOutOfRange {
+                    reservation_id: member.reservation_id,
+                    member_index: member.member_index,
+                    member_count: reservation.member_count,
+                });
             }
         }
 

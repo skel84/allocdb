@@ -707,6 +707,7 @@ fn open_hotspot_engine(
         shard_id: 0,
         max_resources: 1,
         max_reservations: hotspot_reservation_capacity(options.hotspot_rounds),
+        max_bundle_size: 1,
         max_operations: hotspot_operation_capacity(
             options.hotspot_rounds,
             options.hotspot_contenders,
@@ -727,6 +728,7 @@ fn open_retry_engine(
         shard_id: 0,
         max_resources: retry_resource_capacity(options.retry_table_capacity),
         max_reservations: 1,
+        max_bundle_size: 1,
         max_operations: options.retry_table_capacity,
         max_ttl_slots: RETRY_TTL_SLOTS,
         max_client_retry_window_slots: RETRY_WINDOW_SLOTS,

@@ -16,7 +16,8 @@ impl AllocDb {
         context: CommandContext,
         request: ClientRequest,
     ) -> CommandOutcome {
-        if let Err(error) = self.validate_client_request_slot(context.request_slot, request.command)
+        if let Err(error) =
+            self.validate_client_request_slot(context.request_slot, &request.command)
         {
             return Self::slot_overflow_outcome("apply_client", error);
         }
@@ -91,7 +92,7 @@ impl AllocDb {
     /// Panics if log sequence numbers or request slots move backwards, or if existing state has
     /// already violated internal invariants.
     pub fn apply_internal(&mut self, context: CommandContext, command: Command) -> CommandOutcome {
-        if let Err(error) = self.validate_internal_request_slot(context.request_slot, command) {
+        if let Err(error) = self.validate_internal_request_slot(context.request_slot, &command) {
             return Self::slot_overflow_outcome("apply_internal", error);
         }
 

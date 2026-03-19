@@ -27,6 +27,7 @@ fn config() -> Config {
         shard_id: 0,
         max_resources: 8,
         max_reservations: 8,
+        max_bundle_size: 1,
         max_operations: 16,
         max_ttl_slots: 16,
         max_client_retry_window_slots: 8,
@@ -35,7 +36,7 @@ fn config() -> Config {
     }
 }
 
-fn client_frame(lsn: u64, request_slot: u64, request: ClientRequest) -> Frame {
+fn client_frame(lsn: u64, request_slot: u64, request: &ClientRequest) -> Frame {
     Frame {
         lsn: Lsn(lsn),
         request_slot: Slot(request_slot),
@@ -53,7 +54,7 @@ fn recover_allocdb_rejects_non_monotonic_lsn() {
     wal.append_frame(&client_frame(
         2,
         1,
-        ClientRequest {
+        &ClientRequest {
             operation_id: OperationId(1),
             client_id: ClientId(7),
             command: Command::CreateResource {
@@ -65,7 +66,7 @@ fn recover_allocdb_rejects_non_monotonic_lsn() {
     wal.append_frame(&client_frame(
         1,
         2,
-        ClientRequest {
+        &ClientRequest {
             operation_id: OperationId(2),
             client_id: ClientId(7),
             command: Command::Reserve {
@@ -100,7 +101,7 @@ fn recover_allocdb_rejects_rewound_request_slot() {
     wal.append_frame(&client_frame(
         1,
         5,
-        ClientRequest {
+        &ClientRequest {
             operation_id: OperationId(1),
             client_id: ClientId(7),
             command: Command::CreateResource {
@@ -112,7 +113,7 @@ fn recover_allocdb_rejects_rewound_request_slot() {
     wal.append_frame(&client_frame(
         2,
         4,
-        ClientRequest {
+        &ClientRequest {
             operation_id: OperationId(2),
             client_id: ClientId(7),
             command: Command::Reserve {
@@ -165,6 +166,7 @@ fn recover_allocdb_rejects_semantically_invalid_snapshot() {
                 },
             ],
             reservations: Vec::new(),
+            reservation_members: Vec::new(),
             operations: Vec::new(),
             wheel: vec![Vec::new(); config().wheel_len()],
         })

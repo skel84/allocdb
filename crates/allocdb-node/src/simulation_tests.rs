@@ -21,6 +21,7 @@ fn core_config() -> Config {
         shard_id: 0,
         max_resources: 8,
         max_reservations: 8,
+        max_bundle_size: 1,
         max_operations: 16,
         max_ttl_slots: 16,
         max_client_retry_window_slots: 8,
@@ -92,6 +93,73 @@ fn run_schedule(
     let mut harness = SimulationHarness::new(name, seed, core_config(), engine_config()).unwrap();
     let transcript = harness.explore_schedule(actions).unwrap();
     (harness, transcript)
+}
+
+fn assert_ready_batch_operation_ids_match_requests(
+    transcript: &[crate::simulation::SimulationObservation],
+    requests: &[ClientRequest],
+) {
+    let mut expected_operation_ids = requests
+        .iter()
+        .map(|request| request.operation_id.get())
+        .collect::<Vec<_>>();
+    let mut observed_operation_ids = transcript
+        .iter()
+        .map(|observation| {
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.operation_id == observation.operation_id),
+                "transcript operation_id {} must come from one input request",
+                observation.operation_id.get()
+            );
+            observation.operation_id.get()
+        })
+        .collect::<Vec<_>>();
+    expected_operation_ids.sort_unstable();
+    observed_operation_ids.sort_unstable();
+    assert_eq!(observed_operation_ids, expected_operation_ids);
+}
+
+fn assert_schedule_submit_operation_ids_match_actions(
+    transcript: &[ScheduleObservation],
+    actions: &[ScheduleAction],
+) {
+    assert_eq!(
+        transcript.len(),
+        actions.len(),
+        "schedule transcript must contain one observation per input action"
+    );
+    for observation in transcript {
+        let Some(action) = actions
+            .iter()
+            .find(|action| action.label == observation.label)
+        else {
+            panic!(
+                "schedule transcript label {} must come from one input action",
+                observation.label
+            );
+        };
+        match (&observation.outcome, &action.action) {
+            (ScheduleObservationKind::Submit(submit), ScheduleActionKind::Submit(request)) => {
+                assert_eq!(submit.operation_id, request.operation_id);
+            }
+            (ScheduleObservationKind::Tick(_), ScheduleActionKind::TickExpirations) => {}
+            (ScheduleObservationKind::Submit(_), ScheduleActionKind::TickExpirations)
+            | (ScheduleObservationKind::Tick(_), ScheduleActionKind::Submit(_)) => {
+                panic!("schedule transcript outcome must match the action kind")
+            }
+        }
+    }
+    for action in actions {
+        assert!(
+            transcript
+                .iter()
+                .any(|observation| observation.label == action.label),
+            "schedule action label {} must appear exactly once in the transcript",
+            action.label
+        );
+    }
 }
 
 fn seed_for_schedule<F>(name: &str, actions: &[ScheduleAction], predicate: F) -> u64
@@ -185,7 +253,7 @@ fn setup_recovery_harness(
     harness.checkpoint().unwrap();
     for (slot, request) in replay_requests {
         harness.advance_to(*slot);
-        harness.submit(*request).unwrap();
+        harness.submit(request.clone()).unwrap();
     }
     harness
 }
@@ -265,6 +333,7 @@ fn seeded_ready_batch_transcript_is_reproducible() {
 
     assert_eq!(first_transcript, second_transcript);
     assert_ne!(first_transcript, different_transcript);
+    assert_ready_batch_operation_ids_match_requests(&first_transcript, &requests);
     assert_eq!(
         first_transcript
             .iter()
@@ -312,6 +381,7 @@ fn seeded_schedule_explores_ingress_contention_reproducibly() {
 
     assert_eq!(first_transcript, second_transcript);
     assert_ne!(first_transcript, different_transcript);
+    assert_schedule_submit_operation_ids_match_actions(&first_transcript, &actions);
     assert_eq!(
         submit_observation(&first_transcript, "reserve-holder-9").result_code,
         ResultCode::Ok
