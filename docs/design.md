@@ -55,6 +55,8 @@ Current implementation anchor:
   first-class leases, bundle ownership, fencing, and revoke
 - [lease-kernel-follow-on.md](./lease-kernel-follow-on.md): post-`M8` planning for minimal
   generic lease-kernel extensions such as bundle ownership, fencing, and revoke
+- [revoke-safety-slice.md](./revoke-safety-slice.md): exact `M9-T08` scope for revoke, reclaim,
+  and safe-reuse behavior in the current implementation
 - [replication.md](./replication.md): deferred distributed design areas and boundaries
 - [roadmap.md](./roadmap.md): high-level roadmap and exit criteria
 - [work-breakdown.md](./work-breakdown.md): concrete units of work for the first implementation
