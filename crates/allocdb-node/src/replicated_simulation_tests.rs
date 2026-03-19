@@ -29,6 +29,13 @@ fn core_config() -> Config {
     }
 }
 
+fn bundle_core_config() -> Config {
+    Config {
+        max_bundle_size: 4,
+        ..core_config()
+    }
+}
+
 fn engine_config() -> EngineConfig {
     EngineConfig {
         max_submission_queue: 4,
@@ -63,6 +70,18 @@ fn reserve_payload(resource_id: u128, holder_id: u128, operation_id: u128) -> Ve
     })
 }
 
+fn reserve_bundle_payload(resource_ids: &[u128], holder_id: u128, operation_id: u128) -> Vec<u8> {
+    encode_client_request(ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::ReserveBundle {
+            resource_ids: resource_ids.iter().copied().map(ResourceId).collect(),
+            holder_id: HolderId(holder_id),
+            ttl_slots: 4,
+        },
+    })
+}
+
 fn confirm_payload(
     reservation_id: u128,
     holder_id: u128,
@@ -73,6 +92,23 @@ fn confirm_payload(
         operation_id: OperationId(operation_id),
         client_id: ClientId(7),
         command: Command::Confirm {
+            reservation_id: ReservationId(reservation_id),
+            holder_id: HolderId(holder_id),
+            lease_epoch,
+        },
+    })
+}
+
+fn release_payload(
+    reservation_id: u128,
+    holder_id: u128,
+    lease_epoch: u64,
+    operation_id: u128,
+) -> Vec<u8> {
+    encode_client_request(ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::Release {
             reservation_id: ReservationId(reservation_id),
             holder_id: HolderId(holder_id),
             lease_epoch,
@@ -237,6 +273,14 @@ fn primary_harness(name: &str, seed: u64) -> ReplicatedSimulationHarness {
     harness
 }
 
+fn bundle_primary_harness(name: &str, seed: u64) -> ReplicatedSimulationHarness {
+    let mut harness =
+        ReplicatedSimulationHarness::new(name, seed, bundle_core_config(), engine_config())
+            .unwrap();
+    harness.configure_primary(replica(1), 1).unwrap();
+    harness
+}
+
 fn replica_last_applied_lsn(harness: &ReplicatedSimulationHarness, replica_id: u64) -> Option<Lsn> {
     harness
         .replica(replica(replica_id))
@@ -296,6 +340,25 @@ fn pending_labels(harness: &ReplicatedSimulationHarness) -> Vec<&str> {
         .iter()
         .map(|message| message.label.as_str())
         .collect()
+}
+
+fn replica_reservation_member_ids(
+    harness: &ReplicatedSimulationHarness,
+    replica_id: u64,
+    reservation_id: u128,
+    current_slot: u64,
+) -> Vec<ResourceId> {
+    let node = harness.replica(replica(replica_id)).unwrap().unwrap();
+    let reservation = node
+        .engine()
+        .unwrap()
+        .db()
+        .reservation(ReservationId(reservation_id), Slot(current_slot))
+        .unwrap();
+    node.engine()
+        .unwrap()
+        .db()
+        .reservation_member_resource_ids(reservation)
 }
 
 fn set_replica_link(
@@ -1357,6 +1420,91 @@ fn primary_crash_after_reply_preserves_read_and_retry_on_new_primary() {
 }
 
 #[test]
+fn committed_bundle_membership_survives_failover_and_suffix_rejoin() {
+    let mut harness = bundle_primary_harness("replicated-bundle-failover", 0x5a46_0001);
+
+    let create_first = harness
+        .client_submit(
+            replica(1),
+            Slot(1),
+            &create_payload(81, 801),
+            "bundle-create-first",
+        )
+        .unwrap();
+    commit_to_all_backups(&mut harness, "bundle-create-first", create_first.lsn);
+
+    let create_second = harness
+        .client_submit(
+            replica(1),
+            Slot(2),
+            &create_payload(82, 802),
+            "bundle-create-second",
+        )
+        .unwrap();
+    commit_to_all_backups(&mut harness, "bundle-create-second", create_second.lsn);
+
+    let bundle = harness
+        .client_submit(
+            replica(1),
+            Slot(3),
+            &reserve_bundle_payload(&[81, 82], 91, 803),
+            "bundle-reserve",
+        )
+        .unwrap();
+    commit_to_backup(&mut harness, "bundle-reserve", bundle.lsn, 2);
+
+    harness.crash_replica(replica(1)).unwrap();
+    harness.complete_view_change(replica(2), 2).unwrap();
+
+    let first_member = harness
+        .read_resource(replica(2), ResourceId(81), Some(bundle.lsn))
+        .unwrap()
+        .expect("new primary should preserve first bundle member");
+    assert_eq!(
+        first_member.current_state,
+        allocdb_core::ResourceState::Reserved
+    );
+    assert_eq!(first_member.current_reservation_id, Some(ReservationId(3)));
+
+    let second_member = harness
+        .read_resource(replica(2), ResourceId(82), Some(bundle.lsn))
+        .unwrap()
+        .expect("new primary should preserve second bundle member");
+    assert_eq!(
+        second_member.current_state,
+        allocdb_core::ResourceState::Reserved
+    );
+    assert_eq!(second_member.current_reservation_id, Some(ReservationId(3)));
+
+    assert_eq!(
+        replica_reservation_member_ids(&harness, 2, 3, 3),
+        vec![ResourceId(81), ResourceId(82)]
+    );
+
+    let method = harness.rejoin_replica(replica(3), replica(2)).unwrap();
+    assert_eq!(method, ReplicaRejoinMethod::SuffixOnly);
+    assert_eq!(
+        replica_reservation_member_ids(&harness, 3, 3, 3),
+        vec![ResourceId(81), ResourceId(82)]
+    );
+
+    let busy_member = harness
+        .client_submit(
+            replica(2),
+            Slot(4),
+            &reserve_payload(82, 92, 804),
+            "bundle-member-busy",
+        )
+        .unwrap();
+    commit_to_backup(&mut harness, "bundle-member-busy", busy_member.lsn, 3);
+    let busy_result = harness
+        .published_result(busy_member.lsn)
+        .expect("conflicting member reserve should publish deterministically");
+    assert_eq!(busy_result.outcome.result_code, ResultCode::ResourceBusy);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn committed_revoke_stays_non_reusable_across_failover_until_reclaim() {
     let mut harness = primary_harness("replicated-revoke-failover", 0x5a46);
 
@@ -1421,11 +1569,28 @@ fn committed_revoke_stays_non_reusable_across_failover_until_reclaim() {
         allocdb_core::ResourceState::Revoking
     );
 
+    let stale_release = harness
+        .client_submit(
+            replica(2),
+            Slot(3),
+            &release_payload(2, 91, 1, 705),
+            "revoke-stale-release",
+        )
+        .unwrap();
+    commit_to_backup(&mut harness, "revoke-stale-release", stale_release.lsn, 3);
+    let stale_release_result = harness
+        .published_result(stale_release.lsn)
+        .expect("stale holder release should publish deterministically");
+    assert_eq!(
+        stale_release_result.outcome.result_code,
+        ResultCode::StaleEpoch
+    );
+
     let early_reuse = harness
         .client_submit(
             replica(2),
             Slot(3),
-            &reserve_payload(71, 99, 705),
+            &reserve_payload(71, 99, 706),
             "revoke-early-reuse",
         )
         .unwrap();
@@ -1442,7 +1607,7 @@ fn committed_revoke_stays_non_reusable_across_failover_until_reclaim() {
         .client_submit(
             replica(2),
             Slot(4),
-            &reclaim_payload(2, 706),
+            &reclaim_payload(2, 707),
             "revoke-reclaim",
         )
         .unwrap();
