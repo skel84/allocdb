@@ -21,7 +21,6 @@ use crate::watch_render::{
     compact_counter, compact_fault_window_progress, parse_watch_event_line, progress_bar,
 };
 use allocdb_core::{
-    ReservationState, ResourceState,
     ids::{HolderId, Lsn, ReservationId, ResourceId, Slot},
     result::ResultCode,
 };
@@ -35,8 +34,8 @@ use allocdb_node::local_cluster::{
     LocalClusterReplicaConfig, ReplicaRuntimeState, ReplicaRuntimeStatus,
 };
 use allocdb_node::{
-    ApiResponse, ReplicaId, ReplicaPaths, ReplicaRole, ResourceResponse, SubmissionFailure,
-    SubmissionFailureCode, SubmitResponse,
+    ApiResponse, LeaseViewState, ReplicaId, ReplicaPaths, ReplicaRole, ResourceResponse,
+    ResourceViewState, SubmissionFailure, SubmissionFailureCode, SubmitResponse,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -121,7 +120,7 @@ fn release_gate_plan_includes_faulted_qemu_runs() {
 
 #[test]
 fn indefinite_submission_failure_maps_to_ambiguous_outcome() {
-    let outcome = outcome_from_submission_failure(SubmissionFailure {
+    let outcome = outcome_from_submission_failure(&SubmissionFailure {
         category: allocdb_node::SubmissionErrorCategory::Indefinite,
         code: SubmissionFailureCode::StorageFailure,
     });
@@ -133,16 +132,16 @@ fn indefinite_submission_failure_maps_to_ambiguous_outcome() {
 
 #[test]
 fn expired_reservation_maps_to_released_read_state() {
-    let state = map_reservation_state(allocdb_node::ReservationView {
-        reservation_id: ReservationId(11),
-        resource_id: ResourceId(22),
+    let state = map_reservation_state(&allocdb_node::LeaseView {
+        lease_id: ReservationId(11),
         holder_id: HolderId(33),
         lease_epoch: 2,
-        state: ReservationState::Expired,
+        state: LeaseViewState::Expired,
         created_lsn: Lsn(1),
-        deadline_slot: Slot(9),
+        deadline_slot: Some(Slot(9)),
         released_lsn: Some(Lsn(4)),
         retire_after_slot: Some(Slot(17)),
+        member_resource_ids: vec![ResourceId(22)],
     });
     assert_eq!(
         state,
@@ -220,8 +219,8 @@ fn probe_submit_and_read_validation_cover_pass_and_fail_paths() {
 
     let ok_read = ApiResponse::GetResource(ResourceResponse::Found(allocdb_node::ResourceView {
         resource_id: ResourceId(41),
-        state: ResourceState::Available,
-        current_reservation_id: None,
+        state: ResourceViewState::Available,
+        current_lease_id: None,
         version: 1,
     }));
     assert!(validate_probe_read_response("qemu", 41, &ok_read).is_ok());
@@ -242,8 +241,8 @@ fn classify_resource_read_outcome_distinguishes_available_and_held_states() {
         RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::Found(
             allocdb_node::ResourceView {
                 resource_id: ResourceId(41),
-                state: ResourceState::Available,
-                current_reservation_id: None,
+                state: ResourceViewState::Available,
+                current_lease_id: None,
                 version: 2,
             },
         ))),
@@ -256,8 +255,8 @@ fn classify_resource_read_outcome_distinguishes_available_and_held_states() {
         RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::Found(
             allocdb_node::ResourceView {
                 resource_id: ResourceId(41),
-                state: ResourceState::Reserved,
-                current_reservation_id: Some(ReservationId(7)),
+                state: ResourceViewState::Reserved,
+                current_lease_id: Some(ReservationId(7)),
                 version: 3,
             },
         ))),
@@ -266,7 +265,7 @@ fn classify_resource_read_outcome_distinguishes_available_and_held_states() {
     assert_eq!(
         held,
         ResourceReadObservation::Held {
-            state: ResourceState::Reserved,
+            state: ResourceViewState::Reserved,
             current_reservation_id: Some(ReservationId(7)),
             version: 3,
         }
@@ -290,8 +289,8 @@ fn classify_resource_read_outcome_rejects_mismatched_resource() {
         RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::Found(
             allocdb_node::ResourceView {
                 resource_id: ResourceId(12),
-                state: ResourceState::Available,
-                current_reservation_id: None,
+                state: ResourceViewState::Available,
+                current_lease_id: None,
                 version: 0,
             },
         ))),

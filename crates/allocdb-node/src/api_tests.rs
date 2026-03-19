@@ -2,18 +2,18 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use allocdb_core::SlotOverflowKind;
 use allocdb_core::command::{ClientRequest, Command};
 use allocdb_core::config::Config;
 use allocdb_core::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use allocdb_core::result::ResultCode;
-use allocdb_core::{ReservationState, ResourceState, SlotOverflowKind};
 
 use super::{
-    ApiCodecError, ApiRequest, ApiResponse, InvalidRequestReason, MetricsRequest, MetricsResponse,
-    ReservationRequest, ReservationResponse, ResourceRequest, ResourceResponse,
-    SubmissionFailureCode, SubmitRequest, SubmitResponse, TickExpirationsApplied,
-    TickExpirationsRequest, TickExpirationsResponse, decode_request, decode_response,
-    encode_request, encode_response,
+    ApiCodecError, ApiRequest, ApiResponse, InvalidRequestReason, LeaseRequest, LeaseResponse,
+    LeaseViewState, MetricsRequest, MetricsResponse, ResourceRequest, ResourceResponse,
+    ResourceViewState, SubmissionFailureCode, SubmitRequest, SubmitResponse,
+    TickExpirationsApplied, TickExpirationsRequest, TickExpirationsResponse, decode_request,
+    decode_response, encode_request, encode_response,
 };
 use crate::engine::{
     CrashPlan, CrashPoint, EngineConfig, PersistFailurePhase, RecoveryStartupKind,
@@ -50,6 +50,13 @@ fn core_config() -> Config {
     }
 }
 
+fn bundle_core_config() -> Config {
+    Config {
+        max_bundle_size: 4,
+        ..core_config()
+    }
+}
+
 fn engine_config() -> EngineConfig {
     EngineConfig {
         max_submission_queue: 2,
@@ -74,6 +81,22 @@ fn reserve_request(resource_id: u128, operation_id: u128, holder_id: u128) -> Cl
         client_id: ClientId(7),
         command: Command::Reserve {
             resource_id: ResourceId(resource_id),
+            holder_id: HolderId(holder_id),
+            ttl_slots: 3,
+        },
+    }
+}
+
+fn reserve_bundle_request(
+    resource_ids: &[u128],
+    operation_id: u128,
+    holder_id: u128,
+) -> ClientRequest {
+    ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::ReserveBundle {
+            resource_ids: resource_ids.iter().copied().map(ResourceId).collect(),
             holder_id: HolderId(holder_id),
             ttl_slots: 3,
         },
@@ -115,8 +138,8 @@ fn request_codec_round_trips_all_variants() {
             resource_id: ResourceId(12),
             required_lsn: Some(Lsn(7)),
         }),
-        ApiRequest::GetReservation(ReservationRequest {
-            reservation_id: ReservationId(13),
+        ApiRequest::GetLease(LeaseRequest {
+            lease_id: ReservationId(13),
             current_slot: Slot(14),
             required_lsn: None,
         }),
@@ -138,12 +161,18 @@ fn submit_response_cases() -> Vec<ApiResponse> {
     vec![
         ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
             applied_lsn: Lsn(1),
-            outcome: allocdb_core::result::CommandOutcome::new(ResultCode::Ok),
+            result_code: ResultCode::Ok,
+            lease_id: None,
+            lease_epoch: None,
+            deadline_slot: None,
             from_retry_cache: false,
         })),
         ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
             applied_lsn: Lsn(2),
-            outcome: allocdb_core::result::CommandOutcome::new(ResultCode::SlotOverflow),
+            result_code: ResultCode::SlotOverflow,
+            lease_id: None,
+            lease_epoch: None,
+            deadline_slot: None,
             from_retry_cache: true,
         })),
         ApiResponse::Submit(SubmitResponse::Rejected(super::SubmissionFailure {
@@ -171,14 +200,14 @@ fn read_response_cases() -> Vec<ApiResponse> {
     vec![
         ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
             resource_id: ResourceId(21),
-            state: ResourceState::Confirmed,
-            current_reservation_id: Some(ReservationId(22)),
+            state: ResourceViewState::Active,
+            current_lease_id: Some(ReservationId(22)),
             version: 5,
         })),
         ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
             resource_id: ResourceId(23),
-            state: ResourceState::Revoking,
-            current_reservation_id: Some(ReservationId(24)),
+            state: ResourceViewState::Revoking,
+            current_lease_id: Some(ReservationId(24)),
             version: 6,
         })),
         ApiResponse::GetResource(ResourceResponse::NotFound),
@@ -187,43 +216,43 @@ fn read_response_cases() -> Vec<ApiResponse> {
             required_lsn: Lsn(9),
             last_applied_lsn: Some(Lsn(8)),
         }),
-        ApiResponse::GetReservation(ReservationResponse::Found(super::ReservationView {
-            reservation_id: ReservationId(31),
-            resource_id: ResourceId(32),
+        ApiResponse::GetLease(LeaseResponse::Found(super::LeaseView {
+            lease_id: ReservationId(31),
             holder_id: HolderId(33),
             lease_epoch: 2,
-            state: ReservationState::Released,
+            state: LeaseViewState::Released,
             created_lsn: Lsn(2),
-            deadline_slot: Slot(7),
+            deadline_slot: Some(Slot(7)),
             released_lsn: Some(Lsn(3)),
             retire_after_slot: Some(Slot(9)),
+            member_resource_ids: vec![ResourceId(32)],
         })),
-        ApiResponse::GetReservation(ReservationResponse::Found(super::ReservationView {
-            reservation_id: ReservationId(34),
-            resource_id: ResourceId(35),
+        ApiResponse::GetLease(LeaseResponse::Found(super::LeaseView {
+            lease_id: ReservationId(34),
             holder_id: HolderId(36),
             lease_epoch: 4,
-            state: ReservationState::Revoking,
+            state: LeaseViewState::Revoking,
             created_lsn: Lsn(5),
-            deadline_slot: Slot(11),
+            deadline_slot: Some(Slot(11)),
             released_lsn: None,
             retire_after_slot: None,
+            member_resource_ids: vec![ResourceId(35)],
         })),
-        ApiResponse::GetReservation(ReservationResponse::Found(super::ReservationView {
-            reservation_id: ReservationId(37),
-            resource_id: ResourceId(38),
+        ApiResponse::GetLease(LeaseResponse::Found(super::LeaseView {
+            lease_id: ReservationId(37),
             holder_id: HolderId(39),
             lease_epoch: 4,
-            state: ReservationState::Revoked,
+            state: LeaseViewState::Revoked,
             created_lsn: Lsn(6),
-            deadline_slot: Slot(12),
+            deadline_slot: Some(Slot(12)),
             released_lsn: Some(Lsn(8)),
             retire_after_slot: Some(Slot(14)),
+            member_resource_ids: vec![ResourceId(38)],
         })),
-        ApiResponse::GetReservation(ReservationResponse::NotFound),
-        ApiResponse::GetReservation(ReservationResponse::Retired),
-        ApiResponse::GetReservation(ReservationResponse::EngineHalted),
-        ApiResponse::GetReservation(ReservationResponse::FenceNotApplied {
+        ApiResponse::GetLease(LeaseResponse::NotFound),
+        ApiResponse::GetLease(LeaseResponse::Retired),
+        ApiResponse::GetLease(LeaseResponse::EngineHalted),
+        ApiResponse::GetLease(LeaseResponse::FenceNotApplied {
             required_lsn: Lsn(11),
             last_applied_lsn: None,
         }),
@@ -329,7 +358,10 @@ fn api_submit_commits_and_exposes_retry_cache() {
         first,
         ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
             applied_lsn: Lsn(1),
-            outcome: allocdb_core::result::CommandOutcome::new(ResultCode::Ok),
+            result_code: ResultCode::Ok,
+            lease_id: None,
+            lease_epoch: None,
+            deadline_slot: None,
             from_retry_cache: false,
         }))
     );
@@ -337,7 +369,10 @@ fn api_submit_commits_and_exposes_retry_cache() {
         second,
         ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
             applied_lsn: Lsn(1),
-            outcome: allocdb_core::result::CommandOutcome::new(ResultCode::Ok),
+            result_code: ResultCode::Ok,
+            lease_id: None,
+            lease_epoch: None,
+            deadline_slot: None,
             from_retry_cache: true,
         }))
     );
@@ -369,7 +404,10 @@ fn api_reserve_retry_preserves_lease_epoch_outcome() {
         first,
         ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
             applied_lsn: Lsn(2),
-            outcome: expected,
+            result_code: expected.result_code,
+            lease_id: expected.reservation_id,
+            lease_epoch: expected.lease_epoch,
+            deadline_slot: expected.deadline_slot,
             from_retry_cache: false,
         }))
     );
@@ -377,7 +415,10 @@ fn api_reserve_retry_preserves_lease_epoch_outcome() {
         second,
         ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
             applied_lsn: Lsn(2),
-            outcome: expected,
+            result_code: expected.result_code,
+            lease_id: expected.reservation_id,
+            lease_epoch: expected.lease_epoch,
+            deadline_slot: expected.deadline_slot,
             from_retry_cache: true,
         }))
     );
@@ -450,29 +491,29 @@ fn api_reads_enforce_fence_and_return_views() {
         resource,
         ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
             resource_id: ResourceId(11),
-            state: ResourceState::Reserved,
-            current_reservation_id: Some(ReservationId(2)),
+            state: ResourceViewState::Reserved,
+            current_lease_id: Some(ReservationId(2)),
             version: 1,
         }))
     );
 
-    let reservation = engine.handle_api_request(ApiRequest::GetReservation(ReservationRequest {
-        reservation_id: ReservationId(2),
+    let reservation = engine.handle_api_request(ApiRequest::GetLease(LeaseRequest {
+        lease_id: ReservationId(2),
         current_slot: Slot(2),
         required_lsn: Some(Lsn(2)),
     }));
     assert_eq!(
         reservation,
-        ApiResponse::GetReservation(ReservationResponse::Found(super::ReservationView {
-            reservation_id: ReservationId(2),
-            resource_id: ResourceId(11),
+        ApiResponse::GetLease(LeaseResponse::Found(super::LeaseView {
+            lease_id: ReservationId(2),
             holder_id: HolderId(9),
             lease_epoch: 1,
-            state: ReservationState::Reserved,
+            state: LeaseViewState::Reserved,
             created_lsn: Lsn(2),
-            deadline_slot: Slot(5),
+            deadline_slot: Some(Slot(5)),
             released_lsn: None,
             retire_after_slot: None,
+            member_resource_ids: vec![ResourceId(11)],
         }))
     );
 
@@ -498,16 +539,13 @@ fn api_reservation_reports_retired_history() {
         release_request(2, 3, 9),
     )));
 
-    let response = engine.handle_api_request(ApiRequest::GetReservation(ReservationRequest {
-        reservation_id: ReservationId(2),
+    let response = engine.handle_api_request(ApiRequest::GetLease(LeaseRequest {
+        lease_id: ReservationId(2),
         current_slot: Slot(8),
         required_lsn: Some(Lsn(3)),
     }));
 
-    assert_eq!(
-        response,
-        ApiResponse::GetReservation(ReservationResponse::Retired)
-    );
+    assert_eq!(response, ApiResponse::GetLease(LeaseResponse::Retired));
 
     let later_write = engine.handle_api_request(ApiRequest::Submit(
         SubmitRequest::from_client_request(Slot(8), create_request(12, 4)),
@@ -517,16 +555,15 @@ fn api_reservation_reports_retired_history() {
         ApiResponse::Submit(SubmitResponse::Committed(_))
     ));
 
-    let after_later_write =
-        engine.handle_api_request(ApiRequest::GetReservation(ReservationRequest {
-            reservation_id: ReservationId(2),
-            current_slot: Slot(8),
-            required_lsn: Some(Lsn(4)),
-        }));
+    let after_later_write = engine.handle_api_request(ApiRequest::GetLease(LeaseRequest {
+        lease_id: ReservationId(2),
+        current_slot: Slot(8),
+        required_lsn: Some(Lsn(4)),
+    }));
 
     assert_eq!(
         after_later_write,
-        ApiResponse::GetReservation(ReservationResponse::Retired)
+        ApiResponse::GetLease(LeaseResponse::Retired)
     );
 
     drop(engine);
@@ -566,29 +603,29 @@ fn api_tick_expirations_commits_due_internal_expire() {
         resource,
         ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
             resource_id: ResourceId(11),
-            state: ResourceState::Available,
-            current_reservation_id: None,
+            state: ResourceViewState::Available,
+            current_lease_id: None,
             version: 2,
         }))
     );
 
-    let reservation = engine.handle_api_request(ApiRequest::GetReservation(ReservationRequest {
-        reservation_id: ReservationId(2),
+    let reservation = engine.handle_api_request(ApiRequest::GetLease(LeaseRequest {
+        lease_id: ReservationId(2),
         current_slot: Slot(20),
         required_lsn: Some(Lsn(3)),
     }));
     assert_eq!(
         reservation,
-        ApiResponse::GetReservation(ReservationResponse::Found(super::ReservationView {
-            reservation_id: ReservationId(2),
-            resource_id: ResourceId(11),
+        ApiResponse::GetLease(LeaseResponse::Found(super::LeaseView {
+            lease_id: ReservationId(2),
             holder_id: HolderId(9),
             lease_epoch: 2,
-            state: ReservationState::Expired,
+            state: LeaseViewState::Expired,
             created_lsn: Lsn(2),
-            deadline_slot: Slot(5),
+            deadline_slot: Some(Slot(5)),
             released_lsn: Some(Lsn(3)),
             retire_after_slot: Some(Slot(24)),
+            member_resource_ids: vec![ResourceId(11)],
         }))
     );
 
@@ -622,12 +659,12 @@ fn api_reads_reject_when_engine_is_halted() {
         ApiResponse::GetResource(ResourceResponse::EngineHalted)
     );
     assert_eq!(
-        live.handle_api_request(ApiRequest::GetReservation(ReservationRequest {
-            reservation_id: ReservationId(11),
+        live.handle_api_request(ApiRequest::GetLease(LeaseRequest {
+            lease_id: ReservationId(11),
             current_slot: Slot(1),
             required_lsn: None,
         })),
-        ApiResponse::GetReservation(ReservationResponse::EngineHalted)
+        ApiResponse::GetLease(LeaseResponse::EngineHalted)
     );
     drop(live);
 
@@ -641,8 +678,8 @@ fn api_reads_reject_when_engine_is_halted() {
         })),
         ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
             resource_id: ResourceId(11),
-            state: ResourceState::Available,
-            current_reservation_id: None,
+            state: ResourceViewState::Available,
+            current_lease_id: None,
             version: 0,
         }))
     );
@@ -735,7 +772,10 @@ fn api_bytes_recovery_preserves_state_and_retry_cache() {
         first,
         ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
             applied_lsn: Lsn(1),
-            outcome: allocdb_core::result::CommandOutcome::new(ResultCode::Ok),
+            result_code: ResultCode::Ok,
+            lease_id: None,
+            lease_epoch: None,
+            deadline_slot: None,
             from_retry_cache: false,
         }))
     );
@@ -751,7 +791,10 @@ fn api_bytes_recovery_preserves_state_and_retry_cache() {
         retry,
         ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
             applied_lsn: Lsn(1),
-            outcome: allocdb_core::result::CommandOutcome::new(ResultCode::Ok),
+            result_code: ResultCode::Ok,
+            lease_id: None,
+            lease_epoch: None,
+            deadline_slot: None,
             from_retry_cache: true,
         }))
     );
@@ -766,11 +809,117 @@ fn api_bytes_recovery_preserves_state_and_retry_cache() {
         read,
         ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
             resource_id: ResourceId(11),
-            state: ResourceState::Available,
-            current_reservation_id: None,
+            state: ResourceViewState::Available,
+            current_lease_id: None,
             version: 0,
         }))
     );
+
+    drop(recovered);
+    let _ = fs::remove_file(&snapshot_path);
+    fs::remove_file(&wal_path).unwrap();
+}
+
+#[test]
+fn api_get_lease_exposes_bundle_members_in_stable_order() {
+    let wal_path = test_path("bundle-lease-view");
+    let mut engine =
+        SingleNodeEngine::open(bundle_core_config(), engine_config(), &wal_path).unwrap();
+
+    let _ = engine.handle_api_request(ApiRequest::Submit(SubmitRequest::from_client_request(
+        Slot(1),
+        create_request(11, 1),
+    )));
+    let _ = engine.handle_api_request(ApiRequest::Submit(SubmitRequest::from_client_request(
+        Slot(2),
+        create_request(12, 2),
+    )));
+    let reserve = engine.handle_api_request(ApiRequest::Submit(
+        SubmitRequest::from_client_request(Slot(3), reserve_bundle_request(&[11, 12], 3, 9)),
+    ));
+    assert_eq!(
+        reserve,
+        ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
+            applied_lsn: Lsn(3),
+            result_code: ResultCode::Ok,
+            lease_id: Some(ReservationId(3)),
+            lease_epoch: Some(1),
+            deadline_slot: Some(Slot(6)),
+            from_retry_cache: false,
+        }))
+    );
+
+    let lease = engine.handle_api_request(ApiRequest::GetLease(LeaseRequest {
+        lease_id: ReservationId(3),
+        current_slot: Slot(3),
+        required_lsn: Some(Lsn(3)),
+    }));
+    assert_eq!(
+        lease,
+        ApiResponse::GetLease(LeaseResponse::Found(super::LeaseView {
+            lease_id: ReservationId(3),
+            holder_id: HolderId(9),
+            state: LeaseViewState::Reserved,
+            lease_epoch: 1,
+            created_lsn: Lsn(3),
+            deadline_slot: Some(Slot(6)),
+            released_lsn: None,
+            retire_after_slot: None,
+            member_resource_ids: vec![ResourceId(11), ResourceId(12)],
+        }))
+    );
+
+    drop(engine);
+    fs::remove_file(&wal_path).unwrap();
+}
+
+#[test]
+fn api_bytes_recovery_preserves_bundle_lease_view_shape() {
+    let wal_path = test_path("bundle-lease-recovery");
+    let snapshot_path = test_snapshot_path("bundle-lease-recovery");
+    let mut engine =
+        SingleNodeEngine::open(bundle_core_config(), engine_config(), &wal_path).unwrap();
+
+    let create_first = encode_request(&ApiRequest::Submit(SubmitRequest::from_client_request(
+        Slot(1),
+        create_request(11, 1),
+    )))
+    .unwrap();
+    let create_second = encode_request(&ApiRequest::Submit(SubmitRequest::from_client_request(
+        Slot(2),
+        create_request(12, 2),
+    )))
+    .unwrap();
+    let reserve_bundle = encode_request(&ApiRequest::Submit(SubmitRequest::from_client_request(
+        Slot(3),
+        reserve_bundle_request(&[11, 12], 3, 9),
+    )))
+    .unwrap();
+    let lease_read = encode_request(&ApiRequest::GetLease(LeaseRequest {
+        lease_id: ReservationId(3),
+        current_slot: Slot(3),
+        required_lsn: Some(Lsn(3)),
+    }))
+    .unwrap();
+
+    let _ = engine.handle_api_bytes(&create_first).unwrap();
+    let _ = engine.handle_api_bytes(&create_second).unwrap();
+    let _ = engine.handle_api_bytes(&reserve_bundle).unwrap();
+    let live_read = decode_response(&engine.handle_api_bytes(&lease_read).unwrap()).unwrap();
+
+    drop(engine);
+
+    let mut recovered = SingleNodeEngine::recover(
+        bundle_core_config(),
+        engine_config(),
+        &snapshot_path,
+        &wal_path,
+    )
+    .unwrap();
+    let recovered_read =
+        decode_response(&recovered.handle_api_bytes(&lease_read).unwrap()).unwrap();
+
+    assert_eq!(recovered_read, live_read);
 
     drop(recovered);
     let _ = fs::remove_file(&snapshot_path);

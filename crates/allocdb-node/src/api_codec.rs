@@ -1,15 +1,16 @@
 use allocdb_core::HealthMetrics;
+use allocdb_core::SlotOverflowKind;
 use allocdb_core::ids::{HolderId, Lsn, ReservationId, ResourceId, Slot};
-use allocdb_core::result::{CommandOutcome, ResultCode};
-use allocdb_core::{ReservationState, ResourceState, SlotOverflowKind};
+use allocdb_core::result::ResultCode;
 
 use crate::engine::{EngineMetrics, RecoveryStartupKind, RecoveryStatus, SubmissionErrorCategory};
 
 use super::{
-    ApiRequest, ApiResponse, InvalidRequestReason, MetricsRequest, MetricsResponse,
-    ReservationRequest, ReservationResponse, ReservationView, ResourceRequest, ResourceResponse,
-    ResourceView, SubmissionCommitted, SubmissionFailure, SubmissionFailureCode, SubmitRequest,
-    SubmitResponse, TickExpirationsApplied, TickExpirationsRequest, TickExpirationsResponse,
+    ApiRequest, ApiResponse, InvalidRequestReason, LeaseRequest, LeaseResponse, LeaseView,
+    LeaseViewState, MetricsRequest, MetricsResponse, ResourceRequest, ResourceResponse,
+    ResourceView, ResourceViewState, SubmissionCommitted, SubmissionFailure, SubmissionFailureCode,
+    SubmitRequest, SubmitResponse, TickExpirationsApplied, TickExpirationsRequest,
+    TickExpirationsResponse,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,11 +42,11 @@ pub fn encode_request(request: &ApiRequest) -> Result<Vec<u8>, ApiCodecError> {
             encode_optional_lsn(&mut bytes, request.required_lsn);
             bytes.extend_from_slice(&request.resource_id.get().to_le_bytes());
         }
-        ApiRequest::GetReservation(request) => {
+        ApiRequest::GetLease(request) => {
             bytes.push(3);
             encode_optional_lsn(&mut bytes, request.required_lsn);
             bytes.extend_from_slice(&request.current_slot.get().to_le_bytes());
-            bytes.extend_from_slice(&request.reservation_id.get().to_le_bytes());
+            bytes.extend_from_slice(&request.lease_id.get().to_le_bytes());
         }
         ApiRequest::GetMetrics(request) => {
             bytes.push(4);
@@ -75,10 +76,10 @@ pub fn decode_request(bytes: &[u8]) -> Result<ApiRequest, ApiCodecError> {
             required_lsn: cursor.read_optional_u64()?.map(Lsn),
             resource_id: ResourceId(cursor.read_u128()?),
         }),
-        3 => ApiRequest::GetReservation(ReservationRequest {
+        3 => ApiRequest::GetLease(LeaseRequest {
             required_lsn: cursor.read_optional_u64()?.map(Lsn),
             current_slot: Slot(cursor.read_u64()?),
-            reservation_id: ReservationId(cursor.read_u128()?),
+            lease_id: ReservationId(cursor.read_u128()?),
         }),
         4 => ApiRequest::GetMetrics(MetricsRequest {
             current_wall_clock_slot: Slot(cursor.read_u64()?),
@@ -102,7 +103,7 @@ pub fn encode_response(response: &ApiResponse) -> Vec<u8> {
         }
         ApiResponse::Submit(SubmitResponse::Rejected(response)) => {
             bytes.push(2);
-            encode_submission_failure(&mut bytes, *response);
+            encode_submission_failure(&mut bytes, response);
         }
         ApiResponse::GetResource(ResourceResponse::Found(response)) => {
             bytes.push(3);
@@ -118,17 +119,17 @@ pub fn encode_response(response: &ApiResponse) -> Vec<u8> {
             bytes.push(5);
             encode_read_fence(&mut bytes, *required_lsn, *last_applied_lsn);
         }
-        ApiResponse::GetReservation(ReservationResponse::Found(response)) => {
+        ApiResponse::GetLease(LeaseResponse::Found(response)) => {
             bytes.push(6);
-            encode_reservation_view(&mut bytes, *response);
+            encode_lease_view(&mut bytes, response);
         }
-        ApiResponse::GetReservation(ReservationResponse::NotFound) => {
+        ApiResponse::GetLease(LeaseResponse::NotFound) => {
             bytes.push(7);
         }
-        ApiResponse::GetReservation(ReservationResponse::Retired) => {
+        ApiResponse::GetLease(LeaseResponse::Retired) => {
             bytes.push(8);
         }
-        ApiResponse::GetReservation(ReservationResponse::FenceNotApplied {
+        ApiResponse::GetLease(LeaseResponse::FenceNotApplied {
             required_lsn,
             last_applied_lsn,
         }) => {
@@ -142,7 +143,7 @@ pub fn encode_response(response: &ApiResponse) -> Vec<u8> {
         ApiResponse::GetResource(ResourceResponse::EngineHalted) => {
             bytes.push(11);
         }
-        ApiResponse::GetReservation(ReservationResponse::EngineHalted) => {
+        ApiResponse::GetLease(LeaseResponse::EngineHalted) => {
             bytes.push(12);
         }
         ApiResponse::TickExpirations(TickExpirationsResponse::Applied(response)) => {
@@ -151,7 +152,7 @@ pub fn encode_response(response: &ApiResponse) -> Vec<u8> {
         }
         ApiResponse::TickExpirations(TickExpirationsResponse::Rejected(response)) => {
             bytes.push(14);
-            encode_submission_failure(&mut bytes, *response);
+            encode_submission_failure(&mut bytes, response);
         }
     }
     bytes
@@ -180,14 +181,12 @@ pub fn decode_response(bytes: &[u8]) -> Result<ApiResponse, ApiCodecError> {
                 last_applied_lsn,
             })
         }
-        6 => ApiResponse::GetReservation(ReservationResponse::Found(decode_reservation_view(
-            &mut cursor,
-        )?)),
-        7 => ApiResponse::GetReservation(ReservationResponse::NotFound),
-        8 => ApiResponse::GetReservation(ReservationResponse::Retired),
+        6 => ApiResponse::GetLease(LeaseResponse::Found(decode_lease_view(&mut cursor)?)),
+        7 => ApiResponse::GetLease(LeaseResponse::NotFound),
+        8 => ApiResponse::GetLease(LeaseResponse::Retired),
         9 => {
             let (required_lsn, last_applied_lsn) = decode_read_fence(&mut cursor)?;
-            ApiResponse::GetReservation(ReservationResponse::FenceNotApplied {
+            ApiResponse::GetLease(LeaseResponse::FenceNotApplied {
                 required_lsn,
                 last_applied_lsn,
             })
@@ -196,7 +195,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<ApiResponse, ApiCodecError> {
             metrics: decode_metrics(&mut cursor)?,
         }),
         11 => ApiResponse::GetResource(ResourceResponse::EngineHalted),
-        12 => ApiResponse::GetReservation(ReservationResponse::EngineHalted),
+        12 => ApiResponse::GetLease(LeaseResponse::EngineHalted),
         13 => ApiResponse::TickExpirations(TickExpirationsResponse::Applied(
             decode_tick_expirations_applied(&mut cursor)?,
         )),
@@ -211,7 +210,10 @@ pub fn decode_response(bytes: &[u8]) -> Result<ApiResponse, ApiCodecError> {
 
 fn encode_submission_committed(bytes: &mut Vec<u8>, response: SubmissionCommitted) {
     bytes.extend_from_slice(&response.applied_lsn.get().to_le_bytes());
-    encode_command_outcome(bytes, response.outcome);
+    bytes.push(encode_result_code(response.result_code));
+    encode_optional_u128(bytes, response.lease_id.map(ReservationId::get));
+    encode_optional_u64(bytes, response.lease_epoch);
+    encode_optional_u64(bytes, response.deadline_slot.map(Slot::get));
     encode_bool(bytes, response.from_retry_cache);
 }
 
@@ -220,12 +222,15 @@ fn decode_submission_committed(
 ) -> Result<SubmissionCommitted, ApiCodecError> {
     Ok(SubmissionCommitted {
         applied_lsn: Lsn(cursor.read_u64()?),
-        outcome: decode_command_outcome(cursor)?,
+        result_code: decode_result_code(cursor.read_u8()?)?,
+        lease_id: cursor.read_optional_u128()?.map(ReservationId),
+        lease_epoch: cursor.read_optional_u64()?,
+        deadline_slot: cursor.read_optional_u64()?.map(Slot),
         from_retry_cache: cursor.read_bool()?,
     })
 }
 
-fn encode_submission_failure(bytes: &mut Vec<u8>, response: SubmissionFailure) {
+fn encode_submission_failure(bytes: &mut Vec<u8>, response: &SubmissionFailure) {
     bytes.push(encode_submission_error_category(response.category));
     match response.code {
         SubmissionFailureCode::EngineHalted => {
@@ -330,43 +335,43 @@ fn decode_invalid_request_reason(
 
 fn encode_resource_view(bytes: &mut Vec<u8>, view: ResourceView) {
     bytes.extend_from_slice(&view.resource_id.get().to_le_bytes());
-    bytes.push(encode_resource_state(view.state));
-    encode_optional_u128(bytes, view.current_reservation_id.map(ReservationId::get));
+    bytes.push(encode_resource_view_state(view.state));
+    encode_optional_u128(bytes, view.current_lease_id.map(ReservationId::get));
     bytes.extend_from_slice(&view.version.to_le_bytes());
 }
 
 fn decode_resource_view(cursor: &mut Cursor<'_>) -> Result<ResourceView, ApiCodecError> {
     Ok(ResourceView {
         resource_id: ResourceId(cursor.read_u128()?),
-        state: decode_resource_state(cursor.read_u8()?)?,
-        current_reservation_id: cursor.read_optional_u128()?.map(ReservationId),
+        state: decode_resource_view_state(cursor.read_u8()?)?,
+        current_lease_id: cursor.read_optional_u128()?.map(ReservationId),
         version: cursor.read_u64()?,
     })
 }
 
-fn encode_reservation_view(bytes: &mut Vec<u8>, view: ReservationView) {
-    bytes.extend_from_slice(&view.reservation_id.get().to_le_bytes());
-    bytes.extend_from_slice(&view.resource_id.get().to_le_bytes());
+fn encode_lease_view(bytes: &mut Vec<u8>, view: &LeaseView) {
+    bytes.extend_from_slice(&view.lease_id.get().to_le_bytes());
     bytes.extend_from_slice(&view.holder_id.get().to_le_bytes());
+    bytes.push(encode_lease_view_state(view.state));
     bytes.extend_from_slice(&view.lease_epoch.to_le_bytes());
-    bytes.push(encode_reservation_state(view.state));
     bytes.extend_from_slice(&view.created_lsn.get().to_le_bytes());
-    bytes.extend_from_slice(&view.deadline_slot.get().to_le_bytes());
+    encode_optional_u64(bytes, view.deadline_slot.map(Slot::get));
     encode_optional_u64(bytes, view.released_lsn.map(Lsn::get));
     encode_optional_u64(bytes, view.retire_after_slot.map(Slot::get));
+    encode_resource_ids(bytes, &view.member_resource_ids);
 }
 
-fn decode_reservation_view(cursor: &mut Cursor<'_>) -> Result<ReservationView, ApiCodecError> {
-    Ok(ReservationView {
-        reservation_id: ReservationId(cursor.read_u128()?),
-        resource_id: ResourceId(cursor.read_u128()?),
+fn decode_lease_view(cursor: &mut Cursor<'_>) -> Result<LeaseView, ApiCodecError> {
+    Ok(LeaseView {
+        lease_id: ReservationId(cursor.read_u128()?),
         holder_id: HolderId(cursor.read_u128()?),
+        state: decode_lease_view_state(cursor.read_u8()?)?,
         lease_epoch: cursor.read_u64()?,
-        state: decode_reservation_state(cursor.read_u8()?)?,
         created_lsn: Lsn(cursor.read_u64()?),
-        deadline_slot: Slot(cursor.read_u64()?),
+        deadline_slot: cursor.read_optional_u64()?.map(Slot),
         released_lsn: cursor.read_optional_u64()?.map(Lsn),
         retire_after_slot: cursor.read_optional_u64()?.map(Slot),
+        member_resource_ids: decode_resource_ids(cursor)?,
     })
 }
 
@@ -454,22 +459,6 @@ fn decode_health_metrics(cursor: &mut Cursor<'_>) -> Result<HealthMetrics, ApiCo
     })
 }
 
-fn encode_command_outcome(bytes: &mut Vec<u8>, outcome: CommandOutcome) {
-    bytes.push(encode_result_code(outcome.result_code));
-    encode_optional_u128(bytes, outcome.reservation_id.map(ReservationId::get));
-    encode_optional_u64(bytes, outcome.lease_epoch);
-    encode_optional_u64(bytes, outcome.deadline_slot.map(Slot::get));
-}
-
-fn decode_command_outcome(cursor: &mut Cursor<'_>) -> Result<CommandOutcome, ApiCodecError> {
-    Ok(CommandOutcome {
-        result_code: decode_result_code(cursor.read_u8()?)?,
-        reservation_id: cursor.read_optional_u128()?.map(ReservationId),
-        lease_epoch: cursor.read_optional_u64()?,
-        deadline_slot: cursor.read_optional_u64()?.map(Slot),
-    })
-}
-
 fn encode_optional_lsn(bytes: &mut Vec<u8>, value: Option<Lsn>) {
     encode_optional_u64(bytes, value.map(Lsn::get));
 }
@@ -505,6 +494,14 @@ fn encode_bytes(bytes: &mut Vec<u8>, payload: &[u8]) -> Result<(), ApiCodecError
     Ok(())
 }
 
+fn encode_resource_ids(bytes: &mut Vec<u8>, resource_ids: &[ResourceId]) {
+    let len = u32::try_from(resource_ids.len()).expect("resource id list length must fit u32");
+    bytes.extend_from_slice(&len.to_le_bytes());
+    for resource_id in resource_ids {
+        bytes.extend_from_slice(&resource_id.get().to_le_bytes());
+    }
+}
+
 fn encode_submission_error_category(category: SubmissionErrorCategory) -> u8 {
     match category {
         SubmissionErrorCategory::DefiniteFailure => 1,
@@ -523,21 +520,21 @@ fn decode_submission_error_category(value: u8) -> Result<SubmissionErrorCategory
     }
 }
 
-fn encode_resource_state(state: ResourceState) -> u8 {
+fn encode_resource_view_state(state: ResourceViewState) -> u8 {
     match state {
-        ResourceState::Available => 1,
-        ResourceState::Reserved => 2,
-        ResourceState::Confirmed => 3,
-        ResourceState::Revoking => 4,
+        ResourceViewState::Available => 1,
+        ResourceViewState::Reserved => 2,
+        ResourceViewState::Active => 3,
+        ResourceViewState::Revoking => 4,
     }
 }
 
-fn decode_resource_state(value: u8) -> Result<ResourceState, ApiCodecError> {
+fn decode_resource_view_state(value: u8) -> Result<ResourceViewState, ApiCodecError> {
     match value {
-        1 => Ok(ResourceState::Available),
-        2 => Ok(ResourceState::Reserved),
-        3 => Ok(ResourceState::Confirmed),
-        4 => Ok(ResourceState::Revoking),
+        1 => Ok(ResourceViewState::Available),
+        2 => Ok(ResourceViewState::Reserved),
+        3 => Ok(ResourceViewState::Active),
+        4 => Ok(ResourceViewState::Revoking),
         value => Err(ApiCodecError::InvalidEnumValue {
             kind: "resource_state",
             value,
@@ -545,27 +542,27 @@ fn decode_resource_state(value: u8) -> Result<ResourceState, ApiCodecError> {
     }
 }
 
-fn encode_reservation_state(state: ReservationState) -> u8 {
+fn encode_lease_view_state(state: LeaseViewState) -> u8 {
     match state {
-        ReservationState::Reserved => 1,
-        ReservationState::Confirmed => 2,
-        ReservationState::Released => 3,
-        ReservationState::Expired => 4,
-        ReservationState::Revoking => 5,
-        ReservationState::Revoked => 6,
+        LeaseViewState::Reserved => 1,
+        LeaseViewState::Active => 2,
+        LeaseViewState::Released => 3,
+        LeaseViewState::Expired => 4,
+        LeaseViewState::Revoking => 5,
+        LeaseViewState::Revoked => 6,
     }
 }
 
-fn decode_reservation_state(value: u8) -> Result<ReservationState, ApiCodecError> {
+fn decode_lease_view_state(value: u8) -> Result<LeaseViewState, ApiCodecError> {
     match value {
-        1 => Ok(ReservationState::Reserved),
-        2 => Ok(ReservationState::Confirmed),
-        3 => Ok(ReservationState::Released),
-        4 => Ok(ReservationState::Expired),
-        5 => Ok(ReservationState::Revoking),
-        6 => Ok(ReservationState::Revoked),
+        1 => Ok(LeaseViewState::Reserved),
+        2 => Ok(LeaseViewState::Active),
+        3 => Ok(LeaseViewState::Released),
+        4 => Ok(LeaseViewState::Expired),
+        5 => Ok(LeaseViewState::Revoking),
+        6 => Ok(LeaseViewState::Revoked),
         value => Err(ApiCodecError::InvalidEnumValue {
-            kind: "reservation_state",
+            kind: "lease_state",
             value,
         }),
     }
@@ -753,4 +750,17 @@ impl<'a> Cursor<'a> {
         self.offset += len;
         Ok(slice.to_vec())
     }
+
+    fn read_resource_ids(&mut self) -> Result<Vec<ResourceId>, ApiCodecError> {
+        let len = usize::try_from(self.read_u32()?).map_err(|_| ApiCodecError::LengthTooLarge)?;
+        let mut resource_ids = Vec::with_capacity(len);
+        for _ in 0..len {
+            resource_ids.push(ResourceId(self.read_u128()?));
+        }
+        Ok(resource_ids)
+    }
+}
+
+fn decode_resource_ids(cursor: &mut Cursor<'_>) -> Result<Vec<ResourceId>, ApiCodecError> {
+    cursor.read_resource_ids()
 }

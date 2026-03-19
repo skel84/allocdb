@@ -12,11 +12,11 @@ pub(crate) mod replicated_simulation;
 pub(crate) mod simulation;
 
 pub use api::{
-    ApiCodecError, ApiRequest, ApiResponse, InvalidRequestReason, MetricsRequest, MetricsResponse,
-    ReservationRequest, ReservationResponse, ReservationView, ResourceRequest, ResourceResponse,
-    ResourceView, SubmissionCommitted, SubmissionFailure, SubmissionFailureCode, SubmitRequest,
-    SubmitResponse, TickExpirationsApplied, TickExpirationsRequest, TickExpirationsResponse,
-    decode_request, decode_response, encode_request, encode_response,
+    ApiCodecError, ApiRequest, ApiResponse, InvalidRequestReason, LeaseRequest, LeaseResponse,
+    LeaseView, LeaseViewState, MetricsRequest, MetricsResponse, ResourceRequest, ResourceResponse,
+    ResourceView, ResourceViewState, SubmissionCommitted, SubmissionFailure, SubmissionFailureCode,
+    SubmitRequest, SubmitResponse, TickExpirationsApplied, TickExpirationsRequest,
+    TickExpirationsResponse, decode_request, decode_response, encode_request, encode_response,
 };
 pub use engine::{
     EngineConfig, EngineConfigError, EngineMetrics, EngineOpenError, EnqueueResult, ReadError,

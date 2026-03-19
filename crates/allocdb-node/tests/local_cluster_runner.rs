@@ -8,16 +8,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use allocdb_core::command::{ClientRequest, Command as AllocCommand};
 use allocdb_core::ids::{ClientId, HolderId, Lsn, OperationId, ResourceId, Slot};
-use allocdb_core::{ReservationState, ResourceState};
 use allocdb_node::local_cluster::{
     LocalClusterFaultState, LocalClusterLayout, LocalClusterTimelineEventKind,
     load_local_cluster_timeline, request_control_status,
 };
 use allocdb_node::{
-    ApiRequest, ApiResponse, ReplicaId, ReplicaMetadataFile, ReplicaRole, ResourceRequest,
-    ResourceResponse, SubmitRequest, SubmitResponse, TickExpirationsRequest,
-    TickExpirationsResponse, decode_response, encode_request,
+    ApiRequest, ApiResponse, LeaseRequest, LeaseResponse, ReplicaId, ReplicaMetadataFile,
+    ReplicaRole, ResourceRequest, ResourceResponse, SubmitRequest, SubmitResponse,
+    TickExpirationsRequest, TickExpirationsResponse, decode_response, encode_request,
 };
+use allocdb_node::{LeaseViewState, ResourceViewState};
 
 fn temp_workspace(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -571,8 +571,7 @@ fn local_cluster_tick_expirations_replicates_internal_commands() {
         ApiResponse::Submit(SubmitResponse::Committed(response)) => {
             assert_eq!(response.applied_lsn, Lsn(2));
             response
-                .outcome
-                .reservation_id
+                .lease_id
                 .expect("reserve should assign one reservation id")
         }
         other => panic!("expected committed reserve response, got {other:?}"),
@@ -609,23 +608,23 @@ fn local_cluster_tick_expirations_replicates_internal_commands() {
     );
     match resource {
         ApiResponse::GetResource(ResourceResponse::Found(resource)) => {
-            assert_eq!(resource.state, ResourceState::Available);
-            assert_eq!(resource.current_reservation_id, None);
+            assert_eq!(resource.state, ResourceViewState::Available);
+            assert_eq!(resource.current_lease_id, None);
         }
         other => panic!("expected available resource after tick, got {other:?}"),
     }
 
     let reservation = send_api_request(
         primary.client_addr,
-        &ApiRequest::GetReservation(allocdb_node::ReservationRequest {
-            reservation_id,
+        &ApiRequest::GetLease(LeaseRequest {
+            lease_id: reservation_id,
             current_slot: Slot(12),
             required_lsn: Some(tick_lsn),
         }),
     );
     match reservation {
-        ApiResponse::GetReservation(allocdb_node::ReservationResponse::Found(reservation)) => {
-            assert_eq!(reservation.state, ReservationState::Expired);
+        ApiResponse::GetLease(LeaseResponse::Found(reservation)) => {
+            assert_eq!(reservation.state, LeaseViewState::Expired);
             assert_eq!(reservation.released_lsn, Some(tick_lsn));
         }
         other => panic!("expected expired reservation after tick, got {other:?}"),
@@ -667,8 +666,7 @@ fn local_cluster_tick_retry_drains_pending_internal_suffix_after_quorum_recovers
     );
     let reservation_id = match reserve {
         ApiResponse::Submit(SubmitResponse::Committed(response)) => response
-            .outcome
-            .reservation_id
+            .lease_id
             .expect("reserve should assign one reservation id"),
         other => panic!("expected committed reserve response, got {other:?}"),
     };
@@ -729,23 +727,23 @@ fn local_cluster_tick_retry_drains_pending_internal_suffix_after_quorum_recovers
     );
     match resource {
         ApiResponse::GetResource(ResourceResponse::Found(resource)) => {
-            assert_eq!(resource.state, ResourceState::Available);
-            assert_eq!(resource.current_reservation_id, None);
+            assert_eq!(resource.state, ResourceViewState::Available);
+            assert_eq!(resource.current_lease_id, None);
         }
         other => panic!("expected available resource after retry tick, got {other:?}"),
     }
 
     let reservation = send_api_request(
         primary.client_addr,
-        &ApiRequest::GetReservation(allocdb_node::ReservationRequest {
-            reservation_id,
+        &ApiRequest::GetLease(LeaseRequest {
+            lease_id: reservation_id,
             current_slot: Slot(12),
             required_lsn: Some(committed_lsn),
         }),
     );
     match reservation {
-        ApiResponse::GetReservation(allocdb_node::ReservationResponse::Found(reservation)) => {
-            assert_eq!(reservation.state, ReservationState::Expired);
+        ApiResponse::GetLease(LeaseResponse::Found(reservation)) => {
+            assert_eq!(reservation.state, LeaseViewState::Expired);
             assert_eq!(reservation.released_lsn, Some(committed_lsn));
         }
         other => panic!("expected expired reservation after retry tick, got {other:?}"),

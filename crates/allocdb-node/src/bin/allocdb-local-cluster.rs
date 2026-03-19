@@ -21,9 +21,9 @@ use allocdb_node::replica::{
     ReplicaId, ReplicaIdentity, ReplicaNode, ReplicaNodeStatus, ReplicaPreparedKind, ReplicaRole,
 };
 use allocdb_node::{
-    ApiRequest, ApiResponse, MetricsResponse, ReservationResponse, ResourceResponse,
-    SubmissionFailure, SubmissionFailureCode, SubmitResponse, TickExpirationsApplied,
-    TickExpirationsResponse, decode_request, encode_response,
+    ApiRequest, ApiResponse, LeaseResponse, MetricsResponse, ResourceResponse, SubmissionFailure,
+    SubmissionFailureCode, SubmitResponse, TickExpirationsApplied, TickExpirationsResponse,
+    decode_request, encode_response,
 };
 use log::{info, warn};
 
@@ -747,7 +747,7 @@ fn handle_client_stream(
     let response = match request {
         ApiRequest::Submit(request) => handle_replicated_submit(node, layout, replica, &request),
         ApiRequest::GetResource(request) => Ok(handle_resource_request(node, request)),
-        ApiRequest::GetReservation(request) => Ok(handle_reservation_request(node, request)),
+        ApiRequest::GetLease(request) => Ok(handle_lease_request(node, request)),
         ApiRequest::GetMetrics(request) => Ok(handle_metrics_request(node, request)),
         ApiRequest::TickExpirations(request) => {
             handle_replicated_tick_expirations(node, layout, replica, request)
@@ -1444,39 +1444,41 @@ fn handle_resource_request(node: &ReplicaNode, request: allocdb_node::ResourceRe
     encode_response(&ApiResponse::GetResource(response))
 }
 
-fn handle_reservation_request(
-    node: &ReplicaNode,
-    request: allocdb_node::ReservationRequest,
-) -> Vec<u8> {
+fn handle_lease_request(node: &ReplicaNode, request: allocdb_node::LeaseRequest) -> Vec<u8> {
     let response = match node.enforce_primary_read(request.required_lsn.unwrap_or(Lsn(0))) {
         Ok(()) => match node
             .engine()
             .expect("primary read requires one live engine")
             .db()
-            .reservation(request.reservation_id, request.current_slot)
+            .reservation(request.lease_id, request.current_slot)
         {
-            Ok(record) => ReservationResponse::Found(record.into()),
-            Err(ReservationLookupError::NotFound) => ReservationResponse::NotFound,
-            Err(ReservationLookupError::Retired) => ReservationResponse::Retired,
+            Ok(record) => LeaseResponse::Found(allocdb_node::LeaseView::from_db(
+                node.engine()
+                    .expect("primary read requires one live engine")
+                    .db(),
+                record,
+            )),
+            Err(ReservationLookupError::NotFound) => LeaseResponse::NotFound,
+            Err(ReservationLookupError::Retired) => LeaseResponse::Retired,
         },
         Err(allocdb_node::NotPrimaryReadError::Fence(
             allocdb_node::ReadError::RequiredLsnNotApplied {
                 required_lsn,
                 last_applied_lsn,
             },
-        )) => ReservationResponse::FenceNotApplied {
+        )) => LeaseResponse::FenceNotApplied {
             required_lsn,
             last_applied_lsn,
         },
         Err(
             allocdb_node::NotPrimaryReadError::Fence(allocdb_node::ReadError::EngineHalted)
             | allocdb_node::NotPrimaryReadError::ReplicaCrashed,
-        ) => ReservationResponse::EngineHalted,
+        ) => LeaseResponse::EngineHalted,
         Err(allocdb_node::NotPrimaryReadError::Role(role)) => {
             return encode_control_error_bytes(&format!("not primary: role={}", encode_role(role)));
         }
     };
-    encode_response(&ApiResponse::GetReservation(response))
+    encode_response(&ApiResponse::GetLease(response))
 }
 
 fn handle_metrics_request(node: &ReplicaNode, request: allocdb_node::MetricsRequest) -> Vec<u8> {

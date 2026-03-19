@@ -1,4 +1,3 @@
-use allocdb_core::ReservationState;
 use allocdb_core::command::{ClientRequest, Command as AllocCommand};
 use allocdb_core::ids::{HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use allocdb_core::result::ResultCode;
@@ -9,9 +8,9 @@ use allocdb_node::jepsen::{
 };
 use allocdb_node::local_cluster::LocalClusterReplicaConfig;
 use allocdb_node::{
-    ApiRequest, ApiResponse, ReservationRequest, ReservationResponse, ResourceRequest,
-    ResourceResponse, SubmissionFailure, SubmissionFailureCode, SubmitRequest, SubmitResponse,
-    TickExpirationsRequest, TickExpirationsResponse, decode_response,
+    ApiRequest, ApiResponse, LeaseRequest, LeaseResponse, LeaseViewState, ResourceRequest,
+    ResourceResponse, ResourceViewState, SubmissionFailure, SubmissionFailureCode, SubmitRequest,
+    SubmitResponse, TickExpirationsRequest, TickExpirationsResponse, decode_response,
 };
 
 use crate::ExternalTestbed;
@@ -30,7 +29,7 @@ pub(super) enum RemoteApiOutcome {
 pub(super) enum ResourceReadObservation {
     Available,
     Held {
-        state: allocdb_core::ResourceState,
+        state: ResourceViewState,
         current_reservation_id: Option<ReservationId>,
         version: u64,
     },
@@ -76,7 +75,7 @@ pub(super) fn create_qemu_resource<T: ExternalTestbed>(
     ));
     match send_replica_api_request(layout, primary, &request)? {
         RemoteApiOutcome::Api(ApiResponse::Submit(SubmitResponse::Committed(response)))
-            if response.outcome.result_code == ResultCode::Ok =>
+            if response.result_code == ResultCode::Ok =>
         {
             Ok(())
         }
@@ -183,7 +182,7 @@ pub(super) fn tick_expirations_event<T: ExternalTestbed>(
                 ))
             }
             TickExpirationsResponse::Rejected(failure) => {
-                Ok((operation, outcome_from_submission_failure(failure), None))
+                Ok((operation, outcome_from_submission_failure(&failure), None))
             }
         },
         RemoteApiOutcome::Api(other) => Err(format!(
@@ -219,44 +218,40 @@ pub(super) fn reservation_read_event<T: ExternalTestbed>(
         request_slot: Some(current_slot),
         ttl_slots: None,
     };
-    let request = ApiRequest::GetReservation(ReservationRequest {
-        reservation_id,
+    let request = ApiRequest::GetLease(LeaseRequest {
+        lease_id: reservation_id,
         current_slot,
         required_lsn,
     });
     match send_replica_api_request(layout, replica, &request)? {
-        RemoteApiOutcome::Api(ApiResponse::GetReservation(ReservationResponse::Found(
-            reservation,
-        ))) => Ok((
+        RemoteApiOutcome::Api(ApiResponse::GetLease(LeaseResponse::Found(reservation))) => Ok((
             operation,
             JepsenEventOutcome::SuccessfulRead(JepsenSuccessfulRead {
                 target: JepsenReadTarget::Reservation,
                 served_by: replica.replica_id,
                 served_role: replica.role,
                 observed_lsn: required_lsn,
-                state: JepsenReadState::Reservation(map_reservation_state(reservation)),
+                state: JepsenReadState::Reservation(map_reservation_state(&reservation)),
             }),
         )),
-        RemoteApiOutcome::Api(ApiResponse::GetReservation(ReservationResponse::NotFound)) => Ok((
+        RemoteApiOutcome::Api(ApiResponse::GetLease(LeaseResponse::NotFound)) => Ok((
             operation,
             JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::NotFound),
         )),
-        RemoteApiOutcome::Api(ApiResponse::GetReservation(ReservationResponse::Retired)) => Ok((
+        RemoteApiOutcome::Api(ApiResponse::GetLease(LeaseResponse::Retired)) => Ok((
             operation,
             JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::Retired),
         )),
-        RemoteApiOutcome::Api(ApiResponse::GetReservation(
-            ReservationResponse::FenceNotApplied { .. },
-        )) => Ok((
-            operation,
-            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::FenceNotApplied),
-        )),
-        RemoteApiOutcome::Api(ApiResponse::GetReservation(ReservationResponse::EngineHalted)) => {
+        RemoteApiOutcome::Api(ApiResponse::GetLease(LeaseResponse::FenceNotApplied { .. })) => {
             Ok((
                 operation,
-                JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::EngineHalted),
+                JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::FenceNotApplied),
             ))
         }
+        RemoteApiOutcome::Api(ApiResponse::GetLease(LeaseResponse::EngineHalted)) => Ok((
+            operation,
+            JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::EngineHalted),
+        )),
         RemoteApiOutcome::Api(other) => Err(format!(
             "reservation read for {} returned unexpected response {other:?}",
             reservation_id.get()
@@ -304,12 +299,12 @@ pub(super) fn classify_resource_read_outcome(
                     resource.resource_id.get()
                 ));
             }
-            if matches!(resource.state, allocdb_core::ResourceState::Available) {
+            if matches!(resource.state, ResourceViewState::Available) {
                 Ok(ResourceReadObservation::Available)
             } else {
                 Ok(ResourceReadObservation::Held {
                     state: resource.state,
-                    current_reservation_id: resource.current_reservation_id,
+                    current_reservation_id: resource.current_lease_id,
                     version: resource.version,
                 })
             }
@@ -338,26 +333,28 @@ pub(super) fn classify_resource_read_outcome(
 }
 
 pub(super) fn map_reservation_state(
-    reservation: allocdb_node::ReservationView,
+    reservation: &allocdb_node::LeaseView,
 ) -> JepsenReservationState {
     match reservation.state {
-        ReservationState::Reserved => JepsenReservationState::Active {
-            resource_id: reservation.resource_id,
+        LeaseViewState::Reserved => JepsenReservationState::Active {
+            resource_id: reservation.member_resource_ids[0],
             holder_id: reservation.holder_id.get(),
-            expires_at_slot: reservation.deadline_slot,
+            expires_at_slot: reservation
+                .deadline_slot
+                .expect("live lease should expose deadline"),
             confirmed: false,
         },
-        ReservationState::Confirmed | ReservationState::Revoking => {
-            JepsenReservationState::Active {
-                resource_id: reservation.resource_id,
-                holder_id: reservation.holder_id.get(),
-                expires_at_slot: reservation.deadline_slot,
-                confirmed: true,
-            }
-        }
-        ReservationState::Released | ReservationState::Expired | ReservationState::Revoked => {
+        LeaseViewState::Active | LeaseViewState::Revoking => JepsenReservationState::Active {
+            resource_id: reservation.member_resource_ids[0],
+            holder_id: reservation.holder_id.get(),
+            expires_at_slot: reservation
+                .deadline_slot
+                .expect("live lease should expose deadline"),
+            confirmed: true,
+        },
+        LeaseViewState::Released | LeaseViewState::Expired | LeaseViewState::Revoked => {
             JepsenReservationState::Released {
-                resource_id: reservation.resource_id,
+                resource_id: reservation.member_resource_ids[0],
                 holder_id: reservation.holder_id.get(),
                 released_lsn: reservation.released_lsn,
             }
@@ -365,7 +362,7 @@ pub(super) fn map_reservation_state(
     }
 }
 
-pub(super) fn outcome_from_submission_failure(failure: SubmissionFailure) -> JepsenEventOutcome {
+pub(super) fn outcome_from_submission_failure(failure: &SubmissionFailure) -> JepsenEventOutcome {
     if failure.category == allocdb_node::SubmissionErrorCategory::Indefinite {
         return JepsenEventOutcome::Ambiguous(JepsenAmbiguousOutcome::IndefiniteWrite);
     }
@@ -410,14 +407,12 @@ fn map_reserve_submit_response(
     response: SubmitResponse,
 ) -> Result<(JepsenOperation, JepsenEventOutcome, Option<ReserveCommit>), String> {
     match response {
-        SubmitResponse::Committed(response) => match response.outcome.result_code {
+        SubmitResponse::Committed(response) => match response.result_code {
             ResultCode::Ok => {
                 let reservation_id = response
-                    .outcome
-                    .reservation_id
+                    .lease_id
                     .ok_or_else(|| String::from("reserve commit missing reservation_id"))?;
                 let expires_at_slot = response
-                    .outcome
                     .deadline_slot
                     .ok_or_else(|| String::from("reserve commit missing deadline_slot"))?;
                 Ok((
@@ -460,7 +455,7 @@ fn map_reserve_submit_response(
             other => Err(format!("unexpected reserve result code {other:?}")),
         },
         SubmitResponse::Rejected(failure) => {
-            Ok((operation, outcome_from_submission_failure(failure), None))
+            Ok((operation, outcome_from_submission_failure(&failure), None))
         }
     }
 }
@@ -815,16 +810,16 @@ mod tests {
 
     #[test]
     fn revoking_reservation_maps_to_confirmed_active_state() {
-        let state = map_reservation_state(allocdb_node::ReservationView {
-            reservation_id: ReservationId(11),
-            resource_id: ResourceId(22),
+        let state = map_reservation_state(&allocdb_node::LeaseView {
+            lease_id: ReservationId(11),
             holder_id: HolderId(33),
             lease_epoch: 2,
-            state: ReservationState::Revoking,
+            state: LeaseViewState::Revoking,
             created_lsn: Lsn(1),
-            deadline_slot: Slot(9),
+            deadline_slot: Some(Slot(9)),
             released_lsn: None,
             retire_after_slot: None,
+            member_resource_ids: vec![ResourceId(22)],
         });
         assert_eq!(
             state,
@@ -839,16 +834,16 @@ mod tests {
 
     #[test]
     fn revoked_reservation_maps_to_released_state() {
-        let state = map_reservation_state(allocdb_node::ReservationView {
-            reservation_id: ReservationId(11),
-            resource_id: ResourceId(22),
+        let state = map_reservation_state(&allocdb_node::LeaseView {
+            lease_id: ReservationId(11),
             holder_id: HolderId(33),
             lease_epoch: 2,
-            state: ReservationState::Revoked,
+            state: LeaseViewState::Revoked,
             created_lsn: Lsn(1),
-            deadline_slot: Slot(9),
+            deadline_slot: Some(Slot(9)),
             released_lsn: Some(Lsn(4)),
             retire_after_slot: Some(Slot(17)),
+            member_resource_ids: vec![ResourceId(22)],
         });
         assert_eq!(
             state,
@@ -862,7 +857,7 @@ mod tests {
 
     #[test]
     fn outcome_from_submission_failure_maps_rejection_codes() {
-        let overloaded = outcome_from_submission_failure(SubmissionFailure {
+        let overloaded = outcome_from_submission_failure(&SubmissionFailure {
             category: SubmissionErrorCategory::DefiniteFailure,
             code: SubmissionFailureCode::Overloaded {
                 queue_depth: 9,
@@ -874,7 +869,7 @@ mod tests {
             JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::Busy)
         );
 
-        let invalid = outcome_from_submission_failure(SubmissionFailure {
+        let invalid = outcome_from_submission_failure(&SubmissionFailure {
             category: SubmissionErrorCategory::DefiniteFailure,
             code: SubmissionFailureCode::InvalidRequest(InvalidRequestReason::InvalidLayout),
         });
@@ -883,7 +878,7 @@ mod tests {
             JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::InvalidRequest)
         );
 
-        let halted = outcome_from_submission_failure(SubmissionFailure {
+        let halted = outcome_from_submission_failure(&SubmissionFailure {
             category: SubmissionErrorCategory::DefiniteFailure,
             code: SubmissionFailureCode::EngineHalted,
         });
@@ -900,8 +895,8 @@ mod tests {
             responses.push(Ok(encoded_api_response(&ApiResponse::GetResource(
                 ResourceResponse::Found(allocdb_node::ResourceView {
                     resource_id: ResourceId(7),
-                    state: allocdb_core::ResourceState::Reserved,
-                    current_reservation_id: Some(ReservationId(70 + u128::from(attempt))),
+                    state: ResourceViewState::Reserved,
+                    current_lease_id: Some(ReservationId(70 + u128::from(attempt))),
                     version: attempt,
                 }),
             ))));
@@ -918,8 +913,8 @@ mod tests {
         responses.push(Ok(encoded_api_response(&ApiResponse::GetResource(
             ResourceResponse::Found(allocdb_node::ResourceView {
                 resource_id: ResourceId(7),
-                state: allocdb_core::ResourceState::Reserved,
-                current_reservation_id: Some(ReservationId(999)),
+                state: ResourceViewState::Reserved,
+                current_lease_id: Some(ReservationId(999)),
                 version: 99,
             }),
         ))));
@@ -966,8 +961,8 @@ mod tests {
             Ok(encoded_api_response(&ApiResponse::GetResource(
                 ResourceResponse::Found(allocdb_node::ResourceView {
                     resource_id: ResourceId(7),
-                    state: allocdb_core::ResourceState::Reserved,
-                    current_reservation_id: Some(ReservationId(70)),
+                    state: ResourceViewState::Reserved,
+                    current_lease_id: Some(ReservationId(70)),
                     version: 1,
                 }),
             ))),
@@ -983,8 +978,8 @@ mod tests {
             Ok(encoded_api_response(&ApiResponse::GetResource(
                 ResourceResponse::Found(allocdb_node::ResourceView {
                     resource_id: ResourceId(7),
-                    state: allocdb_core::ResourceState::Available,
-                    current_reservation_id: None,
+                    state: ResourceViewState::Available,
+                    current_lease_id: None,
                     version: 2,
                 }),
             ))),
@@ -1039,8 +1034,8 @@ mod tests {
             RemoteApiOutcome::Api(ApiResponse::GetResource(ResourceResponse::Found(
                 allocdb_node::ResourceView {
                     resource_id: ResourceId(8),
-                    state: allocdb_core::ResourceState::Available,
-                    current_reservation_id: None,
+                    state: ResourceViewState::Available,
+                    current_lease_id: None,
                     version: 1,
                 },
             ))),
