@@ -617,6 +617,26 @@ Checks:
 - restarted and rejoined replicas converge on committed history before serving or voting
 - recovery preserves the same client-visible result for retried operations
 
+### Supplementary Lease Coverage
+
+The release-blocking matrix stays on the four workload families above. Lease-kernel follow-on
+work uses one separate non-blocking workload family so bundle, fencing, and revoke behavior can
+be exercised on the real Jepsen surface without silently changing the documented gate size.
+
+#### Lease Safety
+
+- reserve one bundle atomically, confirm it, revoke it, and reclaim it later
+- issue one holder-authorized command with a stale `lease_epoch` after revoke
+- try one pre-reclaim bundle reuse and one post-reclaim bundle reuse
+- run the workload in at least one control lane and one faulted lane, currently
+  `lease_safety-control` and `lease_safety-crash-restart`
+
+Checks:
+
+- bundle ownership remains all-or-nothing across retries and failover
+- revoked ownership is not reusable before explicit `reclaim`
+- stale holders fail with `stale_epoch` rather than succeeding or drifting into a weaker outcome
+
 ### Nemesis Families
 
 The first Jepsen gate should explicitly cover:

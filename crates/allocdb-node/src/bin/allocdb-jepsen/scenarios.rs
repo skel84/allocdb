@@ -1,6 +1,7 @@
 use allocdb_core::ids::{HolderId, OperationId, ResourceId, Slot};
 use allocdb_node::jepsen::{
-    JepsenExpiredReservation, JepsenHistoryEvent, JepsenRunSpec, JepsenWorkloadFamily,
+    JepsenExpiredReservation, JepsenHistoryEvent, JepsenOperationKind, JepsenRunSpec,
+    JepsenWorkloadFamily,
 };
 use allocdb_node::local_cluster::LocalClusterReplicaConfig;
 
@@ -9,9 +10,10 @@ use crate::cluster::{
     runtime_replica_by_id,
 };
 use crate::events::{
-    ExpirationDrainPlan, ReserveEventSpec, backup_process_name, create_qemu_resource,
-    primary_process_name, record_resource_available_after_expiration, reservation_read_event,
-    reserve_event, tick_expirations_event,
+    AdminLeaseEventSpec, ExpirationDrainPlan, HolderLeaseEventSpec, ReserveBundleEventSpec,
+    ReserveCommit, ReserveEventSpec, admin_lease_event, backup_process_name, create_qemu_resource,
+    holder_lease_event, primary_process_name, record_resource_available_after_expiration,
+    reservation_read_event, reserve_bundle_event, reserve_event, tick_expirations_event,
 };
 use crate::support::{HistoryBuilder, RunExecutionContext};
 use crate::{ExternalTestbed, unique_probe_resource_id};
@@ -37,6 +39,7 @@ pub(super) fn execute_control_run<T: ExternalTestbed>(
         JepsenWorkloadFamily::ExpirationAndRecovery => {
             run_expiration_and_recovery(layout, &primary, base_id, context)
         }
+        JepsenWorkloadFamily::LeaseSafety => run_lease_safety(layout, &primary, base_id, context),
     }
 }
 
@@ -75,6 +78,14 @@ pub(super) fn execute_crash_restart_run<T: ExternalTestbed>(
             context,
         ),
         JepsenWorkloadFamily::ExpirationAndRecovery => run_crash_restart_expiration_recovery(
+            layout,
+            &primary,
+            &failover_target,
+            &supporting_backup,
+            base_id,
+            context,
+        ),
+        JepsenWorkloadFamily::LeaseSafety => run_crash_restart_lease_safety(
             layout,
             &primary,
             &failover_target,
@@ -399,6 +410,222 @@ fn run_crash_restart_expiration_recovery<T: ExternalTestbed>(
     Ok(history.finish())
 }
 
+struct LeaseSafetySetup {
+    resource_ids: [ResourceId; 2],
+    reserve_commit: ReserveCommit,
+}
+
+fn lease_safety_resource_ids(base_id: u128) -> [ResourceId; 2] {
+    [ResourceId(base_id + 4), ResourceId(base_id + 5)]
+}
+
+fn create_lease_safety_resources<T: ExternalTestbed>(
+    layout: &T,
+    primary: &LocalClusterReplicaConfig,
+    context: &RunExecutionContext,
+    base_id: u128,
+) -> Result<[ResourceId; 2], String> {
+    let resource_ids = lease_safety_resource_ids(base_id);
+    for (offset, resource_id) in resource_ids.iter().enumerate() {
+        create_qemu_resource(
+            layout,
+            primary,
+            context,
+            *resource_id,
+            OperationId(base_id + 104 + u128::try_from(offset).expect("offset fits u128")),
+        )?;
+    }
+    Ok(resource_ids)
+}
+
+fn prepare_lease_safety_setup<T: ExternalTestbed>(
+    layout: &T,
+    primary: &LocalClusterReplicaConfig,
+    context: &RunExecutionContext,
+    history: &mut HistoryBuilder,
+    base_id: u128,
+    reserve_error_context: &str,
+) -> Result<LeaseSafetySetup, String> {
+    let resource_ids = create_lease_safety_resources(layout, primary, context, base_id)?;
+    let (reserve_operation, reserve_outcome, reserve_commit) = reserve_bundle_event(
+        layout,
+        primary,
+        context,
+        ReserveBundleEventSpec {
+            operation_id: OperationId(base_id + 40),
+            resource_ids: &resource_ids,
+            holder_id: HolderId(808),
+            request_slot: Slot(70),
+            ttl_slots: 8,
+        },
+    )?;
+    let reserve_commit = reserve_commit
+        .ok_or_else(|| format!("{reserve_error_context} expected one committed bundle reserve"))?;
+    history.push(
+        primary_process_name(primary),
+        reserve_operation,
+        reserve_outcome,
+    );
+
+    let confirm = holder_lease_event(
+        layout,
+        primary,
+        context,
+        HolderLeaseEventSpec {
+            kind: JepsenOperationKind::Confirm,
+            operation_id: OperationId(base_id + 41),
+            reservation_id: reserve_commit.reservation_id,
+            resource_id: resource_ids[0],
+            resource_ids: &resource_ids,
+            holder_id: HolderId(808),
+            lease_epoch: reserve_commit.lease_epoch,
+            request_slot: Slot(71),
+        },
+    )?;
+    history.push(primary_process_name(primary), confirm.0, confirm.1);
+
+    Ok(LeaseSafetySetup {
+        resource_ids,
+        reserve_commit,
+    })
+}
+
+fn record_lease_safety_revoke_cycle<T: ExternalTestbed>(
+    layout: &T,
+    primary: &LocalClusterReplicaConfig,
+    context: &RunExecutionContext,
+    history: &mut HistoryBuilder,
+    base_id: u128,
+    setup: &LeaseSafetySetup,
+) -> Result<(), String> {
+    let revoke = admin_lease_event(
+        layout,
+        primary,
+        context,
+        AdminLeaseEventSpec {
+            kind: JepsenOperationKind::Revoke,
+            operation_id: OperationId(base_id + 42),
+            reservation_id: setup.reserve_commit.reservation_id,
+            request_slot: Slot(72),
+        },
+    )?;
+    history.push(primary_process_name(primary), revoke.0, revoke.1);
+
+    let stale_release = holder_lease_event(
+        layout,
+        primary,
+        context,
+        HolderLeaseEventSpec {
+            kind: JepsenOperationKind::Release,
+            operation_id: OperationId(base_id + 43),
+            reservation_id: setup.reserve_commit.reservation_id,
+            resource_id: setup.resource_ids[0],
+            resource_ids: &setup.resource_ids,
+            holder_id: HolderId(808),
+            lease_epoch: setup.reserve_commit.lease_epoch,
+            request_slot: Slot(73),
+        },
+    )?;
+    history.push(
+        primary_process_name(primary),
+        stale_release.0,
+        stale_release.1,
+    );
+
+    let pre_reclaim_retry = reserve_bundle_event(
+        layout,
+        primary,
+        context,
+        ReserveBundleEventSpec {
+            operation_id: OperationId(base_id + 44),
+            resource_ids: &setup.resource_ids,
+            holder_id: HolderId(809),
+            request_slot: Slot(74),
+            ttl_slots: 6,
+        },
+    )?;
+    history.push(
+        primary_process_name(primary),
+        pre_reclaim_retry.0,
+        pre_reclaim_retry.1,
+    );
+
+    let reclaim = admin_lease_event(
+        layout,
+        primary,
+        context,
+        AdminLeaseEventSpec {
+            kind: JepsenOperationKind::Reclaim,
+            operation_id: OperationId(base_id + 45),
+            reservation_id: setup.reserve_commit.reservation_id,
+            request_slot: Slot(75),
+        },
+    )?;
+    history.push(primary_process_name(primary), reclaim.0, reclaim.1);
+
+    let post_reclaim_reserve = reserve_bundle_event(
+        layout,
+        primary,
+        context,
+        ReserveBundleEventSpec {
+            operation_id: OperationId(base_id + 46),
+            resource_ids: &setup.resource_ids,
+            holder_id: HolderId(810),
+            request_slot: Slot(76),
+            ttl_slots: 4,
+        },
+    )?;
+    history.push(
+        primary_process_name(primary),
+        post_reclaim_reserve.0,
+        post_reclaim_reserve.1,
+    );
+    Ok(())
+}
+
+fn run_crash_restart_lease_safety<T: ExternalTestbed>(
+    layout: &T,
+    primary: &LocalClusterReplicaConfig,
+    failover_target: &LocalClusterReplicaConfig,
+    supporting_backup: &LocalClusterReplicaConfig,
+    base_id: u128,
+    context: &RunExecutionContext,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
+    let lease_setup = prepare_lease_safety_setup(
+        layout,
+        primary,
+        context,
+        &mut history,
+        base_id,
+        "crash-restart lease_safety",
+    )?;
+
+    maybe_crash_replica(layout, primary.replica_id)?;
+    perform_failover(
+        layout,
+        primary.replica_id,
+        failover_target.replica_id,
+        supporting_backup.replica_id,
+    )?;
+
+    let current_primary = primary_replica(layout)?;
+    record_lease_safety_revoke_cycle(
+        layout,
+        &current_primary,
+        context,
+        &mut history,
+        base_id,
+        &lease_setup,
+    )?;
+
+    perform_rejoin(layout, current_primary.replica_id, primary.replica_id)?;
+    Ok(history.finish())
+}
+
 fn run_reservation_contention<T: ExternalTestbed>(
     layout: &T,
     primary: &LocalClusterReplicaConfig,
@@ -654,5 +881,34 @@ fn run_expiration_and_recovery<T: ExternalTestbed>(
         reservation_read.0,
         reservation_read.1,
     );
+    Ok(history.finish())
+}
+
+fn run_lease_safety<T: ExternalTestbed>(
+    layout: &T,
+    primary: &LocalClusterReplicaConfig,
+    base_id: u128,
+    context: &RunExecutionContext,
+) -> Result<Vec<JepsenHistoryEvent>, String> {
+    let mut history = HistoryBuilder::new(
+        Some(context.tracker.clone()),
+        context.history_sequence_start,
+    );
+    let lease_setup = prepare_lease_safety_setup(
+        layout,
+        primary,
+        context,
+        &mut history,
+        base_id,
+        "lease_safety control run",
+    )?;
+    record_lease_safety_revoke_cycle(
+        layout,
+        primary,
+        context,
+        &mut history,
+        base_id,
+        &lease_setup,
+    )?;
     Ok(history.finish())
 }

@@ -105,6 +105,41 @@ fn test_faulted_replica_status(
     status
 }
 
+fn reserve_operation(
+    operation_id: u128,
+    resource_id: ResourceId,
+    holder_id: u128,
+    request_slot: u64,
+) -> JepsenOperation {
+    JepsenOperation {
+        kind: JepsenOperationKind::Reserve,
+        operation_id: Some(operation_id),
+        resource_id: Some(resource_id),
+        resource_ids: Vec::new(),
+        reservation_id: None,
+        holder_id: Some(holder_id),
+        lease_epoch: None,
+        required_lsn: None,
+        request_slot: Some(Slot(request_slot)),
+        ttl_slots: Some(2),
+    }
+}
+
+fn reservation_read_operation(reservation_id: ReservationId, required_lsn: Lsn) -> JepsenOperation {
+    JepsenOperation {
+        kind: JepsenOperationKind::GetReservation,
+        operation_id: None,
+        resource_id: None,
+        resource_ids: Vec::new(),
+        reservation_id: Some(reservation_id.get()),
+        holder_id: None,
+        lease_epoch: None,
+        required_lsn: Some(required_lsn),
+        request_slot: Some(Slot(54)),
+        ttl_slots: None,
+    }
+}
+
 #[test]
 fn release_gate_plan_includes_faulted_qemu_runs() {
     let runs = release_gate_plan();
@@ -309,6 +344,10 @@ fn resolve_run_spec_and_minimum_fault_window_are_enforced() {
     assert!(error.contains("fault window"));
     assert!(error.contains("reservation_contention-crash-restart"));
 
+    let lease_safety = resolve_run_spec("lease_safety-control").unwrap();
+    assert_eq!(lease_safety.workload, JepsenWorkloadFamily::LeaseSafety);
+    assert!(!lease_safety.release_blocking);
+
     let unknown = resolve_run_spec("missing-run").unwrap_err();
     assert!(unknown.contains("unknown Jepsen run id"));
 }
@@ -472,8 +511,10 @@ fn history_builder_preserves_nonzero_sequence_offsets() {
             kind: JepsenOperationKind::Reserve,
             operation_id: Some(11),
             resource_id: Some(ResourceId(21)),
+            resource_ids: Vec::new(),
             reservation_id: None,
             holder_id: Some(31),
+            lease_epoch: None,
             required_lsn: None,
             request_slot: Some(Slot(41)),
             ttl_slots: Some(5),
@@ -486,8 +527,10 @@ fn history_builder_preserves_nonzero_sequence_offsets() {
             kind: JepsenOperationKind::Reserve,
             operation_id: Some(12),
             resource_id: Some(ResourceId(22)),
+            resource_ids: Vec::new(),
             reservation_id: None,
             holder_id: Some(32),
+            lease_epoch: None,
             required_lsn: None,
             request_slot: Some(Slot(42)),
             ttl_slots: Some(5),
@@ -510,20 +553,12 @@ fn analyzer_accepts_failover_read_fence_history_once_ambiguity_is_retried() {
     let mut history = HistoryBuilder::new(None, 0);
     history.push(
         "primary-1",
-        JepsenOperation {
-            kind: JepsenOperationKind::Reserve,
-            operation_id: Some(reserve_operation_id),
-            resource_id: Some(resource_id),
-            reservation_id: None,
-            holder_id: Some(604),
-            required_lsn: None,
-            request_slot: Some(Slot(53)),
-            ttl_slots: Some(6),
-        },
+        reserve_operation(reserve_operation_id, resource_id, 604, 53),
         JepsenEventOutcome::CommittedWrite(JepsenCommittedWrite {
             applied_lsn: committed_lsn,
             result: JepsenWriteResult::Reserved {
                 resource_id,
+                lease_epoch: 1,
                 holder_id: 604,
                 reservation_id: reservation_id.get(),
                 expires_at_slot: Slot(900),
@@ -532,30 +567,12 @@ fn analyzer_accepts_failover_read_fence_history_once_ambiguity_is_retried() {
     );
     history.push(
         "primary-1",
-        JepsenOperation {
-            kind: JepsenOperationKind::Reserve,
-            operation_id: Some(ambiguous_operation_id),
-            resource_id: Some(resource_id),
-            reservation_id: None,
-            holder_id: Some(605),
-            required_lsn: None,
-            request_slot: Some(Slot(54)),
-            ttl_slots: Some(2),
-        },
+        reserve_operation(ambiguous_operation_id, resource_id, 605, 54),
         JepsenEventOutcome::Ambiguous(JepsenAmbiguousOutcome::IndefiniteWrite),
     );
     history.push(
         "primary-2",
-        JepsenOperation {
-            kind: JepsenOperationKind::GetReservation,
-            operation_id: None,
-            resource_id: None,
-            reservation_id: Some(reservation_id.get()),
-            holder_id: None,
-            required_lsn: Some(committed_lsn),
-            request_slot: Some(Slot(54)),
-            ttl_slots: None,
-        },
+        reservation_read_operation(reservation_id, committed_lsn),
         JepsenEventOutcome::SuccessfulRead(JepsenSuccessfulRead {
             target: JepsenReadTarget::Reservation,
             served_by: ReplicaId(2),
@@ -571,30 +588,12 @@ fn analyzer_accepts_failover_read_fence_history_once_ambiguity_is_retried() {
     );
     history.push(
         "primary-2",
-        JepsenOperation {
-            kind: JepsenOperationKind::Reserve,
-            operation_id: Some(ambiguous_operation_id),
-            resource_id: Some(resource_id),
-            reservation_id: None,
-            holder_id: Some(605),
-            required_lsn: None,
-            request_slot: Some(Slot(54)),
-            ttl_slots: Some(2),
-        },
+        reserve_operation(ambiguous_operation_id, resource_id, 605, 54),
         JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::Conflict),
     );
     history.push(
         "backup-1",
-        JepsenOperation {
-            kind: JepsenOperationKind::GetReservation,
-            operation_id: None,
-            resource_id: None,
-            reservation_id: Some(reservation_id.get()),
-            holder_id: None,
-            required_lsn: Some(committed_lsn),
-            request_slot: Some(Slot(54)),
-            ttl_slots: None,
-        },
+        reservation_read_operation(reservation_id, committed_lsn),
         JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::NotPrimary),
     );
 
