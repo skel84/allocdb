@@ -272,15 +272,28 @@ mod tests {
 
     #[test]
     fn revoke_and_reclaim_round_trip() {
-        for command in [
-            Command::Revoke {
-                reservation_id: ReservationId(41),
-            },
-            Command::Reclaim {
-                reservation_id: ReservationId(42),
-            },
+        for (command, reservation_id, tag) in [
+            (
+                Command::Revoke {
+                    reservation_id: ReservationId(41),
+                },
+                ReservationId(41),
+                7,
+            ),
+            (
+                Command::Reclaim {
+                    reservation_id: ReservationId(42),
+                },
+                ReservationId(42),
+                8,
+            ),
         ] {
-            let decoded = decode_internal_command(&encode_internal_command(&command)).unwrap();
+            let encoded = encode_internal_command(&command);
+            let mut expected = vec![tag];
+            expected.extend_from_slice(&reservation_id.get().to_le_bytes());
+            assert_eq!(encoded, expected);
+
+            let decoded = decode_internal_command(&expected).unwrap();
             assert_eq!(decoded, command);
         }
     }
