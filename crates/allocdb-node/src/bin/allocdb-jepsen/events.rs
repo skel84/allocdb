@@ -347,13 +347,15 @@ pub(super) fn map_reservation_state(
             expires_at_slot: reservation.deadline_slot,
             confirmed: false,
         },
-        ReservationState::Confirmed => JepsenReservationState::Active {
-            resource_id: reservation.resource_id,
-            holder_id: reservation.holder_id.get(),
-            expires_at_slot: reservation.deadline_slot,
-            confirmed: true,
-        },
-        ReservationState::Released | ReservationState::Expired => {
+        ReservationState::Confirmed | ReservationState::Revoking => {
+            JepsenReservationState::Active {
+                resource_id: reservation.resource_id,
+                holder_id: reservation.holder_id.get(),
+                expires_at_slot: reservation.deadline_slot,
+                confirmed: true,
+            }
+        }
+        ReservationState::Released | ReservationState::Expired | ReservationState::Revoked => {
             JepsenReservationState::Released {
                 resource_id: reservation.resource_id,
                 holder_id: reservation.holder_id.get(),

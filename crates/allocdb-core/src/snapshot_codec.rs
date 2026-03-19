@@ -316,6 +316,7 @@ fn encode_resource_state(state: ResourceState) -> u8 {
         ResourceState::Available => 1,
         ResourceState::Reserved => 2,
         ResourceState::Confirmed => 3,
+        ResourceState::Revoking => 4,
     }
 }
 
@@ -324,6 +325,7 @@ fn decode_resource_state(tag: u8) -> Result<ResourceState, SnapshotError> {
         1 => Ok(ResourceState::Available),
         2 => Ok(ResourceState::Reserved),
         3 => Ok(ResourceState::Confirmed),
+        4 => Ok(ResourceState::Revoking),
         _ => Err(SnapshotError::InvalidStateTag(tag)),
     }
 }
@@ -334,6 +336,8 @@ fn encode_reservation_state(state: ReservationState) -> u8 {
         ReservationState::Confirmed => 2,
         ReservationState::Released => 3,
         ReservationState::Expired => 4,
+        ReservationState::Revoking => 5,
+        ReservationState::Revoked => 6,
     }
 }
 
@@ -343,6 +347,8 @@ fn decode_reservation_state(tag: u8) -> Result<ReservationState, SnapshotError> 
         2 => Ok(ReservationState::Confirmed),
         3 => Ok(ReservationState::Released),
         4 => Ok(ReservationState::Expired),
+        5 => Ok(ReservationState::Revoking),
+        6 => Ok(ReservationState::Revoked),
         _ => Err(SnapshotError::InvalidStateTag(tag)),
     }
 }

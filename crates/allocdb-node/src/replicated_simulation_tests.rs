@@ -3,7 +3,7 @@ use std::fs;
 use allocdb_core::command::{ClientRequest, Command};
 use allocdb_core::command_codec::encode_client_request;
 use allocdb_core::config::Config;
-use allocdb_core::ids::{ClientId, Lsn, OperationId, ResourceId, Slot};
+use allocdb_core::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use allocdb_core::result::ResultCode;
 
 use crate::engine::EngineConfig;
@@ -47,6 +47,55 @@ fn create_payload(resource_id: u128, operation_id: u128) -> Vec<u8> {
         client_id: ClientId(7),
         command: Command::CreateResource {
             resource_id: ResourceId(resource_id),
+        },
+    })
+}
+
+fn reserve_payload(resource_id: u128, holder_id: u128, operation_id: u128) -> Vec<u8> {
+    encode_client_request(ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::Reserve {
+            resource_id: ResourceId(resource_id),
+            holder_id: HolderId(holder_id),
+            ttl_slots: 4,
+        },
+    })
+}
+
+fn confirm_payload(
+    reservation_id: u128,
+    holder_id: u128,
+    lease_epoch: u64,
+    operation_id: u128,
+) -> Vec<u8> {
+    encode_client_request(ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::Confirm {
+            reservation_id: ReservationId(reservation_id),
+            holder_id: HolderId(holder_id),
+            lease_epoch,
+        },
+    })
+}
+
+fn revoke_payload(reservation_id: u128, operation_id: u128) -> Vec<u8> {
+    encode_client_request(ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::Revoke {
+            reservation_id: ReservationId(reservation_id),
+        },
+    })
+}
+
+fn reclaim_payload(reservation_id: u128, operation_id: u128) -> Vec<u8> {
+    encode_client_request(ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::Reclaim {
+            reservation_id: ReservationId(reservation_id),
         },
     })
 }
@@ -288,6 +337,16 @@ fn commit_to_backup(
         .unwrap();
     harness
         .deliver_protocol_message(&format!("commit-{}-to-{backup}", lsn.get()))
+        .unwrap();
+}
+
+fn commit_to_all_backups(harness: &mut ReplicatedSimulationHarness, label_prefix: &str, lsn: Lsn) {
+    commit_to_backup(harness, label_prefix, lsn, 2);
+    harness
+        .deliver_protocol_message(&format!("{label_prefix}-prepare-{}-to-3", lsn.get()))
+        .unwrap();
+    harness
+        .deliver_protocol_message(&format!("commit-{}-to-3", lsn.get()))
         .unwrap();
 }
 
@@ -1295,6 +1354,109 @@ fn primary_crash_after_reply_preserves_read_and_retry_on_new_primary() {
     assert_eq!(method, ReplicaRejoinMethod::SuffixOnly);
     assert_eq!(replica_last_applied_lsn(&harness, 3), Some(entry.lsn));
     assert!(replica_has_resource(&harness, 3, 48));
+}
+
+#[test]
+fn committed_revoke_stays_non_reusable_across_failover_until_reclaim() {
+    let mut harness = primary_harness("replicated-revoke-failover", 0x5a46);
+
+    let create = harness
+        .client_submit(
+            replica(1),
+            Slot(1),
+            &create_payload(71, 701),
+            "revoke-create",
+        )
+        .unwrap();
+    commit_to_all_backups(&mut harness, "revoke-create", create.lsn);
+
+    let reserve = harness
+        .client_submit(
+            replica(1),
+            Slot(2),
+            &reserve_payload(71, 91, 702),
+            "revoke-reserve",
+        )
+        .unwrap();
+    commit_to_all_backups(&mut harness, "revoke-reserve", reserve.lsn);
+
+    let confirm = harness
+        .client_submit(
+            replica(1),
+            Slot(2),
+            &confirm_payload(2, 91, 1, 703),
+            "revoke-confirm",
+        )
+        .unwrap();
+    commit_to_all_backups(&mut harness, "revoke-confirm", confirm.lsn);
+
+    let revoke = harness
+        .client_submit(
+            replica(1),
+            Slot(2),
+            &revoke_payload(2, 704),
+            "revoke-command",
+        )
+        .unwrap();
+    harness
+        .deliver_protocol_message("revoke-command-prepare-4-to-2")
+        .unwrap();
+    harness
+        .deliver_protocol_message("revoke-command-prepare-4-to-2-ack")
+        .unwrap();
+    deliver_prepare_without_ack(&mut harness, "revoke-command", revoke.lsn, 3);
+
+    harness.crash_replica(replica(1)).unwrap();
+    harness.complete_view_change(replica(2), 2).unwrap();
+    let method = harness.rejoin_replica(replica(3), replica(2)).unwrap();
+    assert_eq!(method, ReplicaRejoinMethod::SuffixOnly);
+
+    let revoking_read = harness
+        .read_resource(replica(2), ResourceId(71), Some(revoke.lsn))
+        .unwrap()
+        .expect("new primary should preserve committed revoke across failover");
+    assert_eq!(revoking_read.current_reservation_id, Some(ReservationId(2)));
+    assert_eq!(
+        revoking_read.current_state,
+        allocdb_core::ResourceState::Revoking
+    );
+
+    let early_reuse = harness
+        .client_submit(
+            replica(2),
+            Slot(3),
+            &reserve_payload(71, 99, 705),
+            "revoke-early-reuse",
+        )
+        .unwrap();
+    commit_to_backup(&mut harness, "revoke-early-reuse", early_reuse.lsn, 3);
+    let early_reuse_result = harness
+        .published_result(early_reuse.lsn)
+        .expect("busy reserve should still publish deterministically");
+    assert_eq!(
+        early_reuse_result.outcome.result_code,
+        ResultCode::ResourceBusy
+    );
+
+    let reclaim = harness
+        .client_submit(
+            replica(2),
+            Slot(4),
+            &reclaim_payload(2, 706),
+            "revoke-reclaim",
+        )
+        .unwrap();
+    commit_to_backup(&mut harness, "revoke-reclaim", reclaim.lsn, 3);
+
+    let available_read = harness
+        .read_resource(replica(2), ResourceId(71), Some(reclaim.lsn))
+        .unwrap()
+        .expect("resource should become available only after reclaim commits");
+    assert_eq!(
+        available_read.current_state,
+        allocdb_core::ResourceState::Available
+    );
+    assert_eq!(available_read.current_reservation_id, None);
 }
 
 #[test]

@@ -109,11 +109,19 @@ fn encode_command(bytes: &mut Vec<u8>, command: &Command) {
             bytes.extend_from_slice(&holder_id.get().to_le_bytes());
             bytes.extend_from_slice(&lease_epoch.to_le_bytes());
         }
+        Command::Revoke { reservation_id } => {
+            bytes.push(6);
+            bytes.extend_from_slice(&reservation_id.get().to_le_bytes());
+        }
+        Command::Reclaim { reservation_id } => {
+            bytes.push(7);
+            bytes.extend_from_slice(&reservation_id.get().to_le_bytes());
+        }
         Command::Expire {
             reservation_id,
             deadline_slot,
         } => {
-            bytes.push(6);
+            bytes.push(8);
             bytes.extend_from_slice(&reservation_id.get().to_le_bytes());
             bytes.extend_from_slice(&deadline_slot.get().to_le_bytes());
         }
@@ -153,7 +161,13 @@ fn decode_command(cursor: &mut Cursor<'_>) -> Result<Command, CommandCodecError>
             holder_id: HolderId(cursor.read_u128()?),
             lease_epoch: decode_optional_legacy_epoch(cursor)?,
         }),
-        6 => Ok(Command::Expire {
+        6 => Ok(Command::Revoke {
+            reservation_id: ReservationId(cursor.read_u128()?),
+        }),
+        7 => Ok(Command::Reclaim {
+            reservation_id: ReservationId(cursor.read_u128()?),
+        }),
+        8 => Ok(Command::Expire {
             reservation_id: ReservationId(cursor.read_u128()?),
             deadline_slot: Slot(cursor.read_u64()?),
         }),
@@ -254,6 +268,21 @@ mod tests {
 
         let decoded = decode_internal_command(&encode_internal_command(&command)).unwrap();
         assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn revoke_and_reclaim_round_trip() {
+        for command in [
+            Command::Revoke {
+                reservation_id: ReservationId(41),
+            },
+            Command::Reclaim {
+                reservation_id: ReservationId(42),
+            },
+        ] {
+            let decoded = decode_internal_command(&encode_internal_command(&command)).unwrap();
+            assert_eq!(decoded, command);
+        }
     }
 
     #[test]

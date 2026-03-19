@@ -14,7 +14,7 @@
   - `M6` replication design: implemented
   - `M7` replicated core prototype: in progress
   - `M8` external cluster validation: in progress
-  - `M9` generic lease-kernel follow-on: `T07` merged, `T08` planning in progress on issue branch
+  - `M9` generic lease-kernel follow-on: `T07` merged, `T08` implementation in progress on issue branch
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -33,8 +33,10 @@
     preserve fail-closed behavior and retry/read continuity after failover; the local
     three-replica cluster runner, fault-control harness, and QEMU testbed around the real replica
     daemon; the first trusted-core bundle-commit slice with bundle membership, bundle-aware
-    confirm/release/expire, and bundle regression coverage; and the first fencing slice with
-    lease-epoch propagation, stale-holder rejection, and epoch-aware retry/read coverage
+    confirm/release/expire, and bundle regression coverage; the first fencing slice with
+    lease-epoch propagation, stale-holder rejection, and epoch-aware retry/read coverage; and the
+    active revoke/reclaim slice on the issue branch with `revoking` / `revoked` lifecycle support,
+    replay-safe recovery, and one replicated failover regression for no-early-reuse preservation
 
 ## What Exists
 
@@ -45,7 +47,7 @@
   - deterministic fixed-capacity open-addressed resource, reservation, and operation tables
   - bounded reservation and operation retirement queues
   - bounded timing-wheel expiration index
-  - `create_resource`, `reserve`, `confirm`, `release`, `expire`
+  - `create_resource`, `reserve`, `confirm`, `release`, `revoke`, `reclaim`, `expire`
   - bounded health snapshot with logical slot lag, expiration backlog, and operation-table
     utilization
 - In-process submission engine:
@@ -89,8 +91,8 @@
   - one merged authoritative-docs pass under issue `#80` that rewrote semantics, API,
     architecture, and fault-model docs to the approved lease-centric contract while keeping the
     current reservation-centric implementation explicitly marked as compatibility surface
-  - one active `M9-T08` planning note that narrows revoke/reclaim implementation scope before the
-    next code-bearing lease-kernel branch
+  - one merged `M9-T08` planning note that narrows revoke/reclaim implementation scope before the
+    code-bearing revoke branch
 - Replication design draft:
   - VSR-style primary/backup replicated log with fixed membership and majority quorums
   - primary-only reads in the first replicated release
@@ -204,12 +206,15 @@
 - PR `#90` merged `M9-T07` on `main`: lease epochs now flow through holder-authorized commands and
   command outcomes, the core rejects stale holder epochs deterministically, and read/retry
   surfaces expose the current authority token for active reservations
-- issue `#85` / `M9-T08` is the active planning slice on the current branch: the local scope is
-  being narrowed to explicit `revoke` and `reclaim`, `revoking` as the only non-reusable
-  post-authority state, and the minimum replay-safe bridge from the reservation-era implementation
-  to the accepted lease-centric semantics
-- the active `#85` planning branch is defining exactly what belongs in revoke/reclaim now versus
-  what stays deferred to `M9-T09` through `M9-T11`, especially around WAL/snapshot broadening,
-  transport cleanup, and replication preservation
-- the next planned code-bearing slices after `#85` remain `M9-T09` persistence and transport
-  extension, `M9-T10` replication preservation, and `M9-T11` broader regression coverage
+- issue `#85` / `M9-T08` is the active implementation slice on the current branch: the trusted
+  core now has explicit `revoke` / `reclaim` commands, `revoking` and `revoked` states, minimum
+  command/snapshot/API codec support for those states, and deterministic duplicate/recovery
+  handling on the branch
+- targeted validation on the active `#85` branch currently includes
+  `cargo test -p allocdb-core -- --nocapture`,
+  `cargo test -p allocdb-node api -- --nocapture`, and
+  `cargo test -p allocdb-node replicated_simulation -- --nocapture`
+- the active `#85` branch still keeps the `T08` / `T09` boundary explicit: it adds only the
+  revoke/reclaim persistence and replay support needed for the current path, while broader WAL,
+  transport, and replicated-surface cleanup stays deferred to `M9-T09` and `M9-T10`
+- the next planned code-bearing slices after `#85` remain `M9-T09` persistence and transport extension, `M9-T10` replication preservation, and `M9-T11` broader regression coverage

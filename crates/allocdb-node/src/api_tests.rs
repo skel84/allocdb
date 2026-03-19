@@ -134,9 +134,8 @@ fn request_codec_round_trips_all_variants() {
     }
 }
 
-#[test]
-fn response_codec_round_trips_all_variants() {
-    let responses = vec![
+fn submit_response_cases() -> Vec<ApiResponse> {
+    vec![
         ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
             applied_lsn: Lsn(1),
             outcome: allocdb_core::result::CommandOutcome::new(ResultCode::Ok),
@@ -165,11 +164,22 @@ fn response_codec_round_trips_all_variants() {
                 last_applied_lsn: Lsn(44),
             },
         })),
+    ]
+}
+
+fn read_response_cases() -> Vec<ApiResponse> {
+    vec![
         ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
             resource_id: ResourceId(21),
             state: ResourceState::Confirmed,
             current_reservation_id: Some(ReservationId(22)),
             version: 5,
+        })),
+        ApiResponse::GetResource(ResourceResponse::Found(super::ResourceView {
+            resource_id: ResourceId(23),
+            state: ResourceState::Revoking,
+            current_reservation_id: Some(ReservationId(24)),
+            version: 6,
         })),
         ApiResponse::GetResource(ResourceResponse::NotFound),
         ApiResponse::GetResource(ResourceResponse::EngineHalted),
@@ -188,6 +198,28 @@ fn response_codec_round_trips_all_variants() {
             released_lsn: Some(Lsn(3)),
             retire_after_slot: Some(Slot(9)),
         })),
+        ApiResponse::GetReservation(ReservationResponse::Found(super::ReservationView {
+            reservation_id: ReservationId(34),
+            resource_id: ResourceId(35),
+            holder_id: HolderId(36),
+            lease_epoch: 4,
+            state: ReservationState::Revoking,
+            created_lsn: Lsn(5),
+            deadline_slot: Slot(11),
+            released_lsn: None,
+            retire_after_slot: None,
+        })),
+        ApiResponse::GetReservation(ReservationResponse::Found(super::ReservationView {
+            reservation_id: ReservationId(37),
+            resource_id: ResourceId(38),
+            holder_id: HolderId(39),
+            lease_epoch: 4,
+            state: ReservationState::Revoked,
+            created_lsn: Lsn(6),
+            deadline_slot: Slot(12),
+            released_lsn: Some(Lsn(8)),
+            retire_after_slot: Some(Slot(14)),
+        })),
         ApiResponse::GetReservation(ReservationResponse::NotFound),
         ApiResponse::GetReservation(ReservationResponse::Retired),
         ApiResponse::GetReservation(ReservationResponse::EngineHalted),
@@ -195,6 +227,11 @@ fn response_codec_round_trips_all_variants() {
             required_lsn: Lsn(11),
             last_applied_lsn: None,
         }),
+    ]
+}
+
+fn maintenance_response_cases() -> Vec<ApiResponse> {
+    vec![
         ApiResponse::GetMetrics(MetricsResponse {
             metrics: crate::engine::EngineMetrics {
                 queue_depth: 1,
@@ -228,7 +265,15 @@ fn response_codec_round_trips_all_variants() {
                 code: SubmissionFailureCode::EngineHalted,
             },
         )),
-    ];
+    ]
+}
+
+#[test]
+fn response_codec_round_trips_all_variants() {
+    let responses = submit_response_cases()
+        .into_iter()
+        .chain(read_response_cases())
+        .chain(maintenance_response_cases());
 
     for response in responses {
         let encoded = encode_response(&response);

@@ -194,7 +194,7 @@ impl AllocDb {
                         });
                     }
                 }
-                ResourceState::Reserved | ResourceState::Confirmed => {
+                ResourceState::Reserved | ResourceState::Confirmed | ResourceState::Revoking => {
                     let Some(reservation_id) = resource.current_reservation_id else {
                         return Err(AllocDbInvariantError::ActiveResourceMissingReservationId {
                             resource_id: resource.resource_id,
@@ -219,6 +219,7 @@ impl AllocDb {
                     let expected_reservation_state = match resource.current_state {
                         ResourceState::Reserved => ReservationState::Reserved,
                         ResourceState::Confirmed => ReservationState::Confirmed,
+                        ResourceState::Revoking => ReservationState::Revoking,
                         ResourceState::Available => unreachable!(),
                     };
                     if reservation.state != expected_reservation_state {

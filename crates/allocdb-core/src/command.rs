@@ -44,6 +44,12 @@ pub enum Command {
         holder_id: HolderId,
         lease_epoch: u64,
     },
+    Revoke {
+        reservation_id: ReservationId,
+    },
+    Reclaim {
+        reservation_id: ReservationId,
+    },
     Expire {
         reservation_id: ReservationId,
         deadline_slot: Slot,
@@ -117,11 +123,19 @@ impl Command {
                 state = mix(state, holder_id.get());
                 mix(state, u128::from(*lease_epoch))
             }
+            Self::Revoke { reservation_id } => {
+                state = mix(state, 6);
+                mix(state, reservation_id.get())
+            }
+            Self::Reclaim { reservation_id } => {
+                state = mix(state, 7);
+                mix(state, reservation_id.get())
+            }
             Self::Expire {
                 reservation_id,
                 deadline_slot,
             } => {
-                state = mix(state, 6);
+                state = mix(state, 8);
                 state = mix(state, reservation_id.get());
                 mix(state, u128::from(deadline_slot.get()))
             }
