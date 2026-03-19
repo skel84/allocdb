@@ -123,6 +123,87 @@ fn snapshot_round_trips_bundle_state() {
 }
 
 #[test]
+fn snapshot_round_trips_revoking_and_revoked_states() {
+    let mut config = config();
+    config.max_bundle_size = 2;
+    let mut revoking = AllocDb::new(config.clone()).unwrap();
+    for (lsn, resource_id) in [(1_u64, 11_u128), (2_u64, 12_u128)] {
+        revoking.apply_client(
+            context(lsn, 1),
+            ClientRequest {
+                operation_id: OperationId(u128::from(lsn)),
+                client_id: ClientId(7),
+                command: Command::CreateResource {
+                    resource_id: ResourceId(resource_id),
+                },
+            },
+        );
+    }
+    revoking.apply_client(
+        context(3, 2),
+        ClientRequest {
+            operation_id: OperationId(3),
+            client_id: ClientId(7),
+            command: Command::ReserveBundle {
+                resource_ids: vec![ResourceId(11), ResourceId(12)],
+                holder_id: HolderId(5),
+                ttl_slots: 3,
+            },
+        },
+    );
+    revoking.apply_client(
+        context(4, 2),
+        ClientRequest {
+            operation_id: OperationId(4),
+            client_id: ClientId(7),
+            command: Command::Confirm {
+                reservation_id: ReservationId(3),
+                holder_id: HolderId(5),
+                lease_epoch: 1,
+            },
+        },
+    );
+    revoking.apply_client(
+        context(5, 2),
+        ClientRequest {
+            operation_id: OperationId(5),
+            client_id: ClientId(7),
+            command: Command::Revoke {
+                reservation_id: ReservationId(3),
+            },
+        },
+    );
+
+    let revoking_snapshot = revoking.snapshot();
+    let revoking_restored = AllocDb::from_snapshot(
+        config.clone(),
+        Snapshot::decode(&revoking_snapshot.encode()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(revoking_restored.snapshot(), revoking_snapshot);
+
+    let mut revoked = revoking;
+    revoked.apply_client(
+        context(6, 3),
+        ClientRequest {
+            operation_id: OperationId(6),
+            client_id: ClientId(7),
+            command: Command::Reclaim {
+                reservation_id: ReservationId(3),
+            },
+        },
+    );
+
+    let revoked_snapshot = revoked.snapshot();
+    let revoked_restored = AllocDb::from_snapshot(
+        config,
+        Snapshot::decode(&revoked_snapshot.encode()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(revoked_restored.snapshot(), revoked_snapshot);
+}
+
+#[test]
 fn snapshot_decode_rejects_corruption() {
     let mut bytes = empty_snapshot().encode();
     bytes[0] = 0;

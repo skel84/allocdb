@@ -528,6 +528,7 @@ fn encode_resource_state(state: ResourceState) -> u8 {
         ResourceState::Available => 1,
         ResourceState::Reserved => 2,
         ResourceState::Confirmed => 3,
+        ResourceState::Revoking => 4,
     }
 }
 
@@ -536,6 +537,7 @@ fn decode_resource_state(value: u8) -> Result<ResourceState, ApiCodecError> {
         1 => Ok(ResourceState::Available),
         2 => Ok(ResourceState::Reserved),
         3 => Ok(ResourceState::Confirmed),
+        4 => Ok(ResourceState::Revoking),
         value => Err(ApiCodecError::InvalidEnumValue {
             kind: "resource_state",
             value,
@@ -549,6 +551,8 @@ fn encode_reservation_state(state: ReservationState) -> u8 {
         ReservationState::Confirmed => 2,
         ReservationState::Released => 3,
         ReservationState::Expired => 4,
+        ReservationState::Revoking => 5,
+        ReservationState::Revoked => 6,
     }
 }
 
@@ -558,6 +562,8 @@ fn decode_reservation_state(value: u8) -> Result<ReservationState, ApiCodecError
         2 => Ok(ReservationState::Confirmed),
         3 => Ok(ReservationState::Released),
         4 => Ok(ReservationState::Expired),
+        5 => Ok(ReservationState::Revoking),
+        6 => Ok(ReservationState::Revoked),
         value => Err(ApiCodecError::InvalidEnumValue {
             kind: "reservation_state",
             value,

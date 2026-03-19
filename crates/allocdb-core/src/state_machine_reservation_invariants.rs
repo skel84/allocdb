@@ -10,7 +10,9 @@ impl AllocDb {
         scheduled: bool,
     ) -> Result<(), AllocDbInvariantError> {
         match reservation.state {
-            ReservationState::Reserved | ReservationState::Confirmed => {
+            ReservationState::Reserved
+            | ReservationState::Confirmed
+            | ReservationState::Revoking => {
                 if let Some(retire_after_slot) = reservation.retire_after_slot {
                     return Err(AllocDbInvariantError::ActiveReservationHasRetireAfterSlot {
                         reservation_id: reservation.reservation_id,
@@ -19,7 +21,7 @@ impl AllocDb {
                     });
                 }
             }
-            ReservationState::Released | ReservationState::Expired => {
+            ReservationState::Released | ReservationState::Expired | ReservationState::Revoked => {
                 if reservation.retire_after_slot.is_none() {
                     return Err(
                         AllocDbInvariantError::TerminalReservationMissingRetireAfterSlot {
@@ -41,8 +43,10 @@ impl AllocDb {
                 }
             }
             ReservationState::Confirmed
+            | ReservationState::Revoking
             | ReservationState::Released
-            | ReservationState::Expired => {
+            | ReservationState::Expired
+            | ReservationState::Revoked => {
                 if scheduled {
                     return Err(AllocDbInvariantError::InactiveReservationStillScheduled {
                         reservation_id: reservation.reservation_id,
@@ -154,7 +158,20 @@ impl AllocDb {
                     });
                 }
             }
-            ReservationState::Released | ReservationState::Expired => {
+            ReservationState::Revoking => {
+                if resource.current_state != ResourceState::Revoking
+                    || resource.current_reservation_id != Some(reservation.reservation_id)
+                {
+                    return Err(AllocDbInvariantError::ReservationResourceStateMismatch {
+                        reservation_id: reservation.reservation_id,
+                        resource_id,
+                        reservation_state: reservation.state,
+                        resource_state: resource.current_state,
+                        resource_current_reservation_id: resource.current_reservation_id,
+                    });
+                }
+            }
+            ReservationState::Released | ReservationState::Expired | ReservationState::Revoked => {
                 if resource.current_reservation_id == Some(reservation.reservation_id) {
                     return Err(
                         AllocDbInvariantError::TerminalReservationStillActiveOnResource {

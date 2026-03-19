@@ -111,19 +111,7 @@ impl AllocDb {
             .get_mut(reservation_id)
             .expect("reservation must stay present across confirm");
         reservation.state = ReservationState::Confirmed;
-        let member_count = reservation.member_count;
-
-        for member_index in 0..member_count {
-            let member = self
-                .reservation_member(reservation_id, member_index)
-                .expect("reservation member must stay present across confirm");
-            let resource = self
-                .resources
-                .get_mut(member.resource_id)
-                .expect("resource must stay present across confirm");
-            resource.current_state = ResourceState::Confirmed;
-            resource.version += 1;
-        }
+        self.mark_member_resources(reservation_id, ResourceState::Confirmed);
 
         debug!(
             "confirmed reservation_id={} lease_epoch={}",
@@ -185,7 +173,10 @@ impl AllocDb {
                 );
             }
             ReservationState::Confirmed => {}
-            ReservationState::Released | ReservationState::Expired => {
+            ReservationState::Revoking
+            | ReservationState::Released
+            | ReservationState::Expired
+            | ReservationState::Revoked => {
                 warn!(
                     "release rejected invalid_state reservation_id={} state={:?}",
                     reservation_id.get(),
@@ -214,20 +205,7 @@ impl AllocDb {
         reservation.released_lsn = Some(context.lsn);
         reservation.retire_after_slot = Some(retire_after_slot);
         let queued_reservation_id = reservation.reservation_id;
-        let member_count = reservation.member_count;
-
-        for member_index in 0..member_count {
-            let member = self
-                .reservation_member(reservation_id, member_index)
-                .expect("reservation member must stay present across release");
-            let resource = self
-                .resources
-                .get_mut(member.resource_id)
-                .expect("resource must stay present across release");
-            resource.current_state = ResourceState::Available;
-            resource.current_reservation_id = None;
-            resource.version += 1;
-        }
+        self.release_member_resources(reservation_id);
 
         self.push_reservation_retirement(queued_reservation_id, retire_after_slot);
         debug!(
@@ -265,8 +243,10 @@ impl AllocDb {
 
         match reservation.state {
             ReservationState::Confirmed
+            | ReservationState::Revoking
             | ReservationState::Released
-            | ReservationState::Expired => {
+            | ReservationState::Expired
+            | ReservationState::Revoked => {
                 debug!(
                     "expire noop for terminal/non-reserved reservation_id={} state={:?}",
                     reservation_id.get(),
@@ -302,20 +282,7 @@ impl AllocDb {
         reservation.released_lsn = Some(context.lsn);
         reservation.retire_after_slot = Some(retire_after_slot);
         let queued_reservation_id = reservation.reservation_id;
-        let member_count = reservation.member_count;
-
-        for member_index in 0..member_count {
-            let member = self
-                .reservation_member(reservation_id, member_index)
-                .expect("reservation member must stay present across expire");
-            let resource = self
-                .resources
-                .get_mut(member.resource_id)
-                .expect("resource must stay present across expire");
-            resource.current_state = ResourceState::Available;
-            resource.current_reservation_id = None;
-            resource.version += 1;
-        }
+        self.release_member_resources(reservation_id);
 
         self.push_reservation_retirement(queued_reservation_id, retire_after_slot);
         debug!("expired reservation_id={}", reservation_id.get());

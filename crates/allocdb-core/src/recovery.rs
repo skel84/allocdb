@@ -389,5 +389,8 @@ mod issue_30_tests;
 #[path = "recovery_issue_31_tests.rs"]
 mod issue_31_tests;
 #[cfg(test)]
+#[path = "recovery_revoke_tests.rs"]
+mod revoke_tests;
+#[cfg(test)]
 #[path = "recovery_tests.rs"]
 mod tests;

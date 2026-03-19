@@ -109,6 +109,14 @@ fn encode_command(bytes: &mut Vec<u8>, command: &Command) {
             bytes.extend_from_slice(&holder_id.get().to_le_bytes());
             bytes.extend_from_slice(&lease_epoch.to_le_bytes());
         }
+        Command::Revoke { reservation_id } => {
+            bytes.push(7);
+            bytes.extend_from_slice(&reservation_id.get().to_le_bytes());
+        }
+        Command::Reclaim { reservation_id } => {
+            bytes.push(8);
+            bytes.extend_from_slice(&reservation_id.get().to_le_bytes());
+        }
         Command::Expire {
             reservation_id,
             deadline_slot,
@@ -156,6 +164,12 @@ fn decode_command(cursor: &mut Cursor<'_>) -> Result<Command, CommandCodecError>
         6 => Ok(Command::Expire {
             reservation_id: ReservationId(cursor.read_u128()?),
             deadline_slot: Slot(cursor.read_u64()?),
+        }),
+        7 => Ok(Command::Revoke {
+            reservation_id: ReservationId(cursor.read_u128()?),
+        }),
+        8 => Ok(Command::Reclaim {
+            reservation_id: ReservationId(cursor.read_u128()?),
         }),
         value => Err(CommandCodecError::InvalidCommandTag(value)),
     }
@@ -254,6 +268,51 @@ mod tests {
 
         let decoded = decode_internal_command(&encode_internal_command(&command)).unwrap();
         assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn revoke_and_reclaim_round_trip() {
+        for (command, reservation_id, tag) in [
+            (
+                Command::Revoke {
+                    reservation_id: ReservationId(41),
+                },
+                ReservationId(41),
+                7,
+            ),
+            (
+                Command::Reclaim {
+                    reservation_id: ReservationId(42),
+                },
+                ReservationId(42),
+                8,
+            ),
+        ] {
+            let encoded = encode_internal_command(&command);
+            let mut expected = vec![tag];
+            expected.extend_from_slice(&reservation_id.get().to_le_bytes());
+            assert_eq!(encoded, expected);
+
+            let decoded = decode_internal_command(&expected).unwrap();
+            assert_eq!(decoded, command);
+        }
+    }
+
+    #[test]
+    fn decoder_accepts_legacy_expire_tag_payload() {
+        let mut bytes = Vec::new();
+        bytes.push(6);
+        bytes.extend_from_slice(&ReservationId(99).get().to_le_bytes());
+        bytes.extend_from_slice(&Slot(42).get().to_le_bytes());
+
+        let decoded = decode_internal_command(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            Command::Expire {
+                reservation_id: ReservationId(99),
+                deadline_slot: Slot(42),
+            }
+        );
     }
 
     #[test]

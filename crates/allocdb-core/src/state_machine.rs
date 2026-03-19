@@ -45,6 +45,11 @@ mod observe_tests;
 mod reservation_invariants;
 #[path = "state_machine_retire.rs"]
 mod retire;
+#[path = "state_machine_revoke_apply.rs"]
+mod revoke_apply;
+#[cfg(test)]
+#[path = "state_machine_revoke_tests.rs"]
+mod revoke_tests;
 #[path = "state_machine_slots.rs"]
 mod slots;
 #[cfg(test)]
@@ -60,14 +65,17 @@ pub enum ResourceState {
     Available,
     Reserved,
     Confirmed,
+    Revoking,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReservationState {
     Reserved,
     Confirmed,
+    Revoking,
     Released,
     Expired,
+    Revoked,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,6 +221,8 @@ impl AllocDb {
                 holder_id,
                 lease_epoch,
             } => self.apply_release(context, reservation_id, holder_id, lease_epoch),
+            Command::Revoke { reservation_id } => self.apply_revoke(reservation_id),
+            Command::Reclaim { reservation_id } => self.apply_reclaim(context, reservation_id),
             Command::Expire {
                 reservation_id,
                 deadline_slot,

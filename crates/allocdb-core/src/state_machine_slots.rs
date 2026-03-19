@@ -57,10 +57,10 @@ impl AllocDb {
             Command::Reserve { ttl_slots, .. } | Command::ReserveBundle { ttl_slots, .. } => {
                 let _ = Self::deadline_slot(request_slot, *ttl_slots)?;
             }
-            Command::Release { .. } | Command::Expire { .. } => {
+            Command::Release { .. } | Command::Reclaim { .. } | Command::Expire { .. } => {
                 let _ = self.reservation_retire_after_slot(request_slot)?;
             }
-            Command::CreateResource { .. } | Command::Confirm { .. } => {}
+            Command::CreateResource { .. } | Command::Confirm { .. } | Command::Revoke { .. } => {}
         }
         Ok(())
     }

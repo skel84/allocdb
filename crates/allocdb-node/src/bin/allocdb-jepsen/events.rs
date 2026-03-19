@@ -347,13 +347,15 @@ pub(super) fn map_reservation_state(
             expires_at_slot: reservation.deadline_slot,
             confirmed: false,
         },
-        ReservationState::Confirmed => JepsenReservationState::Active {
-            resource_id: reservation.resource_id,
-            holder_id: reservation.holder_id.get(),
-            expires_at_slot: reservation.deadline_slot,
-            confirmed: true,
-        },
-        ReservationState::Released | ReservationState::Expired => {
+        ReservationState::Confirmed | ReservationState::Revoking => {
+            JepsenReservationState::Active {
+                resource_id: reservation.resource_id,
+                holder_id: reservation.holder_id.get(),
+                expires_at_slot: reservation.deadline_slot,
+                confirmed: true,
+            }
+        }
+        ReservationState::Released | ReservationState::Expired | ReservationState::Revoked => {
             JepsenReservationState::Released {
                 resource_id: reservation.resource_id,
                 holder_id: reservation.holder_id.get(),
@@ -808,6 +810,53 @@ mod tests {
         assert_eq!(
             retired.1,
             JepsenEventOutcome::DefiniteFailure(JepsenDefiniteFailure::Retired)
+        );
+    }
+
+    #[test]
+    fn revoking_reservation_maps_to_confirmed_active_state() {
+        let state = map_reservation_state(allocdb_node::ReservationView {
+            reservation_id: ReservationId(11),
+            resource_id: ResourceId(22),
+            holder_id: HolderId(33),
+            lease_epoch: 2,
+            state: ReservationState::Revoking,
+            created_lsn: Lsn(1),
+            deadline_slot: Slot(9),
+            released_lsn: None,
+            retire_after_slot: None,
+        });
+        assert_eq!(
+            state,
+            JepsenReservationState::Active {
+                resource_id: ResourceId(22),
+                holder_id: 33,
+                expires_at_slot: Slot(9),
+                confirmed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn revoked_reservation_maps_to_released_state() {
+        let state = map_reservation_state(allocdb_node::ReservationView {
+            reservation_id: ReservationId(11),
+            resource_id: ResourceId(22),
+            holder_id: HolderId(33),
+            lease_epoch: 2,
+            state: ReservationState::Revoked,
+            created_lsn: Lsn(1),
+            deadline_slot: Slot(9),
+            released_lsn: Some(Lsn(4)),
+            retire_after_slot: Some(Slot(17)),
+        });
+        assert_eq!(
+            state,
+            JepsenReservationState::Released {
+                resource_id: ResourceId(22),
+                holder_id: 33,
+                released_lsn: Some(Lsn(4)),
+            }
         );
     }
 
