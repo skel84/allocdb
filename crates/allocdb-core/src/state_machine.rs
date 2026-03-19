@@ -10,6 +10,9 @@ mod apply;
 #[path = "state_machine_bundle.rs"]
 mod bundle;
 #[cfg(test)]
+#[path = "state_machine_bundle_overflow_tests.rs"]
+mod bundle_overflow_tests;
+#[cfg(test)]
 #[path = "state_machine_bundle_tests.rs"]
 mod bundle_tests;
 #[path = "state_machine_execution.rs"]

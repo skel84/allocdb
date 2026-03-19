@@ -353,6 +353,10 @@ fn confirm_and_release_update_every_bundle_member() {
         },
     );
     assert_eq!(confirmed.result_code, ResultCode::Ok);
+    let reservation = db.reservation(ReservationId(3), Slot(5)).unwrap();
+    assert_eq!(reservation.state, ReservationState::Confirmed);
+    assert_eq!(reservation.holder_id, HolderId(1));
+    assert_eq!(reservation.member_count, 2);
     for resource_id in [ResourceId(11), ResourceId(12)] {
         let resource = db.resource(resource_id).unwrap();
         assert_eq!(resource.current_state, ResourceState::Confirmed);
