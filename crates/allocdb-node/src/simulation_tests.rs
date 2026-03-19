@@ -1,6 +1,6 @@
 use allocdb_core::command::{ClientRequest, Command};
 use allocdb_core::config::Config;
-use allocdb_core::ids::{ClientId, HolderId, OperationId, ResourceId, Slot};
+use allocdb_core::ids::{ClientId, HolderId, OperationId, ReservationId, ResourceId, Slot};
 use allocdb_core::recovery::RecoveryError;
 use allocdb_core::result::ResultCode;
 use allocdb_core::wal::{DecodeError, ScanStopReason};
@@ -27,6 +27,13 @@ fn core_config() -> Config {
         max_client_retry_window_slots: 8,
         reservation_history_window_slots: 4,
         max_expiration_bucket_len: 8,
+    }
+}
+
+fn bundle_core_config() -> Config {
+    Config {
+        max_bundle_size: 4,
+        ..core_config()
     }
 }
 
@@ -61,6 +68,77 @@ fn reserve(
             resource_id: ResourceId(resource_id),
             holder_id: HolderId(holder_id),
             ttl_slots,
+        },
+    }
+}
+
+fn reserve_bundle(
+    resource_ids: &[u128],
+    holder_id: u128,
+    operation_id: u128,
+    ttl_slots: u64,
+) -> ClientRequest {
+    ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::ReserveBundle {
+            resource_ids: resource_ids.iter().copied().map(ResourceId).collect(),
+            holder_id: HolderId(holder_id),
+            ttl_slots,
+        },
+    }
+}
+
+fn confirm(
+    reservation_id: u128,
+    holder_id: u128,
+    lease_epoch: u64,
+    operation_id: u128,
+) -> ClientRequest {
+    ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::Confirm {
+            reservation_id: ReservationId(reservation_id),
+            holder_id: HolderId(holder_id),
+            lease_epoch,
+        },
+    }
+}
+
+fn release(
+    reservation_id: u128,
+    holder_id: u128,
+    lease_epoch: u64,
+    operation_id: u128,
+) -> ClientRequest {
+    ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::Release {
+            reservation_id: ReservationId(reservation_id),
+            holder_id: HolderId(holder_id),
+            lease_epoch,
+        },
+    }
+}
+
+fn revoke(reservation_id: u128, operation_id: u128) -> ClientRequest {
+    ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::Revoke {
+            reservation_id: ReservationId(reservation_id),
+        },
+    }
+}
+
+fn reclaim(reservation_id: u128, operation_id: u128) -> ClientRequest {
+    ClientRequest {
+        operation_id: OperationId(operation_id),
+        client_id: ClientId(7),
+        command: Command::Reclaim {
+            reservation_id: ReservationId(reservation_id),
         },
     }
 }
@@ -552,6 +630,74 @@ fn seeded_schedule_explores_retry_timing_reproducibly() {
 }
 
 #[test]
+fn simulated_sync_failure_recovers_bundle_retry_without_partial_membership() {
+    let mut harness = SimulationHarness::new(
+        "bundle-sync-failure-recovery",
+        0x188,
+        bundle_core_config(),
+        engine_config(),
+    )
+    .unwrap();
+
+    harness.advance_to(Slot(1));
+    harness.submit(create(11, 1)).unwrap();
+    harness.submit(create(12, 2)).unwrap();
+
+    harness.advance_to(Slot(2));
+    harness.inject_storage_fault(StorageFault::SyncFailure);
+    let error = harness
+        .submit(reserve_bundle(&[11, 12], 9, 3, 4))
+        .unwrap_err();
+
+    assert!(matches!(error, SubmissionError::WalFile(_)));
+    assert!(!harness.metrics().accepting_writes);
+
+    let recovered = harness.restart().unwrap();
+    assert_eq!(
+        recovered.recovery.startup_kind,
+        RecoveryStartupKind::WalOnly
+    );
+    assert_eq!(recovered.recovery.replayed_wal_frame_count, 3);
+    assert_eq!(
+        recovered
+            .recovery
+            .replayed_wal_last_lsn
+            .map(allocdb_core::Lsn::get),
+        Some(3)
+    );
+
+    for resource_id in [11, 12] {
+        let resource = harness
+            .engine()
+            .db()
+            .resource(ResourceId(resource_id))
+            .unwrap();
+        assert_eq!(resource.current_state, ResourceState::Reserved);
+        assert_eq!(resource.current_reservation_id, Some(ReservationId(3)));
+    }
+
+    let reservation = harness
+        .engine()
+        .db()
+        .reservation(ReservationId(3), harness.current_slot())
+        .unwrap();
+    assert_eq!(
+        harness
+            .engine()
+            .db()
+            .reservation_member_resource_ids(reservation),
+        vec![ResourceId(11), ResourceId(12)]
+    );
+
+    harness.advance_to(Slot(3));
+    let retry = harness.submit(reserve_bundle(&[11, 12], 9, 3, 4)).unwrap();
+    assert!(retry.from_retry_cache);
+    assert_eq!(retry.applied_lsn.get(), 3);
+    assert_eq!(retry.outcome.result_code, ResultCode::Ok);
+    assert_eq!(retry.outcome.reservation_id, Some(ReservationId(3)));
+}
+
+#[test]
 #[should_panic(expected = "schedule actions must have unique labels")]
 fn schedule_exploration_rejects_duplicate_labels() {
     let actions = [
@@ -706,6 +852,102 @@ fn simulated_slot_driver_handles_expiration_restart_path() {
             .state,
         ReservationState::Expired
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn revoke_restart_preserves_epoch_barrier_until_explicit_reclaim() {
+    let mut harness = SimulationHarness::new(
+        "revoke-restart-epoch-barrier",
+        0x189,
+        bundle_core_config(),
+        engine_config(),
+    )
+    .unwrap();
+
+    harness.advance_to(Slot(1));
+    harness.submit(create(11, 1)).unwrap();
+    harness.submit(create(12, 2)).unwrap();
+
+    harness.advance_to(Slot(2));
+    let reserved = harness.submit(reserve_bundle(&[11, 12], 21, 3, 4)).unwrap();
+    assert_eq!(reserved.outcome.reservation_id, Some(ReservationId(3)));
+
+    harness.advance_to(Slot(3));
+    let confirmed = harness.submit(confirm(3, 21, 1, 4)).unwrap();
+    assert_eq!(confirmed.outcome.result_code, ResultCode::Ok);
+    let checkpoint = harness.checkpoint().unwrap();
+    assert_eq!(checkpoint.snapshot_lsn.map(allocdb_core::Lsn::get), Some(4));
+
+    harness.advance_to(Slot(4));
+    let revoked = harness.submit(revoke(3, 5)).unwrap();
+    assert_eq!(revoked.outcome.result_code, ResultCode::Ok);
+
+    let recovered = harness.restart().unwrap();
+    assert_eq!(
+        recovered.recovery.startup_kind,
+        RecoveryStartupKind::SnapshotAndWal
+    );
+    assert_eq!(
+        recovered
+            .recovery
+            .loaded_snapshot_lsn
+            .map(allocdb_core::Lsn::get),
+        Some(4)
+    );
+    assert_eq!(recovered.recovery.replayed_wal_frame_count, 1);
+    assert_eq!(
+        recovered
+            .recovery
+            .replayed_wal_last_lsn
+            .map(allocdb_core::Lsn::get),
+        Some(5)
+    );
+
+    for resource_id in [11, 12] {
+        let resource = harness
+            .engine()
+            .db()
+            .resource(ResourceId(resource_id))
+            .unwrap();
+        assert_eq!(resource.current_state, ResourceState::Revoking);
+        assert_eq!(resource.current_reservation_id, Some(ReservationId(3)));
+    }
+    assert_eq!(
+        harness
+            .engine()
+            .db()
+            .reservation(ReservationId(3), harness.current_slot())
+            .unwrap()
+            .state,
+        ReservationState::Revoking
+    );
+
+    harness.advance_to(Slot(5));
+    let stale_release = harness.submit(release(3, 21, 1, 6)).unwrap();
+    assert_eq!(stale_release.outcome.result_code, ResultCode::StaleEpoch);
+
+    let early_reuse = harness.submit(reserve(11, 22, 7, 4)).unwrap();
+    assert_eq!(early_reuse.outcome.result_code, ResultCode::ResourceBusy);
+
+    harness.advance_to(Slot(6));
+    let reclaimed = harness.submit(reclaim(3, 8)).unwrap();
+    assert_eq!(reclaimed.outcome.result_code, ResultCode::Ok);
+
+    for resource_id in [11, 12] {
+        let resource = harness
+            .engine()
+            .db()
+            .resource(ResourceId(resource_id))
+            .unwrap();
+        assert_eq!(resource.current_state, ResourceState::Available);
+        assert_eq!(resource.current_reservation_id, None);
+    }
+
+    harness.advance_to(Slot(7));
+    let regranted = harness.submit(reserve_bundle(&[11, 12], 22, 9, 4)).unwrap();
+    assert_eq!(regranted.outcome.result_code, ResultCode::Ok);
+    assert_eq!(regranted.outcome.reservation_id, Some(ReservationId(9)));
 }
 
 #[test]

@@ -1420,6 +1420,106 @@ fn primary_crash_after_reply_preserves_read_and_retry_on_new_primary() {
 }
 
 #[test]
+fn primary_crash_after_quorum_bundle_retry_hits_reconstructed_retry_cache() {
+    let mut harness = bundle_primary_harness("replicated-bundle-after-quorum", 0x5a45_0001);
+
+    let create_first = harness
+        .client_submit(
+            replica(1),
+            Slot(1),
+            &create_payload(91, 901),
+            "bundle-after-quorum-create-first",
+        )
+        .unwrap();
+    commit_to_all_backups(
+        &mut harness,
+        "bundle-after-quorum-create-first",
+        create_first.lsn,
+    );
+
+    let create_second = harness
+        .client_submit(
+            replica(1),
+            Slot(2),
+            &create_payload(92, 902),
+            "bundle-after-quorum-create-second",
+        )
+        .unwrap();
+    commit_to_all_backups(
+        &mut harness,
+        "bundle-after-quorum-create-second",
+        create_second.lsn,
+    );
+
+    let payload = reserve_bundle_payload(&[91, 92], 31, 903);
+    let entry = harness
+        .client_submit(replica(1), Slot(3), &payload, "bundle-after-quorum")
+        .unwrap();
+    harness
+        .deliver_protocol_message("bundle-after-quorum-prepare-3-to-2")
+        .unwrap();
+    harness
+        .deliver_protocol_message("bundle-after-quorum-prepare-3-to-2-ack")
+        .unwrap();
+    assert_eq!(replica_commit_lsn(&harness, 1), Some(entry.lsn));
+    assert_eq!(replica_last_applied_lsn(&harness, 1), Some(entry.lsn));
+    assert_eq!(replica_commit_lsn(&harness, 2), Some(create_second.lsn));
+    assert_eq!(replica_prepared_len(&harness, 2), 1);
+
+    harness.crash_replica(replica(1)).unwrap();
+    harness.complete_view_change(replica(2), 2).unwrap();
+
+    let retry = harness
+        .client_submit_or_retry(replica(2), Slot(4), &payload, "bundle-after-quorum-retry")
+        .unwrap();
+    match retry {
+        ReplicatedClientRequestOutcome::Published(result) => {
+            assert_eq!(result.applied_lsn, entry.lsn);
+            assert_eq!(result.outcome.result_code, ResultCode::Ok);
+            assert_eq!(result.outcome.reservation_id, Some(ReservationId(3)));
+            assert_eq!(result.outcome.deadline_slot, Some(Slot(7)));
+            assert!(result.from_retry_cache);
+        }
+        other @ ReplicatedClientRequestOutcome::Prepared(_) => {
+            panic!("expected bundle retry cache hit after majority-committed crash, got {other:?}")
+        }
+    }
+
+    let first_member = harness
+        .read_resource(replica(2), ResourceId(91), Some(entry.lsn))
+        .unwrap()
+        .expect("new primary should preserve first committed bundle member");
+    assert_eq!(
+        first_member.current_state,
+        allocdb_core::ResourceState::Reserved
+    );
+    assert_eq!(first_member.current_reservation_id, Some(ReservationId(3)));
+
+    let second_member = harness
+        .read_resource(replica(2), ResourceId(92), Some(entry.lsn))
+        .unwrap()
+        .expect("new primary should preserve second committed bundle member");
+    assert_eq!(
+        second_member.current_state,
+        allocdb_core::ResourceState::Reserved
+    );
+    assert_eq!(second_member.current_reservation_id, Some(ReservationId(3)));
+    assert_eq!(
+        replica_reservation_member_ids(&harness, 2, 3, 4),
+        vec![ResourceId(91), ResourceId(92)]
+    );
+
+    let method = harness.rejoin_replica(replica(3), replica(2)).unwrap();
+    assert_eq!(method, ReplicaRejoinMethod::SuffixOnly);
+    assert_eq!(replica_last_applied_lsn(&harness, 2), Some(entry.lsn));
+    assert_eq!(replica_last_applied_lsn(&harness, 3), Some(entry.lsn));
+    assert_eq!(
+        replica_reservation_member_ids(&harness, 3, 3, 4),
+        vec![ResourceId(91), ResourceId(92)]
+    );
+}
+
+#[test]
 fn committed_bundle_membership_survives_failover_and_suffix_rejoin() {
     let mut harness = bundle_primary_harness("replicated-bundle-failover", 0x5a46_0001);
 
