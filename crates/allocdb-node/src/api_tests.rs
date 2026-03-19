@@ -87,6 +87,7 @@ fn release_request(reservation_id: u128, operation_id: u128, holder_id: u128) ->
         command: Command::Release {
             reservation_id: ReservationId(reservation_id),
             holder_id: HolderId(holder_id),
+            lease_epoch: 1,
         },
     }
 }
@@ -180,6 +181,7 @@ fn response_codec_round_trips_all_variants() {
             reservation_id: ReservationId(31),
             resource_id: ResourceId(32),
             holder_id: HolderId(33),
+            lease_epoch: 2,
             state: ReservationState::Released,
             created_lsn: Lsn(2),
             deadline_slot: Slot(7),
@@ -300,6 +302,46 @@ fn api_submit_commits_and_exposes_retry_cache() {
 }
 
 #[test]
+fn api_reserve_retry_preserves_lease_epoch_outcome() {
+    let wal_path = test_path("reserve-retry-lease-epoch");
+    let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
+    let _ = engine.handle_api_request(ApiRequest::Submit(SubmitRequest::from_client_request(
+        Slot(1),
+        create_request(11, 1),
+    )));
+    let request = SubmitRequest::from_client_request(Slot(2), reserve_request(11, 2, 9));
+
+    let first = engine.handle_api_request(ApiRequest::Submit(request.clone()));
+    let second = engine.handle_api_request(ApiRequest::Submit(request));
+
+    let expected = allocdb_core::result::CommandOutcome::with_reservation_epoch(
+        ResultCode::Ok,
+        ReservationId(2),
+        1,
+        Slot(5),
+    );
+    assert_eq!(
+        first,
+        ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
+            applied_lsn: Lsn(2),
+            outcome: expected,
+            from_retry_cache: false,
+        }))
+    );
+    assert_eq!(
+        second,
+        ApiResponse::Submit(SubmitResponse::Committed(super::SubmissionCommitted {
+            applied_lsn: Lsn(2),
+            outcome: expected,
+            from_retry_cache: true,
+        }))
+    );
+
+    drop(engine);
+    fs::remove_file(&wal_path).unwrap();
+}
+
+#[test]
 fn api_submit_maps_invalid_payload_to_definite_failure() {
     let wal_path = test_path("invalid-submit");
     let mut engine = SingleNodeEngine::open(core_config(), engine_config(), &wal_path).unwrap();
@@ -380,6 +422,7 @@ fn api_reads_enforce_fence_and_return_views() {
             reservation_id: ReservationId(2),
             resource_id: ResourceId(11),
             holder_id: HolderId(9),
+            lease_epoch: 1,
             state: ReservationState::Reserved,
             created_lsn: Lsn(2),
             deadline_slot: Slot(5),
@@ -495,6 +538,7 @@ fn api_tick_expirations_commits_due_internal_expire() {
             reservation_id: ReservationId(2),
             resource_id: ResourceId(11),
             holder_id: HolderId(9),
+            lease_epoch: 2,
             state: ReservationState::Expired,
             created_lsn: Lsn(2),
             deadline_slot: Slot(5),

@@ -96,8 +96,11 @@ fn reserve_assigns_deterministic_reservation_id_and_deadline() {
 
     assert_eq!(outcome.result_code, ResultCode::Ok);
     assert_eq!(outcome.reservation_id, Some(ReservationId(2)));
+    assert_eq!(outcome.lease_epoch, Some(1));
     assert_eq!(outcome.deadline_slot, Some(Slot(13)));
 
+    let reservation = db.reservation(ReservationId(2), Slot(10)).unwrap();
+    assert_eq!(reservation.lease_epoch, 1);
     let resource = db.resource(ResourceId(11)).unwrap();
     assert_eq!(resource.current_state, ResourceState::Reserved);
     assert_eq!(resource.current_reservation_id, Some(ReservationId(2)));
@@ -161,6 +164,7 @@ fn confirm_requires_matching_holder() {
             command: Command::Confirm {
                 reservation_id: ReservationId(2),
                 holder_id: HolderId(2),
+                lease_epoch: 1,
             },
         },
     );
@@ -172,6 +176,7 @@ fn confirm_requires_matching_holder() {
             command: Command::Confirm {
                 reservation_id: ReservationId(2),
                 holder_id: HolderId(1),
+                lease_epoch: 1,
             },
         },
     );
@@ -181,6 +186,12 @@ fn confirm_requires_matching_holder() {
     assert_eq!(
         db.resource(ResourceId(11)).unwrap().current_state,
         ResourceState::Confirmed
+    );
+    assert_eq!(
+        db.reservation(ReservationId(2), Slot(5))
+            .unwrap()
+            .lease_epoch,
+        1
     );
 }
 
@@ -209,6 +220,7 @@ fn release_returns_resource_to_available_and_retains_history() {
             command: Command::Release {
                 reservation_id: ReservationId(2),
                 holder_id: HolderId(1),
+                lease_epoch: 1,
             },
         },
     );
@@ -218,10 +230,9 @@ fn release_returns_resource_to_available_and_retains_history() {
         db.resource(ResourceId(11)).unwrap().current_state,
         ResourceState::Available
     );
-    assert_eq!(
-        db.reservation(ReservationId(2), Slot(5)).unwrap().state,
-        ReservationState::Released
-    );
+    let reservation = db.reservation(ReservationId(2), Slot(5)).unwrap();
+    assert_eq!(reservation.state, ReservationState::Released);
+    assert_eq!(reservation.lease_epoch, 2);
 }
 
 #[test]
@@ -248,6 +259,7 @@ fn expire_is_noop_after_confirm() {
             command: Command::Confirm {
                 reservation_id: ReservationId(2),
                 holder_id: HolderId(1),
+                lease_epoch: 1,
             },
         },
     );
@@ -297,10 +309,9 @@ fn expire_releases_reserved_resource() {
         db.resource(ResourceId(11)).unwrap().current_state,
         ResourceState::Available
     );
-    assert_eq!(
-        db.reservation(ReservationId(2), Slot(5)).unwrap().state,
-        ReservationState::Expired
-    );
+    let reservation = db.reservation(ReservationId(2), Slot(5)).unwrap();
+    assert_eq!(reservation.state, ReservationState::Expired);
+    assert_eq!(reservation.lease_epoch, 2);
 }
 
 #[test]

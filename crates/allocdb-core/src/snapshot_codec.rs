@@ -54,6 +54,7 @@ pub(super) fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
         bytes.extend_from_slice(&reservation.reservation_id.get().to_le_bytes());
         bytes.extend_from_slice(&reservation.resource_id.get().to_le_bytes());
         bytes.extend_from_slice(&reservation.holder_id.get().to_le_bytes());
+        bytes.extend_from_slice(&reservation.lease_epoch.to_le_bytes());
         bytes.push(encode_reservation_state(reservation.state));
         bytes.extend_from_slice(&reservation.created_lsn.get().to_le_bytes());
         bytes.extend_from_slice(&reservation.deadline_slot.get().to_le_bytes());
@@ -76,6 +77,7 @@ pub(super) fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
             &mut bytes,
             operation.result_reservation_id.map(ReservationId::get),
         );
+        encode_optional_u64(&mut bytes, operation.result_lease_epoch);
         encode_optional_u64(&mut bytes, operation.result_deadline_slot.map(Slot::get));
         bytes.extend_from_slice(&operation.applied_lsn.get().to_le_bytes());
         bytes.extend_from_slice(&operation.retire_after_slot.get().to_le_bytes());
@@ -103,7 +105,7 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, SnapshotError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != 1 && version != 2 && version != VERSION {
+    if version != 1 && version != 2 && version != 3 && version != VERSION {
         return Err(SnapshotError::InvalidVersion(version));
     }
 
@@ -143,6 +145,11 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, SnapshotError> {
             command_fingerprint: cursor.read_u128()?,
             result_code: decode_result_code(cursor.read_u8()?)?,
             result_reservation_id: cursor.read_optional_u128()?.map(ReservationId),
+            result_lease_epoch: if version >= 4 {
+                cursor.read_optional_u64()?
+            } else {
+                None
+            },
             result_deadline_slot: cursor.read_optional_u64()?.map(Slot),
             applied_lsn: Lsn(cursor.read_u64()?),
             retire_after_slot: Slot(cursor.read_u64()?),
@@ -235,6 +242,7 @@ fn decode_snapshot_reservations(
             reservation_id: ReservationId(cursor.read_u128()?),
             resource_id: ResourceId(cursor.read_u128()?),
             holder_id: HolderId(cursor.read_u128()?),
+            lease_epoch: if version >= 4 { cursor.read_u64()? } else { 1 },
             state: decode_reservation_state(cursor.read_u8()?)?,
             created_lsn: Lsn(cursor.read_u64()?),
             deadline_slot: Slot(cursor.read_u64()?),
@@ -358,7 +366,8 @@ fn decode_result_code(tag: u8) -> Result<ResultCode, SnapshotError> {
         14 => Ok(ResultCode::OperationConflict),
         15 => Ok(ResultCode::InvalidState),
         16 => Ok(ResultCode::HolderMismatch),
-        17 => Ok(ResultCode::SlotOverflow),
+        17 => Ok(ResultCode::StaleEpoch),
+        18 => Ok(ResultCode::SlotOverflow),
         _ => Err(SnapshotError::InvalidStateTag(tag)),
     }
 }
@@ -382,6 +391,7 @@ fn encode_result_code(code: ResultCode) -> u8 {
         ResultCode::OperationConflict => 14,
         ResultCode::InvalidState => 15,
         ResultCode::HolderMismatch => 16,
-        ResultCode::SlotOverflow => 17,
+        ResultCode::StaleEpoch => 17,
+        ResultCode::SlotOverflow => 18,
     }
 }

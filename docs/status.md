@@ -195,12 +195,16 @@
   `reservation_contention-crash-restart` reruns on `allocdb-a` with `blockers=0`
 - `M9-T01` through `M9-T05` are merged on `main` via PR `#81`, and the planning issues are closed
   on the `AllocDB` project
-- issue `#83` / `M9-T06` is the active implementation slice on the current branch: the trusted
-  core now has atomic bundle reservation, explicit bundle membership records, bundle-aware
-  confirm/release/expire, and bundle-aware snapshot/codec coverage while preserving the existing
-  reservation compatibility surface
-- validation for the `#83` branch currently includes `cargo test -p allocdb-core -- --nocapture`
-  plus full workspace test compilation via `cargo test --workspace --no-run`
-- the next planned slices after `#83` remain `M9-T07` fencing, `M9-T08` revoke/safe reuse,
-  `M9-T09` persistence and transport extension, `M9-T10` replication preservation, and
-  `M9-T11` broader regression coverage
+- PR `#89` merged `M9-T06` on `main`: the trusted core now supports atomic bundle reservation,
+  explicit bundle membership records, bundle-aware confirm/release/expire, and bundle-aware
+  snapshot/codec coverage while preserving the existing reservation compatibility surface
+- issue `#84` / `M9-T07` is the active implementation slice on the current branch: lease epochs
+  now flow through holder-authorized commands and command outcomes, the core rejects stale holder
+  epochs deterministically, and read/retry surfaces expose the current authority token for active
+  reservations
+- validation for the active `#84` branch currently includes
+  `cargo test -p allocdb-core -- --nocapture`, `cargo test -p allocdb-node api -- --nocapture`,
+  `cargo test -p allocdb-node engine -- --nocapture`, and
+  `cargo test --workspace --no-run`
+- the next planned slices after `#84` remain `M9-T08` revoke/safe reuse, `M9-T09` persistence and
+  transport extension, `M9-T10` replication preservation, and `M9-T11` broader regression coverage

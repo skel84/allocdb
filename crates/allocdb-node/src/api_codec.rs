@@ -348,6 +348,7 @@ fn encode_reservation_view(bytes: &mut Vec<u8>, view: ReservationView) {
     bytes.extend_from_slice(&view.reservation_id.get().to_le_bytes());
     bytes.extend_from_slice(&view.resource_id.get().to_le_bytes());
     bytes.extend_from_slice(&view.holder_id.get().to_le_bytes());
+    bytes.extend_from_slice(&view.lease_epoch.to_le_bytes());
     bytes.push(encode_reservation_state(view.state));
     bytes.extend_from_slice(&view.created_lsn.get().to_le_bytes());
     bytes.extend_from_slice(&view.deadline_slot.get().to_le_bytes());
@@ -360,6 +361,7 @@ fn decode_reservation_view(cursor: &mut Cursor<'_>) -> Result<ReservationView, A
         reservation_id: ReservationId(cursor.read_u128()?),
         resource_id: ResourceId(cursor.read_u128()?),
         holder_id: HolderId(cursor.read_u128()?),
+        lease_epoch: cursor.read_u64()?,
         state: decode_reservation_state(cursor.read_u8()?)?,
         created_lsn: Lsn(cursor.read_u64()?),
         deadline_slot: Slot(cursor.read_u64()?),
@@ -455,6 +457,7 @@ fn decode_health_metrics(cursor: &mut Cursor<'_>) -> Result<HealthMetrics, ApiCo
 fn encode_command_outcome(bytes: &mut Vec<u8>, outcome: CommandOutcome) {
     bytes.push(encode_result_code(outcome.result_code));
     encode_optional_u128(bytes, outcome.reservation_id.map(ReservationId::get));
+    encode_optional_u64(bytes, outcome.lease_epoch);
     encode_optional_u64(bytes, outcome.deadline_slot.map(Slot::get));
 }
 
@@ -462,6 +465,7 @@ fn decode_command_outcome(cursor: &mut Cursor<'_>) -> Result<CommandOutcome, Api
     Ok(CommandOutcome {
         result_code: decode_result_code(cursor.read_u8()?)?,
         reservation_id: cursor.read_optional_u128()?.map(ReservationId),
+        lease_epoch: cursor.read_optional_u64()?,
         deadline_slot: cursor.read_optional_u64()?.map(Slot),
     })
 }
@@ -602,7 +606,8 @@ fn encode_result_code(result_code: ResultCode) -> u8 {
         ResultCode::OperationConflict => 15,
         ResultCode::InvalidState => 16,
         ResultCode::HolderMismatch => 17,
-        ResultCode::SlotOverflow => 18,
+        ResultCode::StaleEpoch => 18,
+        ResultCode::SlotOverflow => 19,
     }
 }
 
@@ -625,7 +630,8 @@ fn decode_result_code(value: u8) -> Result<ResultCode, ApiCodecError> {
         15 => Ok(ResultCode::OperationConflict),
         16 => Ok(ResultCode::InvalidState),
         17 => Ok(ResultCode::HolderMismatch),
-        18 => Ok(ResultCode::SlotOverflow),
+        18 => Ok(ResultCode::StaleEpoch),
+        19 => Ok(ResultCode::SlotOverflow),
         value => Err(ApiCodecError::InvalidEnumValue {
             kind: "result_code",
             value,

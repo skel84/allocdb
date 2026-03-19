@@ -3,7 +3,10 @@ use crate::config::Config;
 use crate::ids::{ClientId, HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use crate::result::ResultCode;
 use crate::snapshot::{Snapshot, SnapshotError};
-use crate::state_machine::{AllocDb, OperationRecord, ReservationLookupError};
+use crate::state_machine::{
+    AllocDb, OperationRecord, ReservationLookupError, ReservationMemberRecord, ReservationRecord,
+    ReservationState, ResourceRecord, ResourceState,
+};
 
 fn config() -> Config {
     Config {
@@ -174,6 +177,7 @@ fn snapshot_restores_retired_lookup_watermark() {
             command: Command::Release {
                 reservation_id: ReservationId(2),
                 holder_id: HolderId(5),
+                lease_epoch: 1,
             },
         },
     );
@@ -240,6 +244,10 @@ fn encoded_optional_u64_len(value: Option<u64>) -> usize {
     if value.is_some() { 9 } else { 1 }
 }
 
+fn encoded_optional_u128_len(value: Option<u128>) -> usize {
+    if value.is_some() { 17 } else { 1 }
+}
+
 #[test]
 fn snapshot_round_trips_slot_overflow_operation_result() {
     let snapshot = Snapshot {
@@ -250,6 +258,7 @@ fn snapshot_round_trips_slot_overflow_operation_result() {
             command_fingerprint: 42,
             result_code: ResultCode::SlotOverflow,
             result_reservation_id: None,
+            result_lease_epoch: None,
             result_deadline_slot: None,
             applied_lsn: Lsn(7),
             retire_after_slot: Slot(12),
@@ -261,4 +270,90 @@ fn snapshot_round_trips_slot_overflow_operation_result() {
     let decoded = Snapshot::decode(&encoded).unwrap();
 
     assert_eq!(decoded, snapshot);
+}
+
+#[test]
+fn snapshot_decode_accepts_legacy_v3_layout_without_epoch_fields() {
+    let mut wheel = vec![Vec::new(); config().wheel_len()];
+    let wheel_len = u64::try_from(wheel.len()).unwrap();
+    let bucket_index = usize::try_from(9_u64 % wheel_len).unwrap();
+    wheel[bucket_index].push(ReservationId(2));
+    let snapshot = Snapshot {
+        last_applied_lsn: Some(Lsn(7)),
+        last_request_slot: Some(Slot(5)),
+        resources: vec![ResourceRecord {
+            resource_id: ResourceId(11),
+            current_state: ResourceState::Reserved,
+            current_reservation_id: Some(ReservationId(2)),
+            version: 1,
+        }],
+        reservations: vec![ReservationRecord {
+            reservation_id: ReservationId(2),
+            resource_id: ResourceId(11),
+            holder_id: HolderId(5),
+            lease_epoch: 1,
+            state: ReservationState::Reserved,
+            created_lsn: Lsn(7),
+            deadline_slot: Slot(9),
+            released_lsn: None,
+            retire_after_slot: None,
+            member_count: 1,
+        }],
+        reservation_members: vec![ReservationMemberRecord {
+            reservation_id: ReservationId(2),
+            resource_id: ResourceId(11),
+            member_index: 0,
+        }],
+        operations: vec![OperationRecord {
+            operation_id: OperationId(3),
+            command_fingerprint: 42,
+            result_code: ResultCode::Ok,
+            result_reservation_id: Some(ReservationId(2)),
+            result_lease_epoch: Some(1),
+            result_deadline_slot: Some(Slot(9)),
+            applied_lsn: Lsn(7),
+            retire_after_slot: Slot(13),
+        }],
+        wheel,
+        ..empty_snapshot()
+    };
+
+    let mut bytes = snapshot.encode();
+    bytes[4..6].copy_from_slice(&3_u16.to_le_bytes());
+
+    let header_len = 4
+        + 2
+        + encoded_optional_u64_len(snapshot.last_applied_lsn.map(Lsn::get))
+        + encoded_optional_u64_len(snapshot.last_request_slot.map(Slot::get))
+        + encoded_optional_u128_len(snapshot.max_retired_reservation_id.map(ReservationId::get))
+        + (5 * 4);
+    let resource_len = 16 + 1 + encoded_optional_u128_len(Some(ReservationId(2).get())) + 8;
+    let reservation_epoch_offset = header_len + resource_len + 16 + 16 + 16;
+    bytes.drain(reservation_epoch_offset..reservation_epoch_offset + 8);
+
+    let reservation_len_v4 = 16
+        + 16
+        + 16
+        + 8
+        + 1
+        + 8
+        + 8
+        + encoded_optional_u64_len(None)
+        + encoded_optional_u64_len(None)
+        + 4;
+    let reservation_member_len = 16 + 16 + 4;
+    let operation_epoch_offset = header_len
+        + resource_len
+        + (reservation_len_v4 - 8)
+        + reservation_member_len
+        + 16
+        + 16
+        + 1
+        + encoded_optional_u128_len(Some(ReservationId(2).get()));
+    bytes.drain(operation_epoch_offset..operation_epoch_offset + 9);
+
+    let mut expected = snapshot.clone();
+    expected.operations[0].result_lease_epoch = None;
+
+    assert_eq!(Snapshot::decode(&bytes).unwrap(), expected);
 }

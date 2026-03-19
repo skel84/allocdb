@@ -1128,6 +1128,7 @@ fn release_request(
         command: Command::Release {
             reservation_id,
             holder_id,
+            lease_epoch: 1,
         },
     }
 }

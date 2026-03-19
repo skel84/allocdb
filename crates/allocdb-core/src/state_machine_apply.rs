@@ -48,6 +48,7 @@ impl AllocDb {
         _context: CommandContext,
         reservation_id: ReservationId,
         holder_id: HolderId,
+        lease_epoch: u64,
     ) -> CommandOutcome {
         let Some(reservation) = self.reservations.get(reservation_id).copied() else {
             warn!(
@@ -57,14 +58,6 @@ impl AllocDb {
             return CommandOutcome::new(ResultCode::ReservationNotFound);
         };
 
-        if reservation.retire_after_slot.is_some() {
-            warn!(
-                "confirm rejected reservation_retired reservation_id={}",
-                reservation_id.get()
-            );
-            return CommandOutcome::new(ResultCode::ReservationRetired);
-        }
-
         if reservation.holder_id != holder_id {
             warn!(
                 "confirm rejected holder_mismatch reservation_id={} holder_id={}",
@@ -72,6 +65,25 @@ impl AllocDb {
                 holder_id.get()
             );
             return CommandOutcome::new(ResultCode::HolderMismatch);
+        }
+
+        if reservation.lease_epoch != lease_epoch {
+            warn!(
+                "confirm rejected stale_epoch reservation_id={} holder_id={} expected={} actual={}",
+                reservation_id.get(),
+                holder_id.get(),
+                reservation.lease_epoch,
+                lease_epoch
+            );
+            return CommandOutcome::new(ResultCode::StaleEpoch);
+        }
+
+        if reservation.retire_after_slot.is_some() {
+            warn!(
+                "confirm rejected reservation_retired reservation_id={}",
+                reservation_id.get()
+            );
+            return CommandOutcome::new(ResultCode::ReservationRetired);
         }
 
         if reservation.state != ReservationState::Reserved {
@@ -113,7 +125,11 @@ impl AllocDb {
             resource.version += 1;
         }
 
-        debug!("confirmed reservation_id={}", reservation_id.get());
+        debug!(
+            "confirmed reservation_id={} lease_epoch={}",
+            reservation_id.get(),
+            lease_epoch
+        );
         CommandOutcome::new(ResultCode::Ok)
     }
 
@@ -122,6 +138,7 @@ impl AllocDb {
         context: CommandContext,
         reservation_id: ReservationId,
         holder_id: HolderId,
+        lease_epoch: u64,
     ) -> CommandOutcome {
         let Some(reservation) = self.reservations.get(reservation_id).copied() else {
             warn!(
@@ -131,14 +148,6 @@ impl AllocDb {
             return CommandOutcome::new(ResultCode::ReservationNotFound);
         };
 
-        if reservation.retire_after_slot.is_some() {
-            warn!(
-                "release rejected reservation_retired reservation_id={}",
-                reservation_id.get()
-            );
-            return CommandOutcome::new(ResultCode::ReservationRetired);
-        }
-
         if reservation.holder_id != holder_id {
             warn!(
                 "release rejected holder_mismatch reservation_id={} holder_id={}",
@@ -146,6 +155,25 @@ impl AllocDb {
                 holder_id.get()
             );
             return CommandOutcome::new(ResultCode::HolderMismatch);
+        }
+
+        if reservation.lease_epoch != lease_epoch {
+            warn!(
+                "release rejected stale_epoch reservation_id={} holder_id={} expected={} actual={}",
+                reservation_id.get(),
+                holder_id.get(),
+                reservation.lease_epoch,
+                lease_epoch
+            );
+            return CommandOutcome::new(ResultCode::StaleEpoch);
+        }
+
+        if reservation.retire_after_slot.is_some() {
+            warn!(
+                "release rejected reservation_retired reservation_id={}",
+                reservation_id.get()
+            );
+            return CommandOutcome::new(ResultCode::ReservationRetired);
         }
 
         match reservation.state {
@@ -182,6 +210,7 @@ impl AllocDb {
             .get_mut(reservation_id)
             .expect("reservation must stay present across release");
         reservation.state = ReservationState::Released;
+        reservation.lease_epoch += 1;
         reservation.released_lsn = Some(context.lsn);
         reservation.retire_after_slot = Some(retire_after_slot);
         let queued_reservation_id = reservation.reservation_id;
@@ -201,7 +230,12 @@ impl AllocDb {
         }
 
         self.push_reservation_retirement(queued_reservation_id, retire_after_slot);
-        debug!("released reservation_id={}", reservation_id.get());
+        debug!(
+            "released reservation_id={} prior_lease_epoch={} retired_at_slot={}",
+            reservation_id.get(),
+            lease_epoch,
+            retire_after_slot.get()
+        );
         CommandOutcome::new(ResultCode::Ok)
     }
 
@@ -264,6 +298,7 @@ impl AllocDb {
             .get_mut(reservation_id)
             .expect("reservation must stay present across expire");
         reservation.state = ReservationState::Expired;
+        reservation.lease_epoch += 1;
         reservation.released_lsn = Some(context.lsn);
         reservation.retire_after_slot = Some(retire_after_slot);
         let queued_reservation_id = reservation.reservation_id;

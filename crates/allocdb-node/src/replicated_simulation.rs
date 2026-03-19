@@ -1231,6 +1231,7 @@ impl ReplicatedSimulationHarness {
             CommandOutcome {
                 result_code: record.result_code,
                 reservation_id: record.result_reservation_id,
+                lease_epoch: record.result_lease_epoch,
                 deadline_slot: record.result_deadline_slot,
             }
         } else {

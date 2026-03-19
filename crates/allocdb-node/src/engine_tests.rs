@@ -83,6 +83,7 @@ fn confirm(reservation_id: ReservationId, operation_id: u128, holder_id: u128) -
         command: Command::Confirm {
             reservation_id,
             holder_id: HolderId(holder_id),
+            lease_epoch: 1,
         },
     }
 }
@@ -94,6 +95,7 @@ fn release(reservation_id: ReservationId, operation_id: u128, holder_id: u128) -
         command: Command::Release {
             reservation_id,
             holder_id: HolderId(holder_id),
+            lease_epoch: 1,
         },
     }
 }

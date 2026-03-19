@@ -10,6 +10,9 @@ mod apply;
 #[path = "state_machine_bundle.rs"]
 mod bundle;
 #[cfg(test)]
+#[path = "state_machine_bundle_fencing_tests.rs"]
+mod bundle_fencing_tests;
+#[cfg(test)]
 #[path = "state_machine_bundle_overflow_tests.rs"]
 mod bundle_overflow_tests;
 #[cfg(test)]
@@ -17,6 +20,9 @@ mod bundle_overflow_tests;
 mod bundle_tests;
 #[path = "state_machine_execution.rs"]
 mod execution;
+#[cfg(test)]
+#[path = "state_machine_fencing_tests.rs"]
+mod fencing_tests;
 #[path = "state_machine_invariants.rs"]
 mod invariants;
 #[cfg(test)]
@@ -77,6 +83,7 @@ pub struct ReservationRecord {
     pub reservation_id: ReservationId,
     pub resource_id: ResourceId,
     pub holder_id: HolderId,
+    pub lease_epoch: u64,
     pub state: ReservationState,
     pub created_lsn: Lsn,
     pub deadline_slot: Slot,
@@ -91,6 +98,7 @@ pub struct OperationRecord {
     pub command_fingerprint: u128,
     pub result_code: ResultCode,
     pub result_reservation_id: Option<ReservationId>,
+    pub result_lease_epoch: Option<u64>,
     pub result_deadline_slot: Option<Slot>,
     pub applied_lsn: Lsn,
     pub retire_after_slot: Slot,
@@ -198,11 +206,13 @@ impl AllocDb {
             Command::Confirm {
                 reservation_id,
                 holder_id,
-            } => self.apply_confirm(context, reservation_id, holder_id),
+                lease_epoch,
+            } => self.apply_confirm(context, reservation_id, holder_id, lease_epoch),
             Command::Release {
                 reservation_id,
                 holder_id,
-            } => self.apply_release(context, reservation_id, holder_id),
+                lease_epoch,
+            } => self.apply_release(context, reservation_id, holder_id, lease_epoch),
             Command::Expire {
                 reservation_id,
                 deadline_slot,

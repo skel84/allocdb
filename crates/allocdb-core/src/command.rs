@@ -37,10 +37,12 @@ pub enum Command {
     Confirm {
         reservation_id: ReservationId,
         holder_id: HolderId,
+        lease_epoch: u64,
     },
     Release {
         reservation_id: ReservationId,
         holder_id: HolderId,
+        lease_epoch: u64,
     },
     Expire {
         reservation_id: ReservationId,
@@ -98,18 +100,22 @@ impl Command {
             Self::Confirm {
                 reservation_id,
                 holder_id,
+                lease_epoch,
             } => {
                 state = mix(state, 4);
                 state = mix(state, reservation_id.get());
-                mix(state, holder_id.get())
+                state = mix(state, holder_id.get());
+                mix(state, u128::from(*lease_epoch))
             }
             Self::Release {
                 reservation_id,
                 holder_id,
+                lease_epoch,
             } => {
                 state = mix(state, 5);
                 state = mix(state, reservation_id.get());
-                mix(state, holder_id.get())
+                state = mix(state, holder_id.get());
+                mix(state, u128::from(*lease_epoch))
             }
             Self::Expire {
                 reservation_id,
