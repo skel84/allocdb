@@ -218,3 +218,4 @@
   both with `blockers=0`
 - the next recommended step is downstream real-cluster e2e work such as `gpu_control_plane`, not more unplanned lease-kernel semantics work
 - the current deployment slice covers a first in-cluster `StatefulSet` shape, but bootstrap-primary routing, failover/rejoin orchestration, and background maintenance remain operator work, and the current staging unblock path is to publish `skel84/allocdb` from GitHub Actions rather than relying on the local Docker engine
+- the next engine-thesis planning slice is `M10`, which freezes `quota-core` as an in-repo second-engine experiment before any shared-runtime extraction or repo split
