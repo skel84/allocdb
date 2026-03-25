@@ -1,3 +1,5 @@
+#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
+
 pub mod bounded_queue;
 pub mod command;
 pub mod command_codec;

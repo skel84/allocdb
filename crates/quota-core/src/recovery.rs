@@ -338,7 +338,7 @@ mod tests {
                 lsn: Lsn(1),
                 request_slot: Slot(1),
             },
-            create.clone(),
+            create,
         );
         snapshot_file.write_snapshot(&live.snapshot()).unwrap();
         let _ = live.apply_client(
@@ -346,14 +346,14 @@ mod tests {
                 lsn: Lsn(2),
                 request_slot: Slot(3),
             },
-            debit.clone(),
+            debit,
         );
         let _ = live.apply_client(
             CommandContext {
                 lsn: Lsn(3),
                 request_slot: Slot(5),
             },
-            second_debit.clone(),
+            second_debit,
         );
 
         let mut wal = WalFile::open(&wal_path, 64).unwrap();
@@ -361,14 +361,14 @@ mod tests {
             lsn: Lsn(2),
             request_slot: Slot(3),
             record_type: RecordType::ClientCommand,
-            payload: encode_client_request(&debit),
+            payload: encode_client_request(debit),
         })
         .unwrap();
         wal.append_frame(&Frame {
             lsn: Lsn(3),
             request_slot: Slot(5),
             record_type: RecordType::ClientCommand,
-            payload: encode_client_request(&second_debit),
+            payload: encode_client_request(second_debit),
         })
         .unwrap();
         wal.sync().unwrap();
@@ -498,7 +498,7 @@ mod tests {
             lsn: Lsn(1),
             request_slot: Slot(1),
             record_type: RecordType::ClientCommand,
-            payload: encode_client_request(&create),
+            payload: encode_client_request(create),
         })
         .unwrap();
 
@@ -506,7 +506,7 @@ mod tests {
             lsn: Lsn(2),
             request_slot: Slot(4),
             record_type: RecordType::ClientCommand,
-            payload: encode_client_request(&debit),
+            payload: encode_client_request(debit),
         }
         .encode();
         fs::OpenOptions::new()

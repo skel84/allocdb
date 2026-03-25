@@ -637,7 +637,7 @@ mod tests {
             },
         );
 
-        let first = db.apply_client(context(1, 1), create.clone());
+        let first = db.apply_client(context(1, 1), create);
         let retry = db.apply_client(context(2, 2), create);
 
         assert_eq!(first.result_code, ResultCode::Ok);
@@ -670,7 +670,7 @@ mod tests {
             },
         );
 
-        let first = db.apply_client(context(2, 2), debit.clone());
+        let first = db.apply_client(context(2, 2), debit);
         let retry = db.apply_client(context(3, 3), debit);
 
         assert_eq!(first.result_code, ResultCode::InsufficientFunds);
@@ -730,7 +730,7 @@ mod tests {
                 amount: 3,
             },
         );
-        let first = db.apply_client(context(2, 2), debit.clone());
+        let first = db.apply_client(context(2, 2), debit);
         let retry = db.apply_client(context(3, 3), debit);
 
         assert_eq!(first.result_code, ResultCode::Ok);

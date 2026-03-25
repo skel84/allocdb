@@ -232,8 +232,9 @@ impl<K: FixedKey, V> FixedMap<K, V> {
 }
 
 fn hash_u128(value: u128) -> u64 {
-    let low = value as u64;
-    let high = (value >> 64) as u64;
+    let bytes = value.to_le_bytes();
+    let low = u64::from_le_bytes(bytes[..8].try_into().expect("slice has exact size"));
+    let high = u64::from_le_bytes(bytes[8..].try_into().expect("slice has exact size"));
     low.rotate_left(21) ^ high.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 

@@ -149,7 +149,7 @@ mod tests {
             },
         };
 
-        let decoded = decode_client_request(&encode_client_request(&request)).unwrap();
+        let decoded = decode_client_request(&encode_client_request(request)).unwrap();
         assert_eq!(decoded, request);
     }
 
@@ -162,7 +162,7 @@ mod tests {
             refill_rate_per_slot: 2,
         };
 
-        let decoded = decode_internal_command(&encode_internal_command(&command)).unwrap();
+        let decoded = decode_internal_command(&encode_internal_command(command)).unwrap();
         assert_eq!(decoded, command);
     }
 

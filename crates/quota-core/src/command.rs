@@ -6,7 +6,7 @@ pub struct CommandContext {
     pub request_slot: Slot,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClientRequest {
     pub operation_id: OperationId,
     pub client_id: ClientId,
@@ -19,7 +19,7 @@ impl AsRef<ClientRequest> for ClientRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
     CreateBucket {
         bucket_id: BucketId,
