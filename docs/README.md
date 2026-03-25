@@ -24,6 +24,7 @@
 - [Revoke Safety Slice](./revoke-safety-slice.md)
 - [Operator Runbook](./operator-runbook.md)
 - [KubeVirt Jepsen Report](./kubevirt-jepsen-report.md)
+- [Real Cluster E2E Roadmap](./real-cluster-e2e-roadmap.md)
 - [Replication Notes](./replication.md)
 - [Benchmark Harness](./benchmark-harness.md)
 - [Roadmap](./roadmap.md)

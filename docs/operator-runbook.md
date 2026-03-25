@@ -9,6 +9,7 @@ It is intentionally limited to behavior that exists on the current branch:
 - the single-node alpha engine
 - the first local multi-process replicated cluster runner
 - the first local QEMU replicated testbed
+- the first Kubernetes `StatefulSet` packaging for the replica daemon
 
 Current operational constraints for the local replicated runner:
 
@@ -25,6 +26,15 @@ Current operational constraints for the single-node alpha remain:
 - there is no standalone general-purpose node daemon beyond the local runner
 - the host process must choose WAL and snapshot paths, expose the API, set up logging, and drive
   `tick_expirations`
+
+Current operational constraints for the Kubernetes deployment remain:
+
+- the deployed pods still run the existing replica daemon and do not add autonomous elections,
+  background expiration ticks, or checkpoint loops
+- the bundled client service is one bootstrap-primary endpoint pinned to replica `1`; failover
+  still requires an operator or a downstream controller to repoint traffic deliberately
+- the per-pod layout is regenerated from StatefulSet peer DNS on every startup so peer addresses
+  follow Kubernetes pod IP churn without changing the replicated runtime contract
 
 Related docs:
 
@@ -108,6 +118,65 @@ Current limits:
 - failover and rejoin still require external orchestration; replica daemons do not run autonomous
   elections or background catch-up loops
 - there is still no background expiration or checkpoint worker inside the replica daemons
+
+## Kubernetes Replica Deployment
+
+Command surface:
+
+- `docker build -t <image> .`
+- `kubectl apply -k deploy/kubernetes`
+- `kubectl -n allocdb-system set image statefulset/allocdb allocdb=<image>`
+- `kubectl -n allocdb-system get pods -l app.kubernetes.io/name=allocdb`
+- `kubectl -n allocdb-system logs statefulset/allocdb`
+- `kubectl -n allocdb-system port-forward svc/allocdb-primary-bootstrap 18000:18000`
+
+What the container image does:
+
+- builds `allocdb-local-cluster` and `allocdb-k8s-layout`
+- runs one small entrypoint that derives the local replica ID from the StatefulSet ordinal
+- resolves all peer pod DNS names from the headless service into concrete socket addresses
+- rewrites `<workspace>/cluster-layout.txt` on every pod startup
+- starts the existing `replica-daemon` path against that generated layout
+
+What the manifest deploys:
+
+- one namespace `allocdb-system`
+- one headless service `allocdb-internal` for peer DNS and not-ready pod discovery
+- one bootstrap client service `allocdb-primary-bootstrap` pinned to pod `allocdb-0`
+- one `3`-replica `StatefulSet` with per-replica PVCs mounted at `/var/lib/allocdb`
+- one `emptyDir` run directory for replica pid files under `/run/allocdb`
+- startup, readiness, and liveness probes driven through `allocdb-local-cluster control-status`
+
+Current durable workspace layout per pod:
+
+- `/var/lib/allocdb/cluster-layout.txt`
+- `/var/lib/allocdb/cluster-faults.txt`
+- `/var/lib/allocdb/replica-{1,2,3}/replica.metadata`
+- `/var/lib/allocdb/replica-{1,2,3}/replica.metadata.prepare`
+- `/var/lib/allocdb/replica-{1,2,3}/state.snapshot`
+- `/var/lib/allocdb/replica-{1,2,3}/state.wal`
+- `/run/allocdb/replica-{1,2,3}.pid`
+
+Recommended bootstrap flow:
+
+1. build and publish one image from the repo root `Dockerfile`
+2. update `deploy/kubernetes/statefulset.yaml` or use `kubectl set image` so the `StatefulSet`
+   points at that image
+3. apply `deploy/kubernetes`
+4. wait for all `3` replica pods to become ready
+5. send initial client traffic through `allocdb-primary-bootstrap:18000`
+6. verify local runtime health with `allocdb-local-cluster control-status --addr 127.0.0.1:17000`
+   inside one pod before admitting downstream integration traffic
+
+Current limits:
+
+- `allocdb-primary-bootstrap` is intentionally only a bootstrap-primary endpoint; it does not
+  follow failover automatically
+- the deployed shape preserves one PVC per pod, but rejoin and failover remain external
+  orchestration work
+- the replica daemon still does not drive `tick_expirations` or checkpoints in the background
+- the first manifest does not yet include NetworkPolicies, PodDisruptionBudgets, or automated
+  upgrade/rollback orchestration
 
 ## Local QEMU Testbed
 
