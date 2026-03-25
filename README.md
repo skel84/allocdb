@@ -82,3 +82,5 @@ The result is a fascinating case study: by enforcing strict determinism and "no-
 - Check out the [Jepsen Testing Report](./docs/jepsen-testing.md).
 - Publish a staging image with
   `gh workflow run publish-image.yml --ref <branch> -f image_tags=staging-<sha>,<sha>`.
+- Or push a staging tag with
+  `git tag staging-<sha> && git push origin staging-<sha>`.

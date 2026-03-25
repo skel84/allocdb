@@ -10,6 +10,7 @@ on:
         default: ""
   push:
     tags:
+      - "staging-*"
       - "v*"
 
 permissions:
