@@ -100,10 +100,7 @@ impl<K: FixedKey, V> FixedMap<K, V> {
 
     pub(crate) fn insert(&mut self, key: K, value: V) -> Result<(), FixedMapError> {
         let bucket_index = self.find_insert_bucket(key)?;
-        let slot = self
-            .free
-            .pop()
-            .ok_or(FixedMapError::Full)?;
+        let slot = self.free.pop().ok_or(FixedMapError::Full)?;
         self.slots[slot] = Some(SlotEntry { key, value });
         self.buckets[bucket_index] = Bucket::Occupied { key, slot };
         self.len += 1;

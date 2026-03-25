@@ -307,7 +307,9 @@ fn decode_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, SnapshotError> {
         .get(*cursor..end)
         .ok_or(SnapshotError::BufferTooShort)?;
     *cursor = end;
-    Ok(u16::from_le_bytes(slice.try_into().expect("slice has exact size")))
+    Ok(u16::from_le_bytes(
+        slice.try_into().expect("slice has exact size"),
+    ))
 }
 
 fn decode_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, SnapshotError> {
@@ -316,7 +318,9 @@ fn decode_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, SnapshotError> {
         .get(*cursor..end)
         .ok_or(SnapshotError::BufferTooShort)?;
     *cursor = end;
-    Ok(u32::from_le_bytes(slice.try_into().expect("slice has exact size")))
+    Ok(u32::from_le_bytes(
+        slice.try_into().expect("slice has exact size"),
+    ))
 }
 
 fn decode_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, SnapshotError> {
@@ -325,7 +329,9 @@ fn decode_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, SnapshotError> {
         .get(*cursor..end)
         .ok_or(SnapshotError::BufferTooShort)?;
     *cursor = end;
-    Ok(u64::from_le_bytes(slice.try_into().expect("slice has exact size")))
+    Ok(u64::from_le_bytes(
+        slice.try_into().expect("slice has exact size"),
+    ))
 }
 
 fn decode_u128(bytes: &[u8], cursor: &mut usize) -> Result<u128, SnapshotError> {

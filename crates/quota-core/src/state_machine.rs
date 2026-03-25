@@ -113,7 +113,8 @@ impl QuotaDb {
         context: CommandContext,
         request: ClientRequest,
     ) -> CommandOutcome {
-        if let Err(error) = self.validate_client_request_slot(context.request_slot, &request.command)
+        if let Err(error) =
+            self.validate_client_request_slot(context.request_slot, &request.command)
         {
             return Self::slot_overflow_outcome("apply_client", error);
         }
@@ -155,11 +156,11 @@ impl QuotaDb {
             return CommandOutcome::new(ResultCode::OperationTableFull);
         }
 
-        let operation_retire_after_slot = match self.operation_retire_after_slot(context.request_slot)
-        {
-            Ok(retire_after_slot) => retire_after_slot,
-            Err(error) => return Self::slot_overflow_outcome("apply_client", error),
-        };
+        let operation_retire_after_slot =
+            match self.operation_retire_after_slot(context.request_slot) {
+                Ok(retire_after_slot) => retire_after_slot,
+                Err(error) => return Self::slot_overflow_outcome("apply_client", error),
+            };
 
         let outcome = self.apply_command(context, request.command);
         let operation_record = OperationRecord {
@@ -254,10 +255,16 @@ impl QuotaDb {
         bucket_id: BucketId,
         amount: u64,
     ) -> CommandOutcome {
-        assert!(amount > 0, "validated debit amount must be strictly positive");
+        assert!(
+            amount > 0,
+            "validated debit amount must be strictly positive"
+        );
 
         let Some(_) = self.buckets.get(bucket_id) else {
-            warn!("debit rejected bucket_not_found bucket_id={}", bucket_id.get());
+            warn!(
+                "debit rejected bucket_not_found bucket_id={}",
+                bucket_id.get()
+            );
             return CommandOutcome::new(ResultCode::BucketNotFound);
         };
 
@@ -311,7 +318,8 @@ impl QuotaDb {
         );
 
         let slots_elapsed = request_slot.get() - bucket.last_refill_slot.get();
-        if slots_elapsed == 0 || bucket.refill_rate_per_slot == 0 || bucket.balance == bucket.limit {
+        if slots_elapsed == 0 || bucket.refill_rate_per_slot == 0 || bucket.balance == bucket.limit
+        {
             bucket.last_refill_slot = request_slot;
             return Ok(());
         }

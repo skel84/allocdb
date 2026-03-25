@@ -1,9 +1,7 @@
 use std::convert::Infallible;
 
 use crate::command::CommandContext;
-use crate::command_codec::{
-    CommandCodecError, decode_client_request, decode_internal_command,
-};
+use crate::command_codec::{CommandCodecError, decode_client_request, decode_internal_command};
 use crate::config::{Config, ConfigError};
 use crate::ids::{Lsn, Slot};
 use crate::snapshot::SnapshotError;
@@ -223,7 +221,10 @@ where
         .map_err(RecoveryObserverError::Observer)?;
     }
 
-    db.set_progress(replayed_wal_last_lsn.or(db.last_applied_lsn()), replay_last_request_slot);
+    db.set_progress(
+        replayed_wal_last_lsn.or(db.last_applied_lsn()),
+        replay_last_request_slot,
+    );
     Ok(RecoveryResult {
         db,
         recovered_wal,
