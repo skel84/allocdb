@@ -1,5 +1,4 @@
 # AllocDB Status
-
 ## Current State
 - Phase: replicated implementation with external Jepsen gate closed and M9 lease-kernel follow-on
   implemented and live-validated
@@ -87,6 +86,7 @@
   - operator-facing runbook for the single-node alpha, local replicated cluster runner, local QEMU testbed, and first Kubernetes deployment shape
 - Kubernetes deployment packaging:
   - one container build, one DNS-backed layout generator for `cluster-layout.txt`, and one first `deploy/kubernetes` install shape with a bootstrap-primary service and per-replica PVCs
+  - one GitHub Actions image-publish workflow for Docker Hub staging and release tags
 - Follow-on planning:
   - one draft lease-kernel follow-on plan that narrows the next trusted-core additions to bundle
     ownership, fencing, revoke, and an explicit liveness boundary, framed as generic
@@ -217,4 +217,4 @@
   `lease_safety-control` and full `1800s` `lease_safety-crash-restart` evidence on `allocdb-a`,
   both with `blockers=0`
 - the next recommended step is downstream real-cluster e2e work such as `gpu_control_plane`, not more unplanned lease-kernel semantics work
-- the current deployment slice now covers a first in-cluster `StatefulSet` shape, but bootstrap-primary routing, failover/rejoin orchestration, and background maintenance remain explicit operator work
+- the current deployment slice covers a first in-cluster `StatefulSet` shape, but bootstrap-primary routing, failover/rejoin orchestration, and background maintenance remain operator work, and the current staging unblock path is to publish `skel84/allocdb` from GitHub Actions rather than relying on the local Docker engine

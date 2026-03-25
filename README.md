@@ -70,6 +70,8 @@ The result is a fascinating case study: by enforcing strict determinism and "no-
 - **Verification:** Jepsen-tested against local QEMU and distributed KubeVirt fleets, including live lease-safety control and `1800s` crash-restart runs.
 - **Deployment Packaging:** The repo now ships a container build plus a first Kubernetes `StatefulSet`
   install under [`deploy/kubernetes`](./deploy/kubernetes).
+  The container image can also be published from GitHub Actions through
+  [`.github/workflows/publish-image.yml`](./.github/workflows/publish-image.yml).
 
 ---
 
@@ -78,3 +80,5 @@ The result is a fascinating case study: by enforcing strict determinism and "no-
 - Read the [Architecture Overview](./docs/architecture.md).
 - Explore the [TigerStyle Principles](./docs/principles.md).
 - Check out the [Jepsen Testing Report](./docs/jepsen-testing.md).
+- Publish a staging image with
+  `gh workflow run publish-image.yml --ref <branch> -f image_tags=staging-<sha>,<sha>`.
