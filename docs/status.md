@@ -1,7 +1,7 @@
 # AllocDB Status
 
 ## Current State
-- Phase: replicated implementation with external Jepsen gate closed and M9 core follow-on
+- Phase: replicated implementation with external Jepsen gate closed and M9 lease-kernel follow-on
   implemented and live-validated
 - Planning IDs: tasks use `M#-T#`; spikes use `M#-S#`
 - Current milestone status:
@@ -85,6 +85,14 @@
   - metrics exposure through the same API boundary
 - Operator documentation:
   - operator-facing runbook for the single-node alpha, local replicated cluster runner, and local QEMU testbed, including workspace layout plus current control-hook limits
+- Kubernetes deployment packaging:
+  - one container build rooted at `Dockerfile`
+  - one Kubernetes startup helper that resolves StatefulSet pod DNS into the existing
+    `cluster-layout.txt` format
+  - one first `deploy/kubernetes` install shape with a headless peer-discovery service, a
+    bootstrap-primary client service, one `StatefulSet`, and per-replica PVCs
+- Real-cluster e2e roadmap:
+  - cross-repo roadmap for the AllocDB deployment work needed to support `gpu_control_plane` e2e, documented in `docs/real-cluster-e2e-roadmap.md`
 - Follow-on planning:
   - one draft lease-kernel follow-on plan that narrows the next trusted-core additions to bundle
     ownership, fencing, revoke, and an explicit liveness boundary, framed as generic
@@ -214,5 +222,8 @@
   reserve, revoke/reclaim, and stale-holder lease paths, then closing the loop with live KubeVirt
   `lease_safety-control` and full `1800s` `lease_safety-crash-restart` evidence on `allocdb-a`,
   both with `blockers=0`
-- the next recommended step is milestone planning beyond `M9` or downstream integration work such
+- the next recommended step is the real-cluster e2e roadmap and downstream integration work such
   as `gpu_control_plane`, not more unplanned lease-kernel semantics work
+- the current deployment slice now covers a first in-cluster `StatefulSet` shape, but bootstrap
+  primary routing, failover/rejoin orchestration, and background maintenance remain explicit
+  operator work rather than automated cluster behavior

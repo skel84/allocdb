@@ -1,0 +1,11 @@
+.git
+target
+.artifacts
+.scannerwork
+.codex
+.codex-gpu
+repomix-output.txt
+gpu_plan.txt
+quotadbfork.txt
+revoked
+revoking
