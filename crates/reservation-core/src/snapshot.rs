@@ -4,7 +4,7 @@ use crate::command::{
 };
 use crate::config::{Config, ConfigError};
 use crate::fixed_map::FixedMapError;
-use crate::ids::{HoldId, Lsn, OperationId, PoolId, Slot};
+use crate::ids::{ClientId, ClientOperationKey, HoldId, Lsn, OperationId, PoolId, Slot};
 use crate::result::ResultCode;
 use crate::state_machine::{
     HoldRecord, HoldState, OperationRecord, PoolRecord, ReservationDb, ReservationInvariantError,
@@ -99,6 +99,7 @@ impl Snapshot {
         }
 
         for operation in &self.operations {
+            bytes.extend_from_slice(&operation.client_id.get().to_le_bytes());
             bytes.extend_from_slice(&operation.operation_id.get().to_le_bytes());
             encode_command(&mut bytes, operation.command);
             bytes.push(encode_result_code(operation.result_code));
@@ -157,6 +158,7 @@ impl Snapshot {
         let mut operations = Vec::with_capacity(operation_count);
         for _ in 0..operation_count {
             operations.push(OperationRecord {
+                client_id: ClientId(decode_u128(bytes, &mut cursor)?),
                 operation_id: OperationId(decode_u128(bytes, &mut cursor)?),
                 command: decode_command(bytes, &mut cursor)?,
                 result_code: decode_result_code(decode_u8(bytes, &mut cursor)?)?,
@@ -246,7 +248,7 @@ impl ReservationDb {
         let mut operation_retire_entries = Vec::new();
         for record in operations {
             operation_retire_entries.push((
-                record.operation_id,
+                ClientOperationKey::new(record.client_id, record.operation_id),
                 record.retire_after_slot,
                 record.applied_lsn.get(),
             ));
@@ -497,7 +499,7 @@ mod tests {
     use crate::{
         command::Command,
         config::Config,
-        ids::{HoldId, Lsn, OperationId, PoolId, Slot},
+        ids::{ClientId, HoldId, Lsn, OperationId, PoolId, Slot},
         result::ResultCode,
         state_machine::{HoldRecord, HoldState, OperationRecord, PoolRecord, ReservationDb},
     };
@@ -534,6 +536,7 @@ mod tests {
                 state: HoldState::Held,
             }],
             operations: vec![OperationRecord {
+                client_id: ClientId(1),
                 operation_id: OperationId(1),
                 command: Command::PlaceHold {
                     pool_id: PoolId(11),

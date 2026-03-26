@@ -3,7 +3,7 @@ use log::warn;
 use crate::command::{ClientRequest, Command, CommandContext};
 use crate::config::{Config, ConfigError};
 use crate::fixed_map::{FixedMap, FixedMapError};
-use crate::ids::{HoldId, Lsn, OperationId, PoolId, Slot};
+use crate::ids::{ClientId, ClientOperationKey, HoldId, Lsn, OperationId, PoolId, Slot};
 use crate::result::{CommandOutcome, ResultCode};
 use crate::retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
 
@@ -34,6 +34,7 @@ pub struct HoldRecord {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationRecord {
+    pub client_id: ClientId,
     pub operation_id: OperationId,
     pub command: Command,
     pub result_code: ResultCode,
@@ -80,9 +81,9 @@ pub struct ReservationDb {
     pub(crate) config: Config,
     pub(crate) pools: FixedMap<PoolId, PoolRecord>,
     pub(crate) holds: FixedMap<HoldId, HoldRecord>,
-    pub(crate) operations: FixedMap<OperationId, OperationRecord>,
+    pub(crate) operations: FixedMap<ClientOperationKey, OperationRecord>,
     pub(crate) hold_retire_queue: RetireQueue<HoldId>,
-    pub(crate) operation_retire_queue: RetireQueue<OperationId>,
+    pub(crate) operation_retire_queue: RetireQueue<ClientOperationKey>,
     pub(crate) last_applied_lsn: Option<Lsn>,
     pub(crate) last_request_slot: Option<Slot>,
 }
@@ -156,9 +157,10 @@ impl ReservationDb {
         self.begin_apply(context);
         self.retire_state(context.request_slot);
 
-        if let Some(record) = self.operations.get(request.operation_id).copied() {
+        let operation_key = ClientOperationKey::new(request.client_id, request.operation_id);
+        if let Some(record) = self.operations.get(operation_key).copied() {
             if context.request_slot.get() > record.retire_after_slot.get() {
-                let removed = self.operations.remove(request.operation_id);
+                let removed = self.operations.remove(operation_key);
                 assert!(
                     removed.is_some(),
                     "existing operation record must be removable"
@@ -171,7 +173,8 @@ impl ReservationDb {
                 };
             } else {
                 warn!(
-                    "operation_id conflict detected operation_id={}",
+                    "operation_id conflict detected client_id={} operation_id={}",
+                    request.client_id.get(),
                     request.operation_id.get()
                 );
                 return CommandOutcome::new(ResultCode::OperationConflict);
@@ -193,6 +196,7 @@ impl ReservationDb {
 
         let outcome = self.apply_command(context, request.command);
         let operation_record = OperationRecord {
+            client_id: request.client_id,
             operation_id: request.operation_id,
             command: request.command,
             result_code: outcome.result_code,
@@ -203,7 +207,7 @@ impl ReservationDb {
         };
         self.insert_operation(operation_record);
         self.push_operation_retirement(
-            operation_record.operation_id,
+            ClientOperationKey::new(operation_record.client_id, operation_record.operation_id),
             operation_record.retire_after_slot,
         );
         self.assert_invariants();
@@ -299,7 +303,7 @@ impl ReservationDb {
                 "place_hold rejected pool_not_found pool_id={}",
                 pool_id.get()
             );
-            return CommandOutcome::new(ResultCode::PoolNotFound);
+            return CommandOutcome::with_pool(ResultCode::PoolNotFound, pool_id);
         };
 
         if self.holds.contains_key(hold_id) {
@@ -351,7 +355,7 @@ impl ReservationDb {
                 "confirm_hold rejected hold_not_found hold_id={}",
                 hold_id.get()
             );
-            return CommandOutcome::new(ResultCode::HoldNotFound);
+            return CommandOutcome::with_hold(ResultCode::HoldNotFound, hold_id);
         };
 
         match hold.state {
@@ -396,7 +400,7 @@ impl ReservationDb {
                 "release_hold rejected hold_not_found hold_id={}",
                 hold_id.get()
             );
-            return CommandOutcome::new(ResultCode::HoldNotFound);
+            return CommandOutcome::with_hold(ResultCode::HoldNotFound, hold_id);
         };
 
         match hold.state {
@@ -422,7 +426,7 @@ impl ReservationDb {
                 "expire_hold rejected hold_not_found hold_id={}",
                 hold_id.get()
             );
-            return CommandOutcome::new(ResultCode::HoldNotFound);
+            return CommandOutcome::with_hold(ResultCode::HoldNotFound, hold_id);
         };
 
         match hold.state {
@@ -462,7 +466,10 @@ impl ReservationDb {
         &mut self,
         record: OperationRecord,
     ) -> Result<(), FixedMapError> {
-        self.operations.insert(record.operation_id, record)
+        self.operations.insert(
+            ClientOperationKey::new(record.client_id, record.operation_id),
+            record,
+        )
     }
 
     pub(crate) fn rebuild_hold_retire_queue(&mut self, entries: &mut Vec<(HoldId, Slot, u64)>) {
@@ -483,15 +490,15 @@ impl ReservationDb {
 
     pub(crate) fn rebuild_operation_retire_queue(
         &mut self,
-        entries: &mut Vec<(OperationId, Slot, u64)>,
+        entries: &mut Vec<(ClientOperationKey, Slot, u64)>,
     ) {
         entries.sort_unstable_by_key(|(_, retire_after_slot, applied_lsn)| {
             (retire_after_slot.get(), *applied_lsn)
         });
 
-        for (operation_id, retire_after_slot, _) in entries.drain(..) {
+        for (operation_key, retire_after_slot, _) in entries.drain(..) {
             match self.operation_retire_queue.push(RetireEntry {
-                key: operation_id,
+                key: operation_key,
                 retire_after_slot,
             }) {
                 Ok(()) => {}
@@ -520,7 +527,8 @@ impl ReservationDb {
         holds.sort_unstable_by_key(|record| record.hold_id.get());
 
         let mut operations: Vec<_> = self.operations.iter().copied().collect();
-        operations.sort_unstable_by_key(|record| record.operation_id.get());
+        operations
+            .sort_unstable_by_key(|record| (record.client_id.get(), record.operation_id.get()));
 
         crate::snapshot::Snapshot {
             last_applied_lsn: self.last_applied_lsn,
@@ -584,7 +592,8 @@ impl ReservationDb {
     }
 
     fn insert_operation(&mut self, record: OperationRecord) {
-        match self.operations.insert(record.operation_id, record) {
+        let operation_key = ClientOperationKey::new(record.client_id, record.operation_id);
+        match self.operations.insert(operation_key, record) {
             Ok(()) => {}
             Err(FixedMapError::DuplicateKey | FixedMapError::Full) => {
                 panic!("operation inserts must respect capacity and uniqueness")
@@ -592,9 +601,13 @@ impl ReservationDb {
         }
     }
 
-    fn push_operation_retirement(&mut self, operation_id: OperationId, retire_after_slot: Slot) {
+    fn push_operation_retirement(
+        &mut self,
+        operation_key: ClientOperationKey,
+        retire_after_slot: Slot,
+    ) {
         match self.operation_retire_queue.push(RetireEntry {
-            key: operation_id,
+            key: operation_key,
             retire_after_slot,
         }) {
             Ok(()) => {}
@@ -632,7 +645,7 @@ impl ReservationDb {
             if removed.is_none() {
                 warn!(
                     "operation retirement queue referenced missing operation_id={}",
-                    entry.key.get()
+                    entry.key.operation_id.get()
                 );
             }
             let popped = self.operation_retire_queue.pop_front();
@@ -698,12 +711,16 @@ mod tests {
         }
     }
 
-    fn request(operation_id: u128, command: Command) -> ClientRequest {
+    fn request_for(client_id: u128, operation_id: u128, command: Command) -> ClientRequest {
         ClientRequest {
             operation_id: OperationId(operation_id),
-            client_id: ClientId(1),
+            client_id: ClientId(client_id),
             command,
         }
+    }
+
+    fn request(operation_id: u128, command: Command) -> ClientRequest {
+        request_for(1, operation_id, command)
     }
 
     #[test]
@@ -847,6 +864,51 @@ mod tests {
 
         assert_eq!(outcome.result_code, ResultCode::OperationConflict);
         assert_eq!(db.snapshot().pools.len(), 1);
+    }
+
+    #[test]
+    fn same_operation_id_is_scoped_per_client() {
+        let mut db = ReservationDb::new(config()).unwrap();
+
+        let first = db.apply_client(
+            context(1, 1),
+            request_for(
+                1,
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 5,
+                },
+            ),
+        );
+        let second = db.apply_client(
+            context(2, 2),
+            request_for(
+                2,
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(12),
+                    total_capacity: 7,
+                },
+            ),
+        );
+        let retry = db.apply_client(
+            context(3, 3),
+            request_for(
+                2,
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(12),
+                    total_capacity: 7,
+                },
+            ),
+        );
+
+        assert_eq!(first.result_code, ResultCode::Ok);
+        assert_eq!(second.result_code, ResultCode::Ok);
+        assert_eq!(retry, second);
+        assert_eq!(db.snapshot().pools.len(), 2);
+        assert_eq!(db.snapshot().operations.len(), 2);
     }
 
     #[test]
