@@ -70,7 +70,7 @@ impl WalFile {
         recover_path(&self.path)
     }
 
-    pub fn truncate_to_valid_prefix(&self) -> Result<RecoveredWal, WalFileError> {
+    pub fn truncate_to_valid_prefix(&mut self) -> Result<RecoveredWal, WalFileError> {
         let recovered = recover_path(&self.path)?;
         let valid_prefix =
             u64::try_from(recovered.scan_result.valid_up_to).expect("valid WAL prefix must fit");
@@ -83,6 +83,8 @@ impl WalFile {
                     file.set_len(valid_prefix)?;
                     file.seek(SeekFrom::Start(valid_prefix))?;
                     file.sync_data()?;
+                    drop(file);
+                    self.file = open_append_file(&self.path)?;
                 }
             }
             ScanStopReason::Corruption { offset, error } => {

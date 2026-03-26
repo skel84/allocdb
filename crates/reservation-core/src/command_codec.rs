@@ -1,4 +1,7 @@
-use crate::command::{ClientRequest, Command};
+use crate::command::{
+    ClientRequest, Command, TAG_CONFIRM_HOLD, TAG_CREATE_POOL, TAG_EXPIRE_HOLD, TAG_PLACE_HOLD,
+    TAG_RELEASE_HOLD,
+};
 use crate::ids::{ClientId, HoldId, OperationId, PoolId, Slot};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,7 +55,7 @@ fn encode_command(bytes: &mut Vec<u8>, command: &Command) {
             pool_id,
             total_capacity,
         } => {
-            bytes.push(1);
+            bytes.push(TAG_CREATE_POOL);
             bytes.extend_from_slice(&pool_id.get().to_le_bytes());
             bytes.extend_from_slice(&total_capacity.to_le_bytes());
         }
@@ -62,22 +65,22 @@ fn encode_command(bytes: &mut Vec<u8>, command: &Command) {
             quantity,
             deadline_slot,
         } => {
-            bytes.push(2);
+            bytes.push(TAG_PLACE_HOLD);
             bytes.extend_from_slice(&pool_id.get().to_le_bytes());
             bytes.extend_from_slice(&hold_id.get().to_le_bytes());
             bytes.extend_from_slice(&quantity.to_le_bytes());
             bytes.extend_from_slice(&deadline_slot.get().to_le_bytes());
         }
         Command::ConfirmHold { hold_id } => {
-            bytes.push(3);
+            bytes.push(TAG_CONFIRM_HOLD);
             bytes.extend_from_slice(&hold_id.get().to_le_bytes());
         }
         Command::ReleaseHold { hold_id } => {
-            bytes.push(4);
+            bytes.push(TAG_RELEASE_HOLD);
             bytes.extend_from_slice(&hold_id.get().to_le_bytes());
         }
         Command::ExpireHold { hold_id } => {
-            bytes.push(5);
+            bytes.push(TAG_EXPIRE_HOLD);
             bytes.extend_from_slice(&hold_id.get().to_le_bytes());
         }
     }
@@ -85,23 +88,23 @@ fn encode_command(bytes: &mut Vec<u8>, command: &Command) {
 
 fn decode_command(cursor: &mut Cursor<'_>) -> Result<Command, CommandCodecError> {
     match cursor.read_u8()? {
-        1 => Ok(Command::CreatePool {
+        TAG_CREATE_POOL => Ok(Command::CreatePool {
             pool_id: PoolId(cursor.read_u128()?),
             total_capacity: cursor.read_u64()?,
         }),
-        2 => Ok(Command::PlaceHold {
+        TAG_PLACE_HOLD => Ok(Command::PlaceHold {
             pool_id: PoolId(cursor.read_u128()?),
             hold_id: HoldId(cursor.read_u128()?),
             quantity: cursor.read_u64()?,
             deadline_slot: Slot(cursor.read_u64()?),
         }),
-        3 => Ok(Command::ConfirmHold {
+        TAG_CONFIRM_HOLD => Ok(Command::ConfirmHold {
             hold_id: HoldId(cursor.read_u128()?),
         }),
-        4 => Ok(Command::ReleaseHold {
+        TAG_RELEASE_HOLD => Ok(Command::ReleaseHold {
             hold_id: HoldId(cursor.read_u128()?),
         }),
-        5 => Ok(Command::ExpireHold {
+        TAG_EXPIRE_HOLD => Ok(Command::ExpireHold {
             hold_id: HoldId(cursor.read_u128()?),
         }),
         value => Err(CommandCodecError::InvalidCommandTag(value)),

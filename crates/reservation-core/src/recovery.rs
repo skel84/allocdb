@@ -135,7 +135,7 @@ impl<E> From<ReplayError> for RecoveryObserverError<E> {
 pub fn recover_reservation(
     config: Config,
     snapshot_file: &SnapshotFile,
-    wal_file: &WalFile,
+    wal_file: &mut WalFile,
 ) -> Result<RecoveryResult, RecoveryError> {
     recover_reservation_with_observer(
         config,
@@ -152,7 +152,7 @@ pub fn recover_reservation(
 pub fn recover_reservation_with_observer<E, F>(
     config: Config,
     snapshot_file: &SnapshotFile,
-    wal_file: &WalFile,
+    wal_file: &mut WalFile,
     mut observer: F,
 ) -> Result<RecoveryResult, RecoveryObserverError<E>>
 where
@@ -325,7 +325,7 @@ mod tests {
             .unwrap();
         wal_file.sync().unwrap();
 
-        let recovered = recover_reservation(config(), &snapshot_file, &wal_file).unwrap();
+        let recovered = recover_reservation(config(), &snapshot_file, &mut wal_file).unwrap();
         assert_eq!(recovered.replayed_wal_frame_count, 1);
         assert_eq!(recovered.db.last_applied_lsn(), Some(Lsn(1)));
         assert_eq!(recovered.db.last_request_slot(), Some(Slot(2)));
@@ -362,7 +362,7 @@ mod tests {
             .unwrap();
         wal_file.sync().unwrap();
 
-        let error = recover_reservation(config(), &snapshot_file, &wal_file).unwrap_err();
+        let error = recover_reservation(config(), &snapshot_file, &mut wal_file).unwrap_err();
         assert!(matches!(
             error,
             RecoveryError::Replay(ReplayError::RewoundRequestSlot { .. })

@@ -1,4 +1,7 @@
 use crate::Command;
+use crate::command::{
+    TAG_CONFIRM_HOLD, TAG_CREATE_POOL, TAG_EXPIRE_HOLD, TAG_PLACE_HOLD, TAG_RELEASE_HOLD,
+};
 use crate::config::{Config, ConfigError};
 use crate::fixed_map::FixedMapError;
 use crate::ids::{HoldId, Lsn, OperationId, PoolId, Slot};
@@ -295,7 +298,7 @@ fn validate_progress_watermarks(
 fn encode_option_u64(bytes: &mut Vec<u8>, value: Option<u64>) {
     match value {
         Some(value) => {
-            bytes.push(1);
+            bytes.push(TAG_CREATE_POOL);
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         None => bytes.push(0),
@@ -344,22 +347,22 @@ fn encode_command(bytes: &mut Vec<u8>, command: Command) {
             quantity,
             deadline_slot,
         } => {
-            bytes.push(2);
+            bytes.push(TAG_PLACE_HOLD);
             bytes.extend_from_slice(&pool_id.get().to_le_bytes());
             bytes.extend_from_slice(&hold_id.get().to_le_bytes());
             bytes.extend_from_slice(&quantity.to_le_bytes());
             bytes.extend_from_slice(&deadline_slot.get().to_le_bytes());
         }
         Command::ConfirmHold { hold_id } => {
-            bytes.push(3);
+            bytes.push(TAG_CONFIRM_HOLD);
             bytes.extend_from_slice(&hold_id.get().to_le_bytes());
         }
         Command::ReleaseHold { hold_id } => {
-            bytes.push(4);
+            bytes.push(TAG_RELEASE_HOLD);
             bytes.extend_from_slice(&hold_id.get().to_le_bytes());
         }
         Command::ExpireHold { hold_id } => {
-            bytes.push(5);
+            bytes.push(TAG_EXPIRE_HOLD);
             bytes.extend_from_slice(&hold_id.get().to_le_bytes());
         }
     }
@@ -367,23 +370,23 @@ fn encode_command(bytes: &mut Vec<u8>, command: Command) {
 
 fn decode_command(bytes: &[u8], cursor: &mut usize) -> Result<Command, SnapshotError> {
     match decode_u8(bytes, cursor)? {
-        1 => Ok(Command::CreatePool {
+        TAG_CREATE_POOL => Ok(Command::CreatePool {
             pool_id: PoolId(decode_u128(bytes, cursor)?),
             total_capacity: decode_u64(bytes, cursor)?,
         }),
-        2 => Ok(Command::PlaceHold {
+        TAG_PLACE_HOLD => Ok(Command::PlaceHold {
             pool_id: PoolId(decode_u128(bytes, cursor)?),
             hold_id: HoldId(decode_u128(bytes, cursor)?),
             quantity: decode_u64(bytes, cursor)?,
             deadline_slot: Slot(decode_u64(bytes, cursor)?),
         }),
-        3 => Ok(Command::ConfirmHold {
+        TAG_CONFIRM_HOLD => Ok(Command::ConfirmHold {
             hold_id: HoldId(decode_u128(bytes, cursor)?),
         }),
-        4 => Ok(Command::ReleaseHold {
+        TAG_RELEASE_HOLD => Ok(Command::ReleaseHold {
             hold_id: HoldId(decode_u128(bytes, cursor)?),
         }),
-        5 => Ok(Command::ExpireHold {
+        TAG_EXPIRE_HOLD => Ok(Command::ExpireHold {
             hold_id: HoldId(decode_u128(bytes, cursor)?),
         }),
         value => Err(SnapshotError::InvalidCommandTag(value)),
