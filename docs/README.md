@@ -24,6 +24,8 @@
 - [Quota Engine Plan](./quota-engine-plan.md)
 - [Quota Engine Semantics](./quota-semantics.md)
 - [Quota Runtime Seam Evaluation](./quota-runtime-seam-evaluation.md)
+- [Reservation Engine Plan](./reservation-engine-plan.md)
+- [Reservation Engine Semantics](./reservation-semantics.md)
 - [Revoke Safety Slice](./revoke-safety-slice.md)
 - [Operator Runbook](./operator-runbook.md)
 - [KubeVirt Jepsen Report](./kubevirt-jepsen-report.md)
