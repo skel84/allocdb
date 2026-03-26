@@ -5,6 +5,7 @@ pub(crate) const TAG_PLACE_HOLD: u8 = 2;
 pub(crate) const TAG_CONFIRM_HOLD: u8 = 3;
 pub(crate) const TAG_RELEASE_HOLD: u8 = 4;
 pub(crate) const TAG_EXPIRE_HOLD: u8 = 5;
+pub(crate) const TAG_EXTEND_HOLD: u8 = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandContext {
@@ -42,6 +43,10 @@ pub enum Command {
     },
     ReleaseHold {
         hold_id: HoldId,
+    },
+    ExtendHold {
+        hold_id: HoldId,
+        deadline_slot: Slot,
     },
     ExpireHold {
         hold_id: HoldId,
