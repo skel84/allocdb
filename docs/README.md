@@ -17,6 +17,7 @@
 ## Engineering Docs
 
 - [Architecture](./architecture.md)
+- [Engine Authoring Boundary](./engine-authoring-boundary.md)
 - [Fault Model](./fault-model.md)
 - [Jepsen Refactor Plan](./jepsen-refactor-plan.md)
 - [Lease Kernel Design Decisions](./lease-kernel-design.md)
