@@ -155,8 +155,59 @@ impl ReservationDb {
 
         self.begin_apply(context);
         self.retire_state(context.request_slot);
+
+        if let Some(record) = self.operations.get(request.operation_id).copied() {
+            if context.request_slot.get() > record.retire_after_slot.get() {
+                let removed = self.operations.remove(request.operation_id);
+                assert!(
+                    removed.is_some(),
+                    "existing operation record must be removable"
+                );
+            } else if record.command == request.command {
+                return CommandOutcome {
+                    result_code: record.result_code,
+                    pool_id: record.result_pool_id,
+                    hold_id: record.result_hold_id,
+                };
+            } else {
+                warn!(
+                    "operation_id conflict detected operation_id={}",
+                    request.operation_id.get()
+                );
+                return CommandOutcome::new(ResultCode::OperationConflict);
+            }
+        }
+
+        if self.operations.len()
+            == usize::try_from(self.config.max_operations).expect("validated max_operations")
+        {
+            warn!("operation table is full");
+            return CommandOutcome::new(ResultCode::OperationTableFull);
+        }
+
+        let operation_retire_after_slot =
+            match self.operation_retire_after_slot(context.request_slot) {
+                Ok(retire_after_slot) => retire_after_slot,
+                Err(error) => return Self::slot_overflow_outcome(error),
+            };
+
+        let outcome = self.apply_command(context, request.command);
+        let operation_record = OperationRecord {
+            operation_id: request.operation_id,
+            command: request.command,
+            result_code: outcome.result_code,
+            result_pool_id: outcome.pool_id,
+            result_hold_id: outcome.hold_id,
+            applied_lsn: context.lsn,
+            retire_after_slot: operation_retire_after_slot,
+        };
+        self.insert_operation(operation_record);
+        self.push_operation_retirement(
+            operation_record.operation_id,
+            operation_record.retire_after_slot,
+        );
         self.assert_invariants();
-        CommandOutcome::new(ResultCode::InvalidState)
+        outcome
     }
 
     pub fn apply_internal(&mut self, context: CommandContext, command: Command) -> CommandOutcome {
@@ -166,8 +217,223 @@ impl ReservationDb {
 
         self.begin_apply(context);
         self.retire_state(context.request_slot);
+        let outcome = self.apply_command(context, command);
         self.assert_invariants();
-        CommandOutcome::new(ResultCode::InvalidState)
+        outcome
+    }
+
+    fn apply_command(&mut self, context: CommandContext, command: Command) -> CommandOutcome {
+        match command {
+            Command::CreatePool {
+                pool_id,
+                total_capacity,
+            } => self.apply_create_pool(pool_id, total_capacity),
+            Command::PlaceHold {
+                pool_id,
+                hold_id,
+                quantity,
+                deadline_slot,
+            } => self.apply_place_hold(pool_id, hold_id, quantity, deadline_slot),
+            Command::ConfirmHold { hold_id } => {
+                self.apply_confirm_hold(context.request_slot, hold_id)
+            }
+            Command::ReleaseHold { hold_id } => self.apply_release_hold(hold_id),
+            Command::ExpireHold { hold_id } => {
+                self.apply_expire_hold(context.request_slot, hold_id)
+            }
+        }
+    }
+
+    fn apply_create_pool(&mut self, pool_id: PoolId, total_capacity: u64) -> CommandOutcome {
+        if self.pools.contains_key(pool_id) {
+            warn!(
+                "create_pool rejected already_exists pool_id={}",
+                pool_id.get()
+            );
+            return CommandOutcome::with_pool(ResultCode::AlreadyExists, pool_id);
+        }
+
+        if self.pools.len() == usize::try_from(self.config.max_pools).expect("validated max_pools")
+        {
+            warn!("pool table is full");
+            return CommandOutcome::new(ResultCode::PoolTableFull);
+        }
+
+        self.insert_pool(PoolRecord {
+            pool_id,
+            total_capacity,
+            held_capacity: 0,
+            consumed_capacity: 0,
+        });
+        CommandOutcome::with_pool(ResultCode::Ok, pool_id)
+    }
+
+    fn apply_place_hold(
+        &mut self,
+        pool_id: PoolId,
+        hold_id: HoldId,
+        quantity: u64,
+        deadline_slot: Slot,
+    ) -> CommandOutcome {
+        assert!(
+            quantity > 0,
+            "validated place_hold quantity must be positive"
+        );
+
+        let Some(pool) = self.pools.get(pool_id).copied() else {
+            warn!(
+                "place_hold rejected pool_not_found pool_id={}",
+                pool_id.get()
+            );
+            return CommandOutcome::new(ResultCode::PoolNotFound);
+        };
+
+        if self.holds.contains_key(hold_id) {
+            warn!(
+                "place_hold rejected already_exists hold_id={}",
+                hold_id.get()
+            );
+            return CommandOutcome::with_hold(ResultCode::AlreadyExists, hold_id);
+        }
+
+        if self.holds.len() == usize::try_from(self.config.max_holds).expect("validated max_holds")
+        {
+            warn!("hold table is full");
+            return CommandOutcome::new(ResultCode::HoldTableFull);
+        }
+
+        let available_capacity = pool
+            .total_capacity
+            .checked_sub(pool.held_capacity + pool.consumed_capacity)
+            .expect("validated pool accounting must not exceed total capacity");
+        if quantity > available_capacity {
+            warn!(
+                "place_hold rejected insufficient_capacity pool_id={} quantity={} available={}",
+                pool_id.get(),
+                quantity,
+                available_capacity
+            );
+            return CommandOutcome::with_pool(ResultCode::InsufficientCapacity, pool_id);
+        }
+
+        let pool = self
+            .pools
+            .get_mut(pool_id)
+            .expect("pool must remain present during place_hold");
+        pool.held_capacity += quantity;
+        self.insert_hold(HoldRecord {
+            hold_id,
+            pool_id,
+            quantity,
+            deadline_slot,
+            state: HoldState::Held,
+        });
+        CommandOutcome::with_pool_and_hold(ResultCode::Ok, pool_id, hold_id)
+    }
+
+    fn apply_confirm_hold(&mut self, request_slot: Slot, hold_id: HoldId) -> CommandOutcome {
+        let Some(mut hold) = self.holds.get(hold_id).copied() else {
+            warn!(
+                "confirm_hold rejected hold_not_found hold_id={}",
+                hold_id.get()
+            );
+            return CommandOutcome::new(ResultCode::HoldNotFound);
+        };
+
+        match hold.state {
+            HoldState::Confirmed | HoldState::Released => {
+                return CommandOutcome::with_hold(ResultCode::InvalidState, hold_id);
+            }
+            HoldState::Expired => {
+                return CommandOutcome::with_hold(ResultCode::HoldExpired, hold_id);
+            }
+            HoldState::Held => {}
+        }
+
+        if request_slot.get() >= hold.deadline_slot.get() {
+            let pool = self
+                .pools
+                .get_mut(hold.pool_id)
+                .expect("hold pool must remain present during expiration");
+            pool.held_capacity -= hold.quantity;
+            hold.state = HoldState::Expired;
+            self.replace_hold(hold);
+            return CommandOutcome::with_pool_and_hold(
+                ResultCode::HoldExpired,
+                hold.pool_id,
+                hold.hold_id,
+            );
+        }
+
+        let pool = self
+            .pools
+            .get_mut(hold.pool_id)
+            .expect("hold pool must remain present during confirm");
+        pool.held_capacity -= hold.quantity;
+        pool.consumed_capacity += hold.quantity;
+        hold.state = HoldState::Confirmed;
+        self.replace_hold(hold);
+        CommandOutcome::with_pool_and_hold(ResultCode::Ok, hold.pool_id, hold.hold_id)
+    }
+
+    fn apply_release_hold(&mut self, hold_id: HoldId) -> CommandOutcome {
+        let Some(mut hold) = self.holds.get(hold_id).copied() else {
+            warn!(
+                "release_hold rejected hold_not_found hold_id={}",
+                hold_id.get()
+            );
+            return CommandOutcome::new(ResultCode::HoldNotFound);
+        };
+
+        match hold.state {
+            HoldState::Confirmed | HoldState::Released | HoldState::Expired => {
+                return CommandOutcome::with_hold(ResultCode::InvalidState, hold_id);
+            }
+            HoldState::Held => {}
+        }
+
+        let pool = self
+            .pools
+            .get_mut(hold.pool_id)
+            .expect("hold pool must remain present during release");
+        pool.held_capacity -= hold.quantity;
+        hold.state = HoldState::Released;
+        self.replace_hold(hold);
+        CommandOutcome::with_pool_and_hold(ResultCode::Ok, hold.pool_id, hold.hold_id)
+    }
+
+    fn apply_expire_hold(&mut self, request_slot: Slot, hold_id: HoldId) -> CommandOutcome {
+        let Some(mut hold) = self.holds.get(hold_id).copied() else {
+            warn!(
+                "expire_hold rejected hold_not_found hold_id={}",
+                hold_id.get()
+            );
+            return CommandOutcome::new(ResultCode::HoldNotFound);
+        };
+
+        match hold.state {
+            HoldState::Confirmed | HoldState::Released | HoldState::Expired => {
+                return CommandOutcome::with_hold(ResultCode::InvalidState, hold_id);
+            }
+            HoldState::Held => {}
+        }
+
+        if request_slot.get() < hold.deadline_slot.get() {
+            return CommandOutcome::with_pool_and_hold(
+                ResultCode::InvalidState,
+                hold.pool_id,
+                hold.hold_id,
+            );
+        }
+
+        let pool = self
+            .pools
+            .get_mut(hold.pool_id)
+            .expect("hold pool must remain present during expire");
+        pool.held_capacity -= hold.quantity;
+        hold.state = HoldState::Expired;
+        self.replace_hold(hold);
+        CommandOutcome::with_pool_and_hold(ResultCode::Ok, hold.pool_id, hold.hold_id)
     }
 
     pub(crate) fn restore_pool(&mut self, record: PoolRecord) -> Result<(), FixedMapError> {
@@ -279,6 +545,51 @@ impl ReservationDb {
         Ok(())
     }
 
+    fn insert_pool(&mut self, record: PoolRecord) {
+        match self.pools.insert(record.pool_id, record) {
+            Ok(()) => {}
+            Err(FixedMapError::DuplicateKey | FixedMapError::Full) => {
+                panic!("pool inserts must respect capacity and uniqueness")
+            }
+        }
+    }
+
+    fn insert_hold(&mut self, record: HoldRecord) {
+        match self.holds.insert(record.hold_id, record) {
+            Ok(()) => {}
+            Err(FixedMapError::DuplicateKey | FixedMapError::Full) => {
+                panic!("hold inserts must respect capacity and uniqueness")
+            }
+        }
+    }
+
+    fn replace_hold(&mut self, record: HoldRecord) {
+        let removed = self.holds.remove(record.hold_id);
+        assert!(removed.is_some(), "existing hold must be removable");
+        self.insert_hold(record);
+    }
+
+    fn insert_operation(&mut self, record: OperationRecord) {
+        match self.operations.insert(record.operation_id, record) {
+            Ok(()) => {}
+            Err(FixedMapError::DuplicateKey | FixedMapError::Full) => {
+                panic!("operation inserts must respect capacity and uniqueness")
+            }
+        }
+    }
+
+    fn push_operation_retirement(&mut self, operation_id: OperationId, retire_after_slot: Slot) {
+        match self.operation_retire_queue.push(RetireEntry {
+            key: operation_id,
+            retire_after_slot,
+        }) {
+            Ok(()) => {}
+            Err(RetireQueueError::Full) => {
+                panic!("operation retire queue must stay within operation capacity")
+            }
+        }
+    }
+
     fn begin_apply(&mut self, context: CommandContext) {
         if let Some(previous_lsn) = self.last_applied_lsn {
             assert!(
@@ -366,6 +677,21 @@ mod tests {
         }
     }
 
+    fn context(lsn: u64, request_slot: u64) -> CommandContext {
+        CommandContext {
+            lsn: Lsn(lsn),
+            request_slot: Slot(request_slot),
+        }
+    }
+
+    fn request(operation_id: u128, command: Command) -> ClientRequest {
+        ClientRequest {
+            operation_id: OperationId(operation_id),
+            client_id: ClientId(1),
+            command,
+        }
+    }
+
     #[test]
     fn new_creates_empty_db() {
         let db = ReservationDb::new(config()).unwrap();
@@ -431,26 +757,326 @@ mod tests {
     }
 
     #[test]
-    fn apply_client_advances_progress_but_does_not_implement_lifecycle_yet() {
+    fn duplicate_retry_after_success_returns_cached_outcome() {
         let mut db = ReservationDb::new(config()).unwrap();
-        let outcome = db.apply_client(
-            CommandContext {
-                lsn: Lsn(1),
-                request_slot: Slot(2),
-            },
-            ClientRequest {
-                operation_id: OperationId(11),
-                client_id: ClientId(12),
-                command: Command::CreatePool {
-                    pool_id: PoolId(13),
-                    total_capacity: 5,
-                },
+        let create = request(
+            1,
+            Command::CreatePool {
+                pool_id: PoolId(13),
+                total_capacity: 5,
             },
         );
 
-        assert_eq!(outcome.result_code, ResultCode::InvalidState);
-        assert_eq!(db.last_applied_lsn(), Some(Lsn(1)));
-        assert_eq!(db.last_request_slot(), Some(Slot(2)));
+        let first = db.apply_client(context(1, 2), create);
+        let retry = db.apply_client(context(2, 3), create);
+
+        assert_eq!(first.result_code, ResultCode::Ok);
+        assert_eq!(retry, first);
+        assert_eq!(db.snapshot().pools.len(), 1);
+        assert_eq!(db.snapshot().operations.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_retry_after_failure_returns_cached_outcome() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(13),
+                    total_capacity: 2,
+                },
+            ),
+        );
+
+        let place_hold = request(
+            2,
+            Command::PlaceHold {
+                pool_id: PoolId(13),
+                hold_id: HoldId(21),
+                quantity: 3,
+                deadline_slot: Slot(10),
+            },
+        );
+
+        let first = db.apply_client(context(2, 2), place_hold);
+        let retry = db.apply_client(context(3, 3), place_hold);
+
+        assert_eq!(first.result_code, ResultCode::InsufficientCapacity);
+        assert_eq!(retry, first);
+        assert_eq!(db.snapshot().holds.len(), 0);
+    }
+
+    #[test]
+    fn conflicting_operation_reuse_returns_conflict() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 5,
+                },
+            ),
+        );
+
+        let conflicting = request(
+            1,
+            Command::CreatePool {
+                pool_id: PoolId(12),
+                total_capacity: 7,
+            },
+        );
+        let outcome = db.apply_client(context(2, 2), conflicting);
+
+        assert_eq!(outcome.result_code, ResultCode::OperationConflict);
+        assert_eq!(db.snapshot().pools.len(), 1);
+    }
+
+    #[test]
+    fn place_hold_reduces_available_capacity_exactly_once() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 10,
+                },
+            ),
+        );
+
+        let place_hold = request(
+            2,
+            Command::PlaceHold {
+                pool_id: PoolId(11),
+                hold_id: HoldId(21),
+                quantity: 4,
+                deadline_slot: Slot(9),
+            },
+        );
+        let first = db.apply_client(context(2, 2), place_hold);
+        let retry = db.apply_client(context(3, 3), place_hold);
+
+        assert_eq!(first.result_code, ResultCode::Ok);
+        assert_eq!(retry, first);
+        assert_eq!(db.snapshot().pools[0].held_capacity, 4);
+        assert_eq!(db.snapshot().pools[0].consumed_capacity, 0);
+        assert_eq!(db.snapshot().holds[0].state, HoldState::Held);
+    }
+
+    #[test]
+    fn confirm_hold_transitions_to_confirmed_and_consumes_capacity() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 10,
+                },
+            ),
+        );
+        db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 3,
+                    deadline_slot: Slot(8),
+                },
+            ),
+        );
+
+        let outcome = db.apply_client(
+            context(3, 3),
+            request(
+                3,
+                Command::ConfirmHold {
+                    hold_id: HoldId(21),
+                },
+            ),
+        );
+
+        assert_eq!(outcome.result_code, ResultCode::Ok);
+        assert_eq!(db.snapshot().pools[0].held_capacity, 0);
+        assert_eq!(db.snapshot().pools[0].consumed_capacity, 3);
+        assert_eq!(db.snapshot().holds[0].state, HoldState::Confirmed);
+    }
+
+    #[test]
+    fn release_hold_transitions_to_released_and_frees_capacity() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 10,
+                },
+            ),
+        );
+        db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 3,
+                    deadline_slot: Slot(8),
+                },
+            ),
+        );
+
+        let outcome = db.apply_client(
+            context(3, 7),
+            request(
+                3,
+                Command::ReleaseHold {
+                    hold_id: HoldId(21),
+                },
+            ),
+        );
+
+        assert_eq!(outcome.result_code, ResultCode::Ok);
+        assert_eq!(db.snapshot().pools[0].held_capacity, 0);
+        assert_eq!(db.snapshot().pools[0].consumed_capacity, 0);
+        assert_eq!(db.snapshot().holds[0].state, HoldState::Released);
+    }
+
+    #[test]
+    fn confirm_after_deadline_expires_hold_and_releases_capacity() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 10,
+                },
+            ),
+        );
+        db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 3,
+                    deadline_slot: Slot(5),
+                },
+            ),
+        );
+
+        let outcome = db.apply_client(
+            context(3, 5),
+            request(
+                3,
+                Command::ConfirmHold {
+                    hold_id: HoldId(21),
+                },
+            ),
+        );
+
+        assert_eq!(outcome.result_code, ResultCode::HoldExpired);
+        assert_eq!(db.snapshot().pools[0].held_capacity, 0);
+        assert_eq!(db.snapshot().pools[0].consumed_capacity, 0);
+        assert_eq!(db.snapshot().holds[0].state, HoldState::Expired);
+    }
+
+    #[test]
+    fn expire_hold_transitions_to_expired_once_due() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 10,
+                },
+            ),
+        );
+        db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 3,
+                    deadline_slot: Slot(5),
+                },
+            ),
+        );
+
+        let first = db.apply_client(
+            context(3, 5),
+            request(
+                3,
+                Command::ExpireHold {
+                    hold_id: HoldId(21),
+                },
+            ),
+        );
+        let retry = db.apply_client(
+            context(4, 6),
+            request(
+                3,
+                Command::ExpireHold {
+                    hold_id: HoldId(21),
+                },
+            ),
+        );
+
+        assert_eq!(first.result_code, ResultCode::Ok);
+        assert_eq!(retry, first);
+        assert_eq!(db.snapshot().pools[0].held_capacity, 0);
+        assert_eq!(db.snapshot().holds[0].state, HoldState::Expired);
+    }
+
+    #[test]
+    fn operation_table_pressure_returns_deterministic_rejection() {
+        let mut config = config();
+        config.max_operations = 1;
+        let mut db = ReservationDb::new(config).unwrap();
+
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 10,
+                },
+            ),
+        );
+
+        let outcome = db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 1,
+                    deadline_slot: Slot(5),
+                },
+            ),
+        );
+
+        assert_eq!(outcome.result_code, ResultCode::OperationTableFull);
+        assert_eq!(db.snapshot().holds.len(), 0);
     }
 
     #[test]
