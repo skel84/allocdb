@@ -346,6 +346,7 @@ impl ReservationDb {
             deadline_slot,
             state: HoldState::Held,
         });
+        self.push_hold_expiry(hold_id, deadline_slot);
         CommandOutcome::with_pool_and_hold(ResultCode::Ok, pool_id, hold_id)
     }
 
@@ -617,6 +618,18 @@ impl ReservationDb {
         }
     }
 
+    fn push_hold_expiry(&mut self, hold_id: HoldId, deadline_slot: Slot) {
+        match self.hold_retire_queue.push(RetireEntry {
+            key: hold_id,
+            retire_after_slot: deadline_slot,
+        }) {
+            Ok(()) => {}
+            Err(RetireQueueError::Full) => {
+                panic!("hold retire queue must stay within hold capacity")
+            }
+        }
+    }
+
     fn begin_apply(&mut self, context: CommandContext) {
         if let Some(previous_lsn) = self.last_applied_lsn {
             assert!(
@@ -636,6 +649,36 @@ impl ReservationDb {
     }
 
     fn retire_state(&mut self, request_slot: Slot) {
+        while let Some(entry) = self.hold_retire_queue.front() {
+            if entry.retire_after_slot.get() >= request_slot.get() {
+                break;
+            }
+
+            let hold_id = entry.key;
+            let popped = self.hold_retire_queue.pop_front();
+            assert!(popped.is_some(), "peeked hold retirement entry must pop");
+
+            let Some(mut hold) = self.holds.get(hold_id).copied() else {
+                warn!(
+                    "hold retirement queue referenced missing hold_id={}",
+                    hold_id.get()
+                );
+                continue;
+            };
+
+            if hold.state != HoldState::Held {
+                continue;
+            }
+
+            let pool = self
+                .pools
+                .get_mut(hold.pool_id)
+                .expect("hold pool must remain present during automatic expiry");
+            pool.held_capacity -= hold.quantity;
+            hold.state = HoldState::Expired;
+            self.replace_hold(hold);
+        }
+
         while let Some(entry) = self.operation_retire_queue.front() {
             if entry.retire_after_slot.get() > request_slot.get() {
                 break;
@@ -1112,6 +1155,104 @@ mod tests {
         assert_eq!(outcome.result_code, ResultCode::HoldExpired);
         assert_eq!(db.snapshot().pools[0].held_capacity, 0);
         assert_eq!(db.snapshot().pools[0].consumed_capacity, 0);
+        assert_eq!(db.snapshot().holds[0].state, HoldState::Expired);
+    }
+
+    #[test]
+    fn overdue_hold_auto_expires_before_later_request() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 5,
+                },
+            ),
+        );
+        db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 5,
+                    deadline_slot: Slot(5),
+                },
+            ),
+        );
+
+        let outcome = db.apply_client(
+            context(3, 20),
+            request(
+                3,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(22),
+                    quantity: 5,
+                    deadline_slot: Slot(30),
+                },
+            ),
+        );
+
+        assert_eq!(outcome.result_code, ResultCode::Ok);
+        assert_eq!(outcome.pool_id, Some(PoolId(11)));
+        assert_eq!(outcome.hold_id, Some(HoldId(22)));
+        assert_eq!(db.snapshot().pools[0].held_capacity, 5);
+        assert_eq!(
+            db.snapshot()
+                .holds
+                .iter()
+                .find(|record| record.hold_id == HoldId(21))
+                .unwrap()
+                .state,
+            HoldState::Expired
+        );
+    }
+
+    #[test]
+    fn duplicate_place_hold_retry_after_deadline_returns_cached_outcome() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 5,
+                },
+            ),
+        );
+        let first = db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 5,
+                    deadline_slot: Slot(5),
+                },
+            ),
+        );
+
+        let retry = db.apply_client(
+            context(3, 6),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 5,
+                    deadline_slot: Slot(5),
+                },
+            ),
+        );
+
+        assert_eq!(retry, first);
+        assert_eq!(db.snapshot().pools[0].held_capacity, 0);
         assert_eq!(db.snapshot().holds[0].state, HoldState::Expired);
     }
 

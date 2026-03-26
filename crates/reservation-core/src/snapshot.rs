@@ -226,11 +226,13 @@ impl ReservationDb {
 
         let mut hold_retire_entries = Vec::new();
         for (ordinal, record) in holds.into_iter().enumerate() {
-            hold_retire_entries.push((
-                record.hold_id,
-                record.deadline_slot,
-                u64::try_from(ordinal).expect("hold ordinal must fit u64"),
-            ));
+            if record.state == HoldState::Held {
+                hold_retire_entries.push((
+                    record.hold_id,
+                    record.deadline_slot,
+                    u64::try_from(ordinal).expect("hold ordinal must fit u64"),
+                ));
+            }
             match db.restore_hold(record) {
                 Ok(()) => {}
                 Err(FixedMapError::DuplicateKey) => {
