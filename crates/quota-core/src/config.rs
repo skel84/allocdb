@@ -5,6 +5,7 @@ pub struct Config {
     pub max_batch_len: u32,
     pub max_client_retry_window_slots: u64,
     pub max_wal_payload_bytes: usize,
+    pub max_snapshot_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +35,9 @@ impl Config {
         if self.max_wal_payload_bytes == 0 {
             return Err(ConfigError::ZeroCapacity("max_wal_payload_bytes"));
         }
+        if self.max_snapshot_bytes == 0 {
+            return Err(ConfigError::ZeroCapacity("max_snapshot_bytes"));
+        }
         Ok(())
     }
 }
@@ -49,6 +53,7 @@ mod tests {
             max_batch_len: 8,
             max_client_retry_window_slots: 8,
             max_wal_payload_bytes: 1024,
+            max_snapshot_bytes: 4096,
         }
     }
 
@@ -66,5 +71,45 @@ mod tests {
             config.validate(),
             Err(ConfigError::ZeroCapacity("max_operations"))
         );
+    }
+
+    #[test]
+    fn validate_rejects_zero_for_each_bound() {
+        let cases = [
+            ("max_buckets", {
+                let mut cfg = config();
+                cfg.max_buckets = 0;
+                cfg
+            }),
+            ("max_operations", {
+                let mut cfg = config();
+                cfg.max_operations = 0;
+                cfg
+            }),
+            ("max_batch_len", {
+                let mut cfg = config();
+                cfg.max_batch_len = 0;
+                cfg
+            }),
+            ("max_client_retry_window_slots", {
+                let mut cfg = config();
+                cfg.max_client_retry_window_slots = 0;
+                cfg
+            }),
+            ("max_wal_payload_bytes", {
+                let mut cfg = config();
+                cfg.max_wal_payload_bytes = 0;
+                cfg
+            }),
+            ("max_snapshot_bytes", {
+                let mut cfg = config();
+                cfg.max_snapshot_bytes = 0;
+                cfg
+            }),
+        ];
+
+        for (field, cfg) in cases {
+            assert_eq!(cfg.validate(), Err(ConfigError::ZeroCapacity(field)));
+        }
     }
 }

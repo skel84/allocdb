@@ -1,3 +1,4 @@
+use crate::Command;
 use crate::config::{Config, ConfigError};
 use crate::fixed_map::FixedMapError;
 use crate::ids::{BucketId, Lsn, OperationId, Slot};
@@ -20,6 +21,8 @@ pub enum SnapshotError {
     BufferTooShort,
     InvalidMagic(u32),
     InvalidVersion(u16),
+    InvalidOptionTag(u8),
+    InvalidCommandTag(u8),
     CountTooLarge,
     InconsistentWatermarks {
         last_applied_lsn: Option<Lsn>,
@@ -77,7 +80,7 @@ impl Snapshot {
 
         for operation in &self.operations {
             bytes.extend_from_slice(&operation.operation_id.get().to_le_bytes());
-            bytes.extend_from_slice(&operation.command_fingerprint.to_le_bytes());
+            encode_command(&mut bytes, operation.command);
             bytes.push(encode_result_code(operation.result_code));
             encode_option_u128(&mut bytes, operation.result_bucket_id.map(BucketId::get));
             bytes.extend_from_slice(&operation.applied_lsn.get().to_le_bytes());
@@ -122,7 +125,7 @@ impl Snapshot {
         for _ in 0..operation_count {
             operations.push(OperationRecord {
                 operation_id: OperationId(decode_u128(bytes, &mut cursor)?),
-                command_fingerprint: decode_u128(bytes, &mut cursor)?,
+                command: decode_command(bytes, &mut cursor)?,
                 result_code: decode_result_code(decode_u8(bytes, &mut cursor)?)?,
                 result_bucket_id: decode_option_u128(bytes, &mut cursor)?.map(BucketId),
                 applied_lsn: Lsn(decode_u64(bytes, &mut cursor)?),
@@ -253,7 +256,7 @@ fn decode_option_u64(bytes: &[u8], cursor: &mut usize) -> Result<Option<u64>, Sn
     match decode_u8(bytes, cursor)? {
         0 => Ok(None),
         1 => Ok(Some(decode_u64(bytes, cursor)?)),
-        _ => Err(SnapshotError::BufferTooShort),
+        value => Err(SnapshotError::InvalidOptionTag(value)),
     }
 }
 
@@ -261,7 +264,45 @@ fn decode_option_u128(bytes: &[u8], cursor: &mut usize) -> Result<Option<u128>, 
     match decode_u8(bytes, cursor)? {
         0 => Ok(None),
         1 => Ok(Some(decode_u128(bytes, cursor)?)),
-        _ => Err(SnapshotError::BufferTooShort),
+        value => Err(SnapshotError::InvalidOptionTag(value)),
+    }
+}
+
+fn encode_command(bytes: &mut Vec<u8>, command: Command) {
+    match command {
+        Command::CreateBucket {
+            bucket_id,
+            limit,
+            initial_balance,
+            refill_rate_per_slot,
+        } => {
+            bytes.push(1);
+            bytes.extend_from_slice(&bucket_id.get().to_le_bytes());
+            bytes.extend_from_slice(&limit.to_le_bytes());
+            bytes.extend_from_slice(&initial_balance.to_le_bytes());
+            bytes.extend_from_slice(&refill_rate_per_slot.to_le_bytes());
+        }
+        Command::Debit { bucket_id, amount } => {
+            bytes.push(2);
+            bytes.extend_from_slice(&bucket_id.get().to_le_bytes());
+            bytes.extend_from_slice(&amount.to_le_bytes());
+        }
+    }
+}
+
+fn decode_command(bytes: &[u8], cursor: &mut usize) -> Result<Command, SnapshotError> {
+    match decode_u8(bytes, cursor)? {
+        1 => Ok(Command::CreateBucket {
+            bucket_id: BucketId(decode_u128(bytes, cursor)?),
+            limit: decode_u64(bytes, cursor)?,
+            initial_balance: decode_u64(bytes, cursor)?,
+            refill_rate_per_slot: decode_u64(bytes, cursor)?,
+        }),
+        2 => Ok(Command::Debit {
+            bucket_id: BucketId(decode_u128(bytes, cursor)?),
+            amount: decode_u64(bytes, cursor)?,
+        }),
+        value => Err(SnapshotError::InvalidCommandTag(value)),
     }
 }
 
@@ -349,6 +390,7 @@ fn decode_u128(bytes: &[u8], cursor: &mut usize) -> Result<u128, SnapshotError> 
 mod tests {
     use crate::{
         Config,
+        command::Command,
         ids::{BucketId, Lsn, OperationId, Slot},
         result::ResultCode,
         state_machine::{BucketRecord, OperationRecord, QuotaDb},
@@ -363,6 +405,7 @@ mod tests {
             max_batch_len: 8,
             max_client_retry_window_slots: 8,
             max_wal_payload_bytes: 1024,
+            max_snapshot_bytes: 4096,
         }
     }
 
@@ -379,7 +422,10 @@ mod tests {
             }],
             operations: vec![OperationRecord {
                 operation_id: OperationId(1),
-                command_fingerprint: 99,
+                command: Command::Debit {
+                    bucket_id: BucketId(11),
+                    amount: 2,
+                },
                 result_code: ResultCode::Ok,
                 result_bucket_id: Some(BucketId(11)),
                 applied_lsn: Lsn(3),
@@ -415,5 +461,16 @@ mod tests {
             error,
             SnapshotError::InconsistentWatermarks { .. }
         ));
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_option_tag() {
+        let mut encoded = seeded_snapshot().encode();
+        encoded[6] = 9;
+
+        assert_eq!(
+            Snapshot::decode(&encoded),
+            Err(SnapshotError::InvalidOptionTag(9))
+        );
     }
 }

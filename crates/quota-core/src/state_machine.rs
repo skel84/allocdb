@@ -19,7 +19,7 @@ pub struct BucketRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationRecord {
     pub operation_id: OperationId,
-    pub command_fingerprint: u128,
+    pub command: Command,
     pub result_code: ResultCode,
     pub result_bucket_id: Option<BucketId>,
     pub applied_lsn: Lsn,
@@ -122,7 +122,6 @@ impl QuotaDb {
         self.begin_apply(context);
         self.retire_state(context.request_slot);
 
-        let fingerprint = request.command.fingerprint();
         if let Some(record) = self.operations.get(request.operation_id).copied() {
             if context.request_slot.get() > record.retire_after_slot.get() {
                 let removed = self.operations.remove(request.operation_id);
@@ -130,7 +129,7 @@ impl QuotaDb {
                     removed.is_some(),
                     "existing operation record must be removable"
                 );
-            } else if record.command_fingerprint == fingerprint {
+            } else if record.command == request.command {
                 debug!(
                     "returning stored outcome for operation_id={} result_code={:?}",
                     request.operation_id.get(),
@@ -165,7 +164,7 @@ impl QuotaDb {
         let outcome = self.apply_command(context, request.command);
         let operation_record = OperationRecord {
             operation_id: request.operation_id,
-            command_fingerprint: fingerprint,
+            command: request.command,
             result_code: outcome.result_code,
             result_bucket_id: outcome.bucket_id,
             applied_lsn: context.lsn,
@@ -560,6 +559,7 @@ mod tests {
             max_batch_len: 8,
             max_client_retry_window_slots: 8,
             max_wal_payload_bytes: 1024,
+            max_snapshot_bytes: 4096,
         }
     }
 

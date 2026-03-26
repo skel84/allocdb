@@ -297,6 +297,7 @@ mod tests {
             max_batch_len: 8,
             max_client_retry_window_slots: 8,
             max_wal_payload_bytes: 1024,
+            max_snapshot_bytes: 4096,
         }
     }
 
@@ -304,7 +305,7 @@ mod tests {
     fn recovery_replays_frames_after_snapshot_boundary() {
         let snapshot_path = test_path("recovery-snapshot", "snapshot");
         let wal_path = test_path("recovery-wal", "wal");
-        let snapshot_file = SnapshotFile::new(&snapshot_path);
+        let snapshot_file = SnapshotFile::new(&snapshot_path, config().max_snapshot_bytes);
         let mut live = QuotaDb::new(config()).unwrap();
         let create = ClientRequest {
             operation_id: OperationId(1),
@@ -386,7 +387,7 @@ mod tests {
     fn recovery_replays_from_empty_snapshot() {
         let snapshot_path = test_path("recovery-rewound-snapshot", "snapshot");
         let wal_path = test_path("recovery-rewound-wal", "wal");
-        let snapshot_file = SnapshotFile::new(&snapshot_path);
+        let snapshot_file = SnapshotFile::new(&snapshot_path, config().max_snapshot_bytes);
         snapshot_file
             .write_snapshot(&QuotaDb::new(config()).unwrap().snapshot())
             .unwrap();
@@ -423,7 +424,7 @@ mod tests {
     fn recovery_rejects_rewound_request_slot_against_snapshot_progress() {
         let snapshot_path = test_path("recovery-rewound-snapshot-progress", "snapshot");
         let wal_path = test_path("recovery-rewound-wal-progress", "wal");
-        let snapshot_file = SnapshotFile::new(&snapshot_path);
+        let snapshot_file = SnapshotFile::new(&snapshot_path, config().max_snapshot_bytes);
         let mut db = QuotaDb::new(config()).unwrap();
         let _ = db.apply_client(
             CommandContext {
@@ -472,7 +473,7 @@ mod tests {
     fn recovery_truncates_torn_tail_without_inventing_refilled_debit() {
         let snapshot_path = test_path("recovery-torn-tail", "snapshot");
         let wal_path = test_path("recovery-torn-tail", "wal");
-        let snapshot_file = SnapshotFile::new(&snapshot_path);
+        let snapshot_file = SnapshotFile::new(&snapshot_path, config().max_snapshot_bytes);
         let mut wal = WalFile::open(&wal_path, config().max_wal_payload_bytes).unwrap();
 
         let create = ClientRequest {

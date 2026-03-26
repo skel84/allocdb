@@ -73,7 +73,7 @@ impl Frame {
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&self.payload);
 
-        let checksum = crc32c::crc32c(&bytes[8..]);
+        let checksum = crc32c::crc32c(&bytes[6..]);
         bytes[27..31].copy_from_slice(&checksum.to_le_bytes());
         bytes
     }
@@ -112,7 +112,7 @@ impl Frame {
             u32::from_le_bytes(bytes[27..31].try_into().expect("slice has exact size"));
         let mut checksum_bytes = bytes[..frame_len].to_vec();
         checksum_bytes[27..31].copy_from_slice(&0u32.to_le_bytes());
-        let computed_checksum = crc32c::crc32c(&checksum_bytes[8..]);
+        let computed_checksum = crc32c::crc32c(&checksum_bytes[6..]);
         if stored_checksum != computed_checksum {
             return Err(DecodeError::InvalidChecksum);
         }

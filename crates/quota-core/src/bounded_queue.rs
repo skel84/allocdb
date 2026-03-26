@@ -15,8 +15,8 @@ pub(crate) struct BoundedQueue<T> {
 impl<T> BoundedQueue<T> {
     #[must_use]
     pub(crate) fn with_capacity(capacity: usize) -> Self {
-        let mut entries = Vec::with_capacity(capacity.max(1));
-        entries.resize_with(capacity.max(1), || None);
+        let mut entries = Vec::with_capacity(capacity);
+        entries.resize_with(capacity, || None);
         Self {
             entries,
             head: 0,
@@ -96,5 +96,16 @@ mod tests {
 
         assert_eq!(queue.pop_front(), Some(2));
         assert_eq!(queue.pop_front(), Some(3));
+    }
+
+    #[test]
+    fn zero_capacity_queue_stays_empty_and_rejects_pushes() {
+        let mut queue = BoundedQueue::<u64>::with_capacity(0);
+
+        assert_eq!(queue.capacity(), 0);
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.iter().copied().collect::<Vec<_>>(), Vec::<u64>::new());
+        assert_eq!(queue.push(1), Err(BoundedQueueError::Full));
+        assert_eq!(queue.pop_front(), None);
     }
 }

@@ -219,7 +219,7 @@ impl<K: FixedKey, V> FixedMap<K, V> {
 
     fn bucket_index(&self, key: K) -> usize {
         let mask = self.buckets.len() - 1;
-        usize::try_from(key.hash64()).expect("hash must fit usize") & mask
+        bucket_index_from_hash(key.hash64(), mask)
     }
 
     fn next_bucket(&self, bucket: usize) -> usize {
@@ -235,11 +235,31 @@ fn hash_u128(value: u128) -> u64 {
     let bytes = value.to_le_bytes();
     let low = u64::from_le_bytes(bytes[..8].try_into().expect("slice has exact size"));
     let high = u64::from_le_bytes(bytes[8..].try_into().expect("slice has exact size"));
-    low.rotate_left(21) ^ high.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    splitmix64(low ^ high.rotate_left(32) ^ 0x9e37_79b9_7f4a_7c15)
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+#[cfg(target_pointer_width = "64")]
+fn bucket_index_from_hash(hash: u64, mask: usize) -> usize {
+    usize::try_from(hash).expect("u64 hash must fit usize on 64-bit targets") & mask
+}
+
+#[cfg(target_pointer_width = "32")]
+fn bucket_index_from_hash(hash: u64, mask: usize) -> usize {
+    usize::try_from(hash & u64::from(u32::MAX)).expect("masked 32-bit hash must fit usize") & mask
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use crate::ids::BucketId;
 
     use super::{FixedMap, FixedMapError};
@@ -274,5 +294,17 @@ mod tests {
         assert_eq!(map.remove(BucketId(7)), Some(11));
         assert_eq!(map.get(BucketId(7)), None);
         assert_eq!(map.get(BucketId(8)), Some(&12));
+    }
+
+    #[test]
+    fn hash_spreads_small_sequential_ids_across_buckets() {
+        let mut seen = BTreeSet::new();
+        let mask = 63_usize;
+
+        for value in 0_u128..16 {
+            seen.insert(super::bucket_index_from_hash(super::hash_u128(value), mask));
+        }
+
+        assert!(seen.len() >= 8);
     }
 }
