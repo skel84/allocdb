@@ -24,3 +24,19 @@ impl_id!(OperationId, u128);
 impl_id!(ClientId, u128);
 impl_id!(Lsn, u64);
 impl_id!(Slot, u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ClientOperationKey {
+    pub client_id: ClientId,
+    pub operation_id: OperationId,
+}
+
+impl ClientOperationKey {
+    #[must_use]
+    pub const fn new(client_id: ClientId, operation_id: OperationId) -> Self {
+        Self {
+            client_id,
+            operation_id,
+        }
+    }
+}

@@ -1,4 +1,4 @@
-use crate::ids::{HoldId, OperationId, PoolId};
+use crate::ids::{ClientOperationKey, HoldId, OperationId, PoolId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FixedMapError {
@@ -23,6 +23,14 @@ macro_rules! impl_fixed_key {
 impl_fixed_key!(PoolId, get);
 impl_fixed_key!(HoldId, get);
 impl_fixed_key!(OperationId, get);
+
+impl FixedKey for ClientOperationKey {
+    fn hash64(self) -> u64 {
+        splitmix64(
+            hash_u128(self.client_id.get()) ^ hash_u128(self.operation_id.get()).rotate_left(1),
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Bucket<K> {

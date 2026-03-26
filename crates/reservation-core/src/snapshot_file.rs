@@ -186,7 +186,7 @@ mod tests {
 
     use crate::{
         command::Command,
-        ids::{HoldId, Lsn, OperationId, PoolId, Slot},
+        ids::{ClientId, HoldId, Lsn, OperationId, PoolId, Slot},
         result::ResultCode,
         snapshot::Snapshot,
         state_machine::{HoldRecord, HoldState, OperationRecord, PoolRecord},
@@ -220,6 +220,7 @@ mod tests {
                 state: HoldState::Held,
             }],
             operations: vec![OperationRecord {
+                client_id: ClientId(1),
                 operation_id: OperationId(1),
                 command: Command::PlaceHold {
                     pool_id: PoolId(11),
