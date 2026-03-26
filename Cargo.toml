@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/allocdb-bench", "crates/allocdb-core", "crates/allocdb-node"]
+members = [
+    "crates/allocdb-bench",
+    "crates/allocdb-core",
+    "crates/allocdb-node",
+    "crates/quota-core",
+]
 resolver = "2"
 
 [workspace.package]

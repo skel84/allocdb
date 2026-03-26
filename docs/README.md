@@ -21,6 +21,8 @@
 - [Jepsen Refactor Plan](./jepsen-refactor-plan.md)
 - [Lease Kernel Design Decisions](./lease-kernel-design.md)
 - [Lease Kernel Follow-On](./lease-kernel-follow-on.md)
+- [Quota Engine Plan](./quota-engine-plan.md)
+- [Quota Engine Semantics](./quota-semantics.md)
 - [Revoke Safety Slice](./revoke-safety-slice.md)
 - [Operator Runbook](./operator-runbook.md)
 - [KubeVirt Jepsen Report](./kubevirt-jepsen-report.md)

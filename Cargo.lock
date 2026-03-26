@@ -211,6 +211,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "quota-core"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "log",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -203,9 +203,8 @@
   - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
 ## Current Focus
-- PR `#82` merged the `#70` maintainability follow-up, including live KubeVirt
-  `reservation_contention-control` and full `1800s`
-  `reservation_contention-crash-restart` reruns on `allocdb-a` with `blockers=0`
+- PR `#82` merged the `#70` maintainability follow-up, including live KubeVirt `reservation_contention-control`
+  and full `1800s` `reservation_contention-crash-restart` reruns on `allocdb-a` with `blockers=0`
 - `M9-T01` through `M9-T05` are merged on `main` via PR `#81`, and the planning issues are
   closed on the `AllocDB` project
 - PRs `#89`, `#90`, `#92`, `#93`, `#94`, and `#95` merged the full `M9-T06` through `M9-T11`
@@ -218,3 +217,4 @@
   both with `blockers=0`
 - the next recommended step is downstream real-cluster e2e work such as `gpu_control_plane`, not more unplanned lease-kernel semantics work
 - the current deployment slice covers a first in-cluster `StatefulSet` shape, but bootstrap-primary routing, failover/rejoin orchestration, and background maintenance remain operator work, and the current staging unblock path is to publish `skel84/allocdb` from GitHub Actions rather than relying on the local Docker engine
+- `M10` is now in implementation and review on PR `#107`: `quota-core` has a bounded in-repo second-engine proof with deterministic `CreateBucket` / `Debit`, refill, snapshot/WAL recovery, and the next remaining readout is whether any shared-runtime seam is actually justified after the second engine exists
