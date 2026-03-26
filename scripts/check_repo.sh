@@ -35,7 +35,7 @@ check_forbidden_pattern() {
 
 check_allowed_dependencies() {
   local dependency
-  local allowed='allocdb-retire-queue allocdb-wal-frame crc32c log'
+  local allowed='allocdb-retire-queue allocdb-wal-file allocdb-wal-frame crc32c log'
 
   while IFS= read -r dependency; do
     if [[ ! " $allowed " =~ [[:space:]]"$dependency"[[:space:]] ]]; then

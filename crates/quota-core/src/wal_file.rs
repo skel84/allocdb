@@ -1,13 +1,11 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::wal::{DecodeError, Frame, ScanResult, ScanStopReason, scan_frames};
+use allocdb_wal_file::AppendWalFile;
 
 #[derive(Debug)]
 pub struct WalFile {
-    path: PathBuf,
-    file: File,
+    file: AppendWalFile,
     max_payload_bytes: usize,
 }
 
@@ -38,11 +36,9 @@ impl From<std::io::Error> for WalFileError {
 
 impl WalFile {
     pub fn open(path: impl AsRef<Path>, max_payload_bytes: usize) -> Result<Self, WalFileError> {
-        let path = path.as_ref().to_path_buf();
-        let file = open_append_file(&path)?;
+        let file = AppendWalFile::open(path)?;
 
         Ok(Self {
-            path,
             file,
             max_payload_bytes,
         })
@@ -50,28 +46,26 @@ impl WalFile {
 
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        self.file.path()
     }
 
     pub fn append_frame(&mut self, frame: &Frame) -> Result<(), WalFileError> {
         self.validate_payload_len(frame)?;
-
-        let encoded = frame.encode();
-        self.file.write_all(&encoded)?;
+        self.file.append_bytes(&frame.encode())?;
         Ok(())
     }
 
     pub fn sync(&self) -> Result<(), WalFileError> {
-        self.file.sync_data()?;
+        self.file.sync()?;
         Ok(())
     }
 
     pub fn recover(&self) -> Result<RecoveredWal, WalFileError> {
-        recover_path(&self.path)
+        recover_file(&self.file)
     }
 
-    pub fn truncate_to_valid_prefix(&self) -> Result<RecoveredWal, WalFileError> {
-        let recovered = recover_path(&self.path)?;
+    pub fn truncate_to_valid_prefix(&mut self) -> Result<RecoveredWal, WalFileError> {
+        let recovered = recover_file(&self.file)?;
         let valid_prefix =
             u64::try_from(recovered.scan_result.valid_up_to).expect("valid WAL prefix must fit");
 
@@ -79,10 +73,7 @@ impl WalFile {
             ScanStopReason::CleanEof => {}
             ScanStopReason::TornTail { .. } => {
                 if recovered.file_len > valid_prefix {
-                    let mut file = OpenOptions::new().write(true).open(&self.path)?;
-                    file.set_len(valid_prefix)?;
-                    file.seek(SeekFrom::Start(valid_prefix))?;
-                    file.sync_data()?;
+                    self.file.truncate_to(valid_prefix)?;
                 }
             }
             ScanStopReason::Corruption { offset, error } => {
@@ -98,22 +89,11 @@ impl WalFile {
             self.validate_payload_len(frame)?;
         }
 
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+        let mut bytes = Vec::new();
+        for frame in frames {
+            bytes.extend_from_slice(&frame.encode());
         }
-
-        let temp_path = self.temp_path();
-        {
-            let mut temp_file = File::create(&temp_path)?;
-            for frame in frames {
-                temp_file.write_all(&frame.encode())?;
-            }
-            temp_file.sync_data()?;
-        }
-
-        fs::rename(&temp_path, &self.path)?;
-        sync_parent_dir(&self.path)?;
-        self.file = open_append_file(&self.path)?;
+        self.file.replace_with_bytes(&bytes)?;
         Ok(())
     }
 
@@ -127,48 +107,15 @@ impl WalFile {
 
         Ok(())
     }
-
-    fn temp_path(&self) -> PathBuf {
-        let mut temp_path = self.path.clone();
-        let extension = temp_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map_or_else(|| "tmp".to_owned(), |value| format!("{value}.tmp"));
-        temp_path.set_extension(extension);
-        temp_path
-    }
 }
 
-fn recover_path(path: &Path) -> Result<RecoveredWal, WalFileError> {
-    let mut file = File::open(path)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+fn recover_file(file: &AppendWalFile) -> Result<RecoveredWal, WalFileError> {
+    let bytes = file.read_all()?;
     let scan_result = scan_frames(&bytes);
     Ok(RecoveredWal {
         scan_result,
         file_len: u64::try_from(bytes.len()).expect("file length must fit into u64"),
     })
-}
-
-fn open_append_file(path: &Path) -> Result<File, std::io::Error> {
-    OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(path)
-}
-
-#[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        OpenOptions::new().read(true).open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) -> Result<(), std::io::Error> {
-    Ok(())
 }
 
 #[cfg(test)]

@@ -79,7 +79,8 @@ fn recover_allocdb_rejects_non_monotonic_lsn() {
     .unwrap();
     wal.sync().unwrap();
 
-    let error = recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &wal).unwrap_err();
+    let error =
+        recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &mut wal).unwrap_err();
     assert!(matches!(
         error,
         RecoveryError::Replay(ReplayError::NonMonotonicLsn {
@@ -126,7 +127,8 @@ fn recover_allocdb_rejects_rewound_request_slot() {
     .unwrap();
     wal.sync().unwrap();
 
-    let error = recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &wal).unwrap_err();
+    let error =
+        recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &mut wal).unwrap_err();
     assert!(matches!(
         error,
         RecoveryError::Replay(ReplayError::RewoundRequestSlot {
@@ -143,7 +145,7 @@ fn recover_allocdb_rejects_rewound_request_slot() {
 fn recover_allocdb_rejects_semantically_invalid_snapshot() {
     let wal_path = test_path("recover-invalid-snapshot", "wal");
     let snapshot_path = test_path("recover-invalid-snapshot", "snapshot");
-    let wal = WalFile::open(&wal_path, 512).unwrap();
+    let mut wal = WalFile::open(&wal_path, 512).unwrap();
     let snapshot_file = SnapshotFile::new(&snapshot_path);
 
     snapshot_file
@@ -172,7 +174,7 @@ fn recover_allocdb_rejects_semantically_invalid_snapshot() {
         })
         .unwrap();
 
-    let error = recover_allocdb(config(), &snapshot_file, &wal).unwrap_err();
+    let error = recover_allocdb(config(), &snapshot_file, &mut wal).unwrap_err();
     assert!(matches!(
         error,
         RecoveryError::Snapshot(SnapshotError::DuplicateResourceId(ResourceId(11)))

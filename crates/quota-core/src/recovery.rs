@@ -135,7 +135,7 @@ impl<E> From<ReplayError> for RecoveryObserverError<E> {
 pub fn recover_quota(
     config: Config,
     snapshot_file: &SnapshotFile,
-    wal_file: &WalFile,
+    wal_file: &mut WalFile,
 ) -> Result<RecoveryResult, RecoveryError> {
     recover_quota_with_observer(
         config,
@@ -152,7 +152,7 @@ pub fn recover_quota(
 pub fn recover_quota_with_observer<E, F>(
     config: Config,
     snapshot_file: &SnapshotFile,
-    wal_file: &WalFile,
+    wal_file: &mut WalFile,
     mut observer: F,
 ) -> Result<RecoveryResult, RecoveryObserverError<E>>
 where
@@ -374,7 +374,7 @@ mod tests {
         .unwrap();
         wal.sync().unwrap();
 
-        let recovered = recover_quota(config(), &snapshot_file, &wal).unwrap();
+        let recovered = recover_quota(config(), &snapshot_file, &mut wal).unwrap();
         assert_eq!(recovered.replayed_wal_frame_count, 2);
         assert_eq!(recovered.replayed_wal_last_lsn, Some(Lsn(3)));
         assert_eq!(recovered.db.snapshot(), live.snapshot());
@@ -412,7 +412,7 @@ mod tests {
         .unwrap();
         wal.sync().unwrap();
 
-        let recovered = recover_quota(config, &snapshot_file, &wal).unwrap();
+        let recovered = recover_quota(config, &snapshot_file, &mut wal).unwrap();
         assert_eq!(recovered.replayed_wal_frame_count, 1);
         assert_eq!(recovered.db.snapshot().buckets.len(), 1);
 
@@ -462,7 +462,7 @@ mod tests {
         .unwrap();
         wal.sync().unwrap();
 
-        let error = recover_quota(config, &snapshot_file, &wal).unwrap_err();
+        let error = recover_quota(config, &snapshot_file, &mut wal).unwrap_err();
         assert!(matches!(error, RecoveryError::Replay(_)));
 
         fs::remove_file(snapshot_path).unwrap();
@@ -517,7 +517,7 @@ mod tests {
             .write_all(&torn[..torn.len() - 3])
             .unwrap();
 
-        let recovered = recover_quota(config(), &snapshot_file, &wal).unwrap();
+        let recovered = recover_quota(config(), &snapshot_file, &mut wal).unwrap();
 
         assert!(!recovered.loaded_snapshot);
         assert_eq!(recovered.recovered_wal.scan_result.frames.len(), 1);

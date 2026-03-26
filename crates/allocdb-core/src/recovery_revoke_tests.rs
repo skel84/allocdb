@@ -89,7 +89,8 @@ fn recover_allocdb_preserves_revoking_state() {
     wal.append_frame(&client_frame(4, 2, &revoke)).unwrap();
     wal.sync().unwrap();
 
-    let recovered = recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &wal).unwrap();
+    let recovered =
+        recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &mut wal).unwrap();
     let reservation = recovered.db.reservation(ReservationId(2), Slot(2)).unwrap();
     let resource = recovered.db.resource(ResourceId(11)).unwrap();
 
@@ -156,7 +157,8 @@ fn recover_allocdb_preserves_revoked_state() {
     wal.append_frame(&client_frame(5, 3, &reclaim)).unwrap();
     wal.sync().unwrap();
 
-    let recovered = recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &wal).unwrap();
+    let recovered =
+        recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &mut wal).unwrap();
     let reservation = recovered.db.reservation(ReservationId(2), Slot(5)).unwrap();
     let resource = recovered.db.resource(ResourceId(11)).unwrap();
 

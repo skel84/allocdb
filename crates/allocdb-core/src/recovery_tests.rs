@@ -92,7 +92,7 @@ fn recover_allocdb_replays_wal_without_snapshot() {
     wal.sync().unwrap();
 
     let snapshot_file = SnapshotFile::new(&snapshot_path);
-    let recovered = recover_allocdb(config(), &snapshot_file, &wal).unwrap();
+    let recovered = recover_allocdb(config(), &snapshot_file, &mut wal).unwrap();
 
     assert!(!recovered.loaded_snapshot);
     assert_eq!(recovered.loaded_snapshot_lsn, None);
@@ -148,7 +148,7 @@ fn recover_allocdb_skips_frames_covered_by_snapshot() {
     wal.append_frame(&client_frame(3, 2, &confirm)).unwrap();
     wal.sync().unwrap();
 
-    let recovered = recover_allocdb(config(), &snapshot_file, &wal).unwrap();
+    let recovered = recover_allocdb(config(), &snapshot_file, &mut wal).unwrap();
 
     assert!(recovered.loaded_snapshot);
     assert_eq!(recovered.loaded_snapshot_lsn, Some(Lsn(1)));
@@ -193,7 +193,8 @@ fn recover_allocdb_truncates_torn_tail() {
         .write_all(&torn[..torn.len() - 2])
         .unwrap();
 
-    let recovered = recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &wal).unwrap();
+    let recovered =
+        recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &mut wal).unwrap();
 
     assert!(!recovered.loaded_snapshot);
     assert_eq!(recovered.recovered_wal.scan_result.frames.len(), 1);
@@ -212,13 +213,13 @@ fn recover_allocdb_truncates_torn_tail() {
 fn recover_allocdb_marks_empty_snapshot_as_loaded() {
     let wal_path = test_path("recover-empty-snapshot", "wal");
     let snapshot_path = test_path("recover-empty-snapshot", "snapshot");
-    let wal = WalFile::open(&wal_path, 512).unwrap();
+    let mut wal = WalFile::open(&wal_path, 512).unwrap();
     let snapshot_file = SnapshotFile::new(&snapshot_path);
     snapshot_file
         .write_snapshot(&AllocDb::new(config()).unwrap().snapshot())
         .unwrap();
 
-    let recovered = recover_allocdb(config(), &snapshot_file, &wal).unwrap();
+    let recovered = recover_allocdb(config(), &snapshot_file, &mut wal).unwrap();
 
     assert!(recovered.loaded_snapshot);
     assert_eq!(recovered.loaded_snapshot_lsn, None);
@@ -262,7 +263,8 @@ fn recover_allocdb_replays_internal_commands() {
     wal.append_frame(&internal_frame(3, 5, &expire)).unwrap();
     wal.sync().unwrap();
 
-    let recovered = recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &wal).unwrap();
+    let recovered =
+        recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &mut wal).unwrap();
 
     assert_eq!(recovered.replayed_wal_frame_count, 3);
     assert_eq!(recovered.replayed_wal_last_lsn, Some(Lsn(3)));
@@ -308,7 +310,8 @@ fn recover_allocdb_fails_closed_on_mid_log_corruption() {
     bytes[last_index] ^= 0xff;
     fs::write(&wal_path, bytes).unwrap();
 
-    let error = recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &wal).unwrap_err();
+    let error =
+        recover_allocdb(config(), &SnapshotFile::new(&snapshot_path), &mut wal).unwrap_err();
 
     assert!(matches!(
         error,

@@ -24,6 +24,7 @@ name = "allocdb-core"
 version = "0.1.0"
 dependencies = [
  "allocdb-retire-queue",
+ "allocdb-wal-file",
  "allocdb-wal-frame",
  "log",
 ]
@@ -41,6 +42,10 @@ dependencies = [
 
 [[package]]
 name = "allocdb-retire-queue"
+version = "0.1.0"
+
+[[package]]
+name = "allocdb-wal-file"
 version = "0.1.0"
 
 [[package]]
@@ -227,6 +232,7 @@ name = "quota-core"
 version = "0.1.0"
 dependencies = [
  "allocdb-retire-queue",
+ "allocdb-wal-file",
  "allocdb-wal-frame",
  "crc32c",
  "log",
@@ -275,6 +281,7 @@ name = "reservation-core"
 version = "0.1.0"
 dependencies = [
  "allocdb-retire-queue",
+ "allocdb-wal-file",
  "allocdb-wal-frame",
  "crc32c",
  "log",

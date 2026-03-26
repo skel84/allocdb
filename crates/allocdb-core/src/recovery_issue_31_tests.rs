@@ -67,7 +67,7 @@ fn recover_allocdb_rejects_client_slot_overflow_in_replayed_wal() {
     .unwrap();
     wal.sync().unwrap();
 
-    let error = recover_allocdb(config, &SnapshotFile::new(&snapshot_path), &wal).unwrap_err();
+    let error = recover_allocdb(config, &SnapshotFile::new(&snapshot_path), &mut wal).unwrap_err();
     assert!(matches!(
         error,
         RecoveryError::Replay(ReplayError::SlotOverflow {
