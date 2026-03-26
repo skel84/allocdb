@@ -233,7 +233,13 @@ impl ReservationDb {
                 hold_id,
                 quantity,
                 deadline_slot,
-            } => self.apply_place_hold(pool_id, hold_id, quantity, deadline_slot),
+            } => self.apply_place_hold(
+                context.request_slot,
+                pool_id,
+                hold_id,
+                quantity,
+                deadline_slot,
+            ),
             Command::ConfirmHold { hold_id } => {
                 self.apply_confirm_hold(context.request_slot, hold_id)
             }
@@ -270,15 +276,23 @@ impl ReservationDb {
 
     fn apply_place_hold(
         &mut self,
+        request_slot: Slot,
         pool_id: PoolId,
         hold_id: HoldId,
         quantity: u64,
         deadline_slot: Slot,
     ) -> CommandOutcome {
-        assert!(
-            quantity > 0,
-            "validated place_hold quantity must be positive"
-        );
+        if quantity == 0 || deadline_slot.get() <= request_slot.get() {
+            warn!(
+                "place_hold rejected invalid_state pool_id={} hold_id={} quantity={} deadline_slot={} request_slot={}",
+                pool_id.get(),
+                hold_id.get(),
+                quantity,
+                deadline_slot.get(),
+                request_slot.get()
+            );
+            return CommandOutcome::with_pool_and_hold(ResultCode::InvalidState, pool_id, hold_id);
+        }
 
         let Some(pool) = self.pools.get(pool_id).copied() else {
             warn!(
@@ -869,6 +883,51 @@ mod tests {
     }
 
     #[test]
+    fn place_hold_rejects_zero_quantity_and_elapsed_deadline() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 10,
+                },
+            ),
+        );
+
+        let zero_quantity = db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 0,
+                    deadline_slot: Slot(5),
+                },
+            ),
+        );
+        let elapsed_deadline = db.apply_client(
+            context(3, 4),
+            request(
+                3,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(22),
+                    quantity: 1,
+                    deadline_slot: Slot(4),
+                },
+            ),
+        );
+
+        assert_eq!(zero_quantity.result_code, ResultCode::InvalidState);
+        assert_eq!(elapsed_deadline.result_code, ResultCode::InvalidState);
+        assert_eq!(db.snapshot().holds.len(), 0);
+        assert_eq!(db.snapshot().pools[0].held_capacity, 0);
+    }
+
+    #[test]
     fn confirm_hold_transitions_to_confirmed_and_consumes_capacity() {
         let mut db = ReservationDb::new(config()).unwrap();
         db.apply_client(
@@ -1077,6 +1136,88 @@ mod tests {
 
         assert_eq!(outcome.result_code, ResultCode::OperationTableFull);
         assert_eq!(db.snapshot().holds.len(), 0);
+    }
+
+    #[test]
+    fn snapshot_restore_and_replay_preserve_suffix_outcomes() {
+        let mut live = ReservationDb::new(config()).unwrap();
+        let prefix = [
+            (
+                context(1, 1),
+                request(
+                    1,
+                    Command::CreatePool {
+                        pool_id: PoolId(11),
+                        total_capacity: 10,
+                    },
+                ),
+            ),
+            (
+                context(2, 2),
+                request(
+                    2,
+                    Command::PlaceHold {
+                        pool_id: PoolId(11),
+                        hold_id: HoldId(21),
+                        quantity: 3,
+                        deadline_slot: Slot(8),
+                    },
+                ),
+            ),
+        ];
+
+        for (ctx, req) in prefix {
+            let _ = live.apply_client(ctx, req);
+        }
+
+        let checkpoint = live.snapshot();
+        let suffix = [
+            (
+                context(3, 3),
+                request(
+                    2,
+                    Command::PlaceHold {
+                        pool_id: PoolId(11),
+                        hold_id: HoldId(21),
+                        quantity: 3,
+                        deadline_slot: Slot(8),
+                    },
+                ),
+            ),
+            (
+                context(4, 4),
+                request(
+                    3,
+                    Command::ConfirmHold {
+                        hold_id: HoldId(21),
+                    },
+                ),
+            ),
+            (
+                context(5, 5),
+                request(
+                    3,
+                    Command::ConfirmHold {
+                        hold_id: HoldId(21),
+                    },
+                ),
+            ),
+        ];
+
+        let live_outcomes: Vec<_> = suffix
+            .iter()
+            .map(|(ctx, req)| live.apply_client(*ctx, *req))
+            .collect();
+        let live_final = live.snapshot();
+
+        let mut replay = ReservationDb::from_snapshot(config(), checkpoint.clone()).unwrap();
+        let replay_outcomes: Vec<_> = suffix
+            .iter()
+            .map(|(ctx, req)| replay.apply_client(*ctx, *req))
+            .collect();
+
+        assert_eq!(replay_outcomes, live_outcomes);
+        assert_eq!(replay.snapshot(), live_final);
     }
 
     #[test]
