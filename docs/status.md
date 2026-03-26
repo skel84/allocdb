@@ -1,6 +1,6 @@
 # AllocDB Status
 ## Current State
-- Phase: replicated implementation with external Jepsen gate closed, M9 lease-kernel follow-on live-validated, and M10 second-engine proof merged
+- Phase: replicated implementation with external Jepsen gate closed, M9 lease-kernel follow-on live-validated, M10 second-engine proof merged, and M11 third-engine planning staged
 - Planning IDs: tasks use `M#-T#`; spikes use `M#-S#`
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
@@ -15,6 +15,7 @@
   - `M8` external cluster validation: in progress
   - `M9` generic lease-kernel follow-on: implementation merged on `main`
   - `M10` second-engine proof: merged on `main`; shared runtime extraction deferred
+  - `M11` third-engine proof: reservation-core planning staged; implementation not started
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -203,8 +204,7 @@
   - local cluster, qemu assets, Jepsen harness, and benchmarks: `cargo test -p allocdb-node local_cluster -- --nocapture`, `cargo test -p allocdb-node qemu_testbed -- --nocapture`, `cargo test -p allocdb-node jepsen -- --nocapture`, `cargo test -p allocdb-node --bin allocdb-jepsen -- --nocapture`, `cargo run -p allocdb-node --bin allocdb-jepsen -- plan`, `cargo run -p allocdb-bench -- --scenario all`
   - repo gate: `scripts/preflight.sh`
 ## Current Focus
-- PR `#82` merged the `#70` maintainability follow-up, including live KubeVirt `reservation_contention-control`
-  and full `1800s` `reservation_contention-crash-restart` reruns on `allocdb-a` with `blockers=0`
+- PR `#82` merged the `#70` maintainability follow-up, including live KubeVirt `reservation_contention-control` and full `1800s` `reservation_contention-crash-restart` reruns on `allocdb-a` with `blockers=0`
 - `M9-T01` through `M9-T05` are merged on `main` via PR `#81`, and the planning issues are
   closed on the `AllocDB` project
 - PRs `#89`, `#90`, `#92`, `#93`, `#94`, and `#95` merged the full `M9-T06` through `M9-T11`
@@ -216,5 +216,5 @@
   `lease_safety-control` and full `1800s` `lease_safety-crash-restart` evidence on `allocdb-a`,
   both with `blockers=0`
 - the next recommended step remains downstream real-cluster e2e work such as `gpu_control_plane`, not more unplanned lease-kernel semantics work; the current deployment slice covers a first in-cluster `StatefulSet` shape, but bootstrap-primary routing, failover/rejoin orchestration, and background maintenance remain operator work, and the current staging unblock path is to publish `skel84/allocdb` from GitHub Actions rather than relying on the local Docker engine
-- PR `#107` merged the `M10` quota-engine proof on `main`: `quota-core` now proves a second deterministic engine in-repo with bounded `CreateBucket` / `Debit`, logical-slot refill, and snapshot/WAL recovery
-- the `M10-T05` seam evaluation concludes that a shared runtime crate is still premature: `retire_queue` is the closest mechanical extraction candidate, but `fixed_map`, `wal`, `wal_file`, recovery, snapshot schema, and all state-machine layers should remain engine-local until repeated maintenance pressure justifies extraction
+- PR `#107` merged the `M10` quota-engine proof on `main`: `quota-core` now proves a second deterministic engine in-repo with bounded `CreateBucket` / `Debit`, logical-slot refill, and snapshot/WAL recovery; the `M10-T05` seam evaluation still concludes that shared runtime extraction is premature, with `retire_queue` the closest candidate and the rest still engine-local
+- the next engine recommendation, if the goal is library extraction truth rather than immediate product pull, is `reservation-core`: the v1 plan narrows the third-engine experiment to `CreatePool`, `PlaceHold`, `ConfirmHold`, `ReleaseHold`, and logical-slot `ExpireHold` to pressure expiry, terminal-state, and recovery seams harder than `quota-core` did
