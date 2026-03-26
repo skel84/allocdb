@@ -1,0 +1,11 @@
+[package]
+name = "allocdb-wal-frame"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crc32c = "0.6.8"
+
+[lints]
+workspace = true
