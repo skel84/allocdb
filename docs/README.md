@@ -27,6 +27,7 @@
 - [Reservation Engine Plan](./reservation-engine-plan.md)
 - [Reservation Engine Semantics](./reservation-semantics.md)
 - [Reservation Runtime Seam Evaluation](./reservation-runtime-seam-evaluation.md)
+- [Runtime Extraction Roadmap](./runtime-extraction-roadmap.md)
 - [Revoke Safety Slice](./revoke-safety-slice.md)
 - [Operator Runbook](./operator-runbook.md)
 - [KubeVirt Jepsen Report](./kubevirt-jepsen-report.md)

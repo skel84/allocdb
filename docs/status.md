@@ -1,6 +1,6 @@
 # AllocDB Status
 ## Current State
-- Phase: replicated implementation with external Jepsen gate closed, M9 lease-kernel follow-on live-validated, M10 second-engine proof merged, and M11 third-engine proof merged
+- Phase: replicated implementation with external Jepsen gate closed, M9 lease-kernel follow-on live-validated, M10 second-engine proof merged, M11 third-engine proof merged, and M12 runtime-extraction roadmap staged
 - Planning IDs: tasks use `M#-T#`; spikes use `M#-S#`
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
@@ -16,6 +16,7 @@
   - `M9` generic lease-kernel follow-on: implementation merged on `main`
   - `M10` second-engine proof: merged on `main`; shared runtime extraction deferred
   - `M11` third-engine proof: merged on `main`; broad shared runtime still deferred, first micro-extraction now justified
+  - `M12` first internal runtime extractions: planned
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -212,9 +213,8 @@
   simulation coverage are now all in the mainline implementation
 - PR `#97` merged issue `#96`, extending Jepsen history generation and analysis for bundle
   reserve, revoke/reclaim, and stale-holder lease paths, then closing the loop with live KubeVirt
-  `lease_safety-control` and full `1800s` `lease_safety-crash-restart` evidence on `allocdb-a`,
-  both with `blockers=0`
+  `lease_safety-control` and full `1800s` `lease_safety-crash-restart` evidence on `allocdb-a` with `blockers=0`
 - the next recommended step remains downstream real-cluster e2e work such as `gpu_control_plane`, not more unplanned lease-kernel semantics work; the current deployment slice covers a first in-cluster `StatefulSet` shape, but bootstrap-primary routing, failover/rejoin orchestration, and background maintenance remain operator work, and the current staging unblock path is to publish `skel84/allocdb` from GitHub Actions rather than relying on the local Docker engine
-- PR `#107` merged the `M10` quota-engine proof on `main`: `quota-core` now proves a second deterministic engine in-repo with bounded `CreateBucket` / `Debit`, logical-slot refill, and snapshot/WAL recovery; the `M10-T05` seam evaluation still concludes that shared runtime extraction is premature, with `retire_queue` the closest candidate and the rest still engine-local
-- PRs `#116`, `#117`, and `#118` merged the full `M11` reservation-core chain on `main`: scaffold, deterministic hold lifecycle, logical-slot overdue expiry, and expiry/recovery proof are now in the mainline implementation
-- PR `#118` also closes the third-engine readout: `retire_queue` is now the first justified internal extraction candidate across all three engines, while a broad `dsm-runtime` or public DB-building library is still premature; `wal`, `wal_file`, and `snapshot_file` are the next likely internal seams only after that micro-extraction lands
+- PR `#107` merged the `M10` quota-engine proof on `main`, and PRs `#116`, `#117`, and `#118` merged the full `M11` reservation-core chain on `main`: the repository now has a second and third deterministic engine with bounded command sets, logical-slot refill/expiry, and snapshot/WAL recovery proofs
+- the `M10-T05` and `M11-T05` readouts still defer broad shared-runtime extraction: `retire_queue` is the first justified internal extraction candidate, while `wal`, `wal_file`, and `snapshot_file` remain the next likely seams only after that micro-extraction lands
+- the next roadmap is now explicit in `runtime-extraction-roadmap.md`: start with `retire_queue`, then `wal`, then `wal_file`, and only then decide whether `snapshot_file` is still clean enough to extract before defining the internal authoring contract and asking for a fourth-engine or reduced-copy proof
