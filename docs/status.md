@@ -1,7 +1,6 @@
 # AllocDB Status
 ## Current State
-- Phase: replicated implementation with external Jepsen gate closed and M9 lease-kernel follow-on
-  implemented and live-validated
+- Phase: replicated implementation with external Jepsen gate closed, M9 lease-kernel follow-on live-validated, and M10 second-engine proof merged
 - Planning IDs: tasks use `M#-T#`; spikes use `M#-S#`
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
@@ -15,6 +14,7 @@
   - `M7` replicated core prototype: in progress
   - `M8` external cluster validation: in progress
   - `M9` generic lease-kernel follow-on: implementation merged on `main`
+  - `M10` second-engine proof: merged on `main`; shared runtime extraction deferred
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
