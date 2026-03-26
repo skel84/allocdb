@@ -29,7 +29,13 @@ pub struct ScanResult {
 impl Frame {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        self.to_raw().encode_with(FORMAT)
+        RawFrame::encode_parts(
+            FORMAT,
+            self.lsn.get(),
+            self.request_slot.get(),
+            self.record_type,
+            &self.payload,
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
@@ -38,15 +44,6 @@ impl Frame {
 
     pub fn encoded_len(bytes: &[u8]) -> Result<usize, DecodeError> {
         RawFrame::encoded_len_with(bytes, FORMAT)
-    }
-
-    fn to_raw(&self) -> RawFrame {
-        RawFrame {
-            lsn: self.lsn.get(),
-            request_slot: self.request_slot.get(),
-            record_type: self.record_type,
-            payload: self.payload.clone(),
-        }
     }
 
     fn from_raw(frame: RawFrame) -> Self {

@@ -66,17 +66,34 @@ pub enum ScanStopReason {
 impl RawFrame {
     #[must_use]
     pub fn encode_with(&self, format: WalFormat) -> Vec<u8> {
+        Self::encode_parts(
+            format,
+            self.lsn,
+            self.request_slot,
+            self.record_type,
+            &self.payload,
+        )
+    }
+
+    #[must_use]
+    pub fn encode_parts(
+        format: WalFormat,
+        lsn: u64,
+        request_slot: u64,
+        record_type: RecordType,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let payload_len =
-            u32::try_from(self.payload.len()).expect("payload length must fit in u32 for WAL");
-        let mut bytes = Vec::with_capacity(HEADER_LEN + self.payload.len());
+            u32::try_from(payload.len()).expect("payload length must fit in u32 for WAL");
+        let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
         bytes.extend_from_slice(&format.magic.to_le_bytes());
         bytes.extend_from_slice(&VERSION.to_le_bytes());
-        bytes.extend_from_slice(&self.lsn.to_le_bytes());
-        bytes.extend_from_slice(&self.request_slot.to_le_bytes());
-        bytes.push(self.record_type.encode());
+        bytes.extend_from_slice(&lsn.to_le_bytes());
+        bytes.extend_from_slice(&request_slot.to_le_bytes());
+        bytes.push(record_type.encode());
         bytes.extend_from_slice(&payload_len.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&self.payload);
+        bytes.extend_from_slice(payload);
 
         let checksum = crc32c::crc32c(&bytes[format.checksum_start..]);
         bytes[27..31].copy_from_slice(&checksum.to_le_bytes());
@@ -108,7 +125,7 @@ impl RawFrame {
         let record_type = RecordType::decode(bytes[22])?;
         let payload_len =
             u32::from_le_bytes(bytes[23..27].try_into().expect("slice has exact size"));
-        let payload_len = usize::try_from(payload_len).expect("u32 payload must fit usize");
+        let payload_len = usize::try_from(payload_len).map_err(|_| DecodeError::PayloadTooLarge)?;
         let frame_len = HEADER_LEN + payload_len;
         if bytes.len() < frame_len {
             return Err(DecodeError::BufferTooShort);

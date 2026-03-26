@@ -25,7 +25,6 @@ version = "0.1.0"
 dependencies = [
  "allocdb-retire-queue",
  "allocdb-wal-frame",
- "crc32c",
  "log",
 ]
 

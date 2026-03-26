@@ -34,7 +34,13 @@ impl Frame {
     /// Panics if the payload length does not fit into `u32`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        self.to_raw().encode_with(FORMAT)
+        RawFrame::encode_parts(
+            FORMAT,
+            self.lsn.get(),
+            self.request_slot.get(),
+            self.record_type,
+            &self.payload,
+        )
     }
 
     /// Decodes one complete WAL frame.
@@ -62,15 +68,6 @@ impl Frame {
     /// Panics only if the implementation's fixed header layout assumptions are violated.
     pub fn encoded_len(bytes: &[u8]) -> Result<usize, DecodeError> {
         RawFrame::encoded_len_with(bytes, FORMAT)
-    }
-
-    fn to_raw(&self) -> RawFrame {
-        RawFrame {
-            lsn: self.lsn.get(),
-            request_slot: self.request_slot.get(),
-            record_type: self.record_type,
-            payload: self.payload.clone(),
-        }
     }
 
     fn from_raw(frame: RawFrame) -> Self {
