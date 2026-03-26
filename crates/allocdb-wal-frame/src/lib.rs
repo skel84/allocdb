@@ -125,8 +125,7 @@ impl RawFrame {
         let record_type = RecordType::decode(bytes[22])?;
         let payload_len =
             u32::from_le_bytes(bytes[23..27].try_into().expect("slice has exact size"));
-        let payload_len = usize::try_from(payload_len).map_err(|_| DecodeError::PayloadTooLarge)?;
-        let frame_len = HEADER_LEN + payload_len;
+        let frame_len = checked_frame_len(payload_len)?;
         if bytes.len() < frame_len {
             return Err(DecodeError::BufferTooShort);
         }
@@ -169,9 +168,15 @@ impl RawFrame {
         let _ = RecordType::decode(bytes[22])?;
         let payload_len =
             u32::from_le_bytes(bytes[23..27].try_into().expect("slice has exact size"));
-        let payload_len = usize::try_from(payload_len).map_err(|_| DecodeError::PayloadTooLarge)?;
-        Ok(HEADER_LEN + payload_len)
+        checked_frame_len(payload_len)
     }
+}
+
+fn checked_frame_len(payload_len: u32) -> Result<usize, DecodeError> {
+    let payload_len = usize::try_from(payload_len).map_err(|_| DecodeError::PayloadTooLarge)?;
+    HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(DecodeError::PayloadTooLarge)
 }
 
 #[must_use]
@@ -226,7 +231,7 @@ pub fn scan_frames_with(bytes: &[u8], format: WalFormat) -> ScanResult {
 mod tests {
     use super::{
         DecodeError, HEADER_LEN, RawFrame, RecordType, ScanStopReason, VERSION, WalFormat,
-        scan_frames_with,
+        checked_frame_len, scan_frames_with,
     };
 
     const FORMAT_FROM_HEADER: WalFormat = WalFormat {
@@ -283,6 +288,73 @@ mod tests {
     }
 
     #[test]
+    fn invalid_magic_is_rejected() {
+        let mut encoded = frame(7, 11, b"abc").encode_with(FORMAT_FROM_HEADER);
+        encoded[0] ^= 0xff;
+
+        assert!(matches!(
+            RawFrame::decode_with(&encoded, FORMAT_FROM_HEADER),
+            Err(DecodeError::InvalidMagic(_))
+        ));
+        assert!(matches!(
+            RawFrame::encoded_len_with(&encoded, FORMAT_FROM_HEADER),
+            Err(DecodeError::InvalidMagic(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_version_is_rejected() {
+        let mut encoded = frame(7, 11, b"abc").encode_with(FORMAT_FROM_HEADER);
+        encoded[4..6].copy_from_slice(&0xffffu16.to_le_bytes());
+
+        assert!(matches!(
+            RawFrame::decode_with(&encoded, FORMAT_FROM_HEADER),
+            Err(DecodeError::InvalidVersion(0xffff))
+        ));
+        assert!(matches!(
+            RawFrame::encoded_len_with(&encoded, FORMAT_FROM_HEADER),
+            Err(DecodeError::InvalidVersion(0xffff))
+        ));
+    }
+
+    #[test]
+    fn invalid_record_type_is_rejected() {
+        let mut encoded = frame(7, 11, b"abc").encode_with(FORMAT_FROM_HEADER);
+        encoded[22] = 0xff;
+
+        assert_eq!(
+            RawFrame::decode_with(&encoded, FORMAT_FROM_HEADER),
+            Err(DecodeError::InvalidRecordType(0xff))
+        );
+        assert_eq!(
+            RawFrame::encoded_len_with(&encoded, FORMAT_FROM_HEADER),
+            Err(DecodeError::InvalidRecordType(0xff))
+        );
+    }
+
+    #[test]
+    fn header_only_returns_buffer_too_short() {
+        let encoded = frame(7, 11, b"payload").encode_with(FORMAT_FROM_HEADER);
+
+        assert_eq!(
+            RawFrame::decode_with(&encoded[..HEADER_LEN], FORMAT_FROM_HEADER),
+            Err(DecodeError::BufferTooShort)
+        );
+    }
+
+    #[test]
+    fn empty_payload_round_trips() {
+        let encoded = frame(7, 11, b"").encode_with(FORMAT_FROM_HEADER);
+        let decoded = RawFrame::decode_with(&encoded, FORMAT_FROM_HEADER).unwrap();
+
+        assert_eq!(decoded, frame(7, 11, b""));
+        assert_eq!(
+            RawFrame::encoded_len_with(&encoded, FORMAT_FROM_HEADER).unwrap(),
+            HEADER_LEN
+        );
+    }
+
+    #[test]
     fn scan_reports_torn_tail() {
         let mut bytes = frame(1, 1, b"one").encode_with(FORMAT_FROM_HEADER);
         let second = frame(2, 2, b"two").encode_with(FORMAT_FROM_HEADER);
@@ -297,5 +369,36 @@ mod tests {
                 offset: frame(1, 1, b"one").encode_with(FORMAT_FROM_HEADER).len(),
             }
         );
+    }
+
+    #[test]
+    fn scan_reports_corruption_in_middle_of_stream() {
+        let mut bytes = frame(1, 1, b"one").encode_with(FORMAT_FROM_HEADER);
+        let first_len = bytes.len();
+        let mut second = frame(2, 2, b"two").encode_with(FORMAT_FROM_HEADER);
+        second[HEADER_LEN] ^= 0xff;
+        bytes.extend_from_slice(&second);
+
+        let scanned = scan_frames_with(&bytes, FORMAT_FROM_HEADER);
+
+        assert_eq!(scanned.frames, vec![frame(1, 1, b"one")]);
+        assert_eq!(scanned.valid_up_to, first_len);
+        assert_eq!(
+            scanned.stop_reason,
+            ScanStopReason::Corruption {
+                offset: first_len,
+                error: DecodeError::InvalidChecksum,
+            }
+        );
+    }
+
+    #[test]
+    fn checked_frame_len_handles_platform_payload_limits() {
+        let max_len = checked_frame_len(u32::MAX);
+        if usize::BITS >= 64 {
+            assert_eq!(max_len, Ok(HEADER_LEN + u32::MAX as usize));
+        } else {
+            assert_eq!(max_len, Err(DecodeError::PayloadTooLarge));
+        }
     }
 }
