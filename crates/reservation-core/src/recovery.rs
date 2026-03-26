@@ -265,16 +265,18 @@ fn validate_replay_order(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::{
-        command::{ClientRequest, Command},
+        command::{ClientRequest, Command, CommandContext},
         command_codec::encode_client_request,
         config::Config,
-        ids::{ClientId, Lsn, OperationId, PoolId, Slot},
+        ids::{ClientId, HoldId, Lsn, OperationId, PoolId, Slot},
         snapshot_file::SnapshotFile,
-        state_machine::{PoolRecord, ReservationDb},
+        state_machine::{HoldState, PoolRecord, ReservationDb},
         wal::{Frame, RecordType},
         wal_file::WalFile,
     };
@@ -367,6 +369,215 @@ mod tests {
             error,
             RecoveryError::Replay(ReplayError::RewoundRequestSlot { .. })
         ));
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn recovery_matches_live_path_when_next_request_expires_overdue_hold() {
+        let snapshot_path = temp_path("snapshot-expiry-live-match", "snapshot");
+        let wal_path = temp_path("wal-expiry-live-match", "wal");
+        let snapshot_file = SnapshotFile::new(&snapshot_path, 4096);
+        let mut wal_file = WalFile::open(&wal_path, 1024).unwrap();
+
+        let prefix = [
+            Frame {
+                lsn: Lsn(1),
+                request_slot: Slot(1),
+                record_type: RecordType::ClientCommand,
+                payload: encode_client_request(ClientRequest {
+                    operation_id: OperationId(1),
+                    client_id: ClientId(1),
+                    command: Command::CreatePool {
+                        pool_id: PoolId(11),
+                        total_capacity: 5,
+                    },
+                }),
+            },
+            Frame {
+                lsn: Lsn(2),
+                request_slot: Slot(2),
+                record_type: RecordType::ClientCommand,
+                payload: encode_client_request(ClientRequest {
+                    operation_id: OperationId(2),
+                    client_id: ClientId(1),
+                    command: Command::PlaceHold {
+                        pool_id: PoolId(11),
+                        hold_id: HoldId(21),
+                        quantity: 5,
+                        deadline_slot: Slot(5),
+                    },
+                }),
+            },
+        ];
+        for frame in prefix {
+            wal_file.append_frame(&frame).unwrap();
+        }
+        wal_file.sync().unwrap();
+
+        let mut live = ReservationDb::new(config()).unwrap();
+        let _ = live.apply_client(
+            CommandContext {
+                lsn: Lsn(1),
+                request_slot: Slot(1),
+            },
+            ClientRequest {
+                operation_id: OperationId(1),
+                client_id: ClientId(1),
+                command: Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 5,
+                },
+            },
+        );
+        let _ = live.apply_client(
+            CommandContext {
+                lsn: Lsn(2),
+                request_slot: Slot(2),
+            },
+            ClientRequest {
+                operation_id: OperationId(2),
+                client_id: ClientId(1),
+                command: Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 5,
+                    deadline_slot: Slot(5),
+                },
+            },
+        );
+
+        let mut recovered = recover_reservation(config(), &snapshot_file, &mut wal_file).unwrap();
+        let request = ClientRequest {
+            operation_id: OperationId(3),
+            client_id: ClientId(1),
+            command: Command::CreatePool {
+                pool_id: PoolId(12),
+                total_capacity: 1,
+            },
+        };
+        let context = CommandContext {
+            lsn: Lsn(3),
+            request_slot: Slot(20),
+        };
+
+        let live_outcome = live.apply_client(context, request);
+        let recovered_outcome = recovered.db.apply_client(context, request);
+
+        assert_eq!(recovered_outcome, live_outcome);
+        assert_eq!(recovered.db.snapshot(), live.snapshot());
+        assert_eq!(
+            recovered
+                .db
+                .snapshot()
+                .holds
+                .iter()
+                .find(|record| record.hold_id == HoldId(21))
+                .unwrap()
+                .state,
+            HoldState::Expired
+        );
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn recovery_truncates_torn_expire_frame_without_fabricating_expired_state() {
+        let snapshot_path = temp_path("snapshot-torn-expire", "snapshot");
+        let wal_path = temp_path("wal-torn-expire", "wal");
+        let snapshot_file = SnapshotFile::new(&snapshot_path, 4096);
+        let mut wal_file = WalFile::open(&wal_path, 1024).unwrap();
+
+        let create_pool = ClientRequest {
+            operation_id: OperationId(1),
+            client_id: ClientId(1),
+            command: Command::CreatePool {
+                pool_id: PoolId(11),
+                total_capacity: 5,
+            },
+        };
+        let place_hold = ClientRequest {
+            operation_id: OperationId(2),
+            client_id: ClientId(1),
+            command: Command::PlaceHold {
+                pool_id: PoolId(11),
+                hold_id: HoldId(21),
+                quantity: 5,
+                deadline_slot: Slot(5),
+            },
+        };
+        wal_file
+            .append_frame(&Frame {
+                lsn: Lsn(1),
+                request_slot: Slot(1),
+                record_type: RecordType::ClientCommand,
+                payload: encode_client_request(create_pool),
+            })
+            .unwrap();
+        wal_file
+            .append_frame(&Frame {
+                lsn: Lsn(2),
+                request_slot: Slot(2),
+                record_type: RecordType::ClientCommand,
+                payload: encode_client_request(place_hold),
+            })
+            .unwrap();
+        wal_file.sync().unwrap();
+
+        let torn_expire = Frame {
+            lsn: Lsn(3),
+            request_slot: Slot(6),
+            record_type: RecordType::InternalCommand,
+            payload: vec![3, 21],
+        }
+        .encode();
+        let mut raw = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        raw.write_all(&torn_expire[..torn_expire.len() - 2])
+            .unwrap();
+        raw.sync_all().unwrap();
+
+        let mut recovered = recover_reservation(config(), &snapshot_file, &mut wal_file).unwrap();
+        assert_eq!(
+            recovered
+                .db
+                .snapshot()
+                .holds
+                .iter()
+                .find(|record| record.hold_id == HoldId(21))
+                .unwrap()
+                .state,
+            HoldState::Held
+        );
+
+        let outcome = recovered.db.apply_client(
+            CommandContext {
+                lsn: Lsn(3),
+                request_slot: Slot(6),
+            },
+            ClientRequest {
+                operation_id: OperationId(3),
+                client_id: ClientId(1),
+                command: Command::CreatePool {
+                    pool_id: PoolId(12),
+                    total_capacity: 1,
+                },
+            },
+        );
+
+        assert_eq!(outcome.result_code, crate::result::ResultCode::Ok);
+        assert_eq!(
+            recovered
+                .db
+                .snapshot()
+                .holds
+                .iter()
+                .find(|record| record.hold_id == HoldId(21))
+                .unwrap()
+                .state,
+            HoldState::Expired
+        );
 
         let _ = fs::remove_file(snapshot_path);
         let _ = fs::remove_file(wal_path);
