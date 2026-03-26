@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 allocdb-retire-queue = { path = "../allocdb-retire-queue" }
+allocdb-wal-file = { path = "../allocdb-wal-file" }
 allocdb-wal-frame = { path = "../allocdb-wal-frame" }
 log = "0.4.28"
 

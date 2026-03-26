@@ -417,10 +417,11 @@ impl SingleNodeEngine {
     ) -> Result<Self, RecoverEngineError> {
         engine_config.validate().map_err(EngineOpenError::from)?;
         let snapshot_file = SnapshotFile::new(snapshot_path);
-        let wal = WalFile::open(wal_path.as_ref(), engine_config.max_command_bytes)
+        let mut wal = WalFile::open(wal_path.as_ref(), engine_config.max_command_bytes)
             .map_err(EngineOpenError::from)?;
         let mut pending_crash = crash_plan;
-        let recovered = recover_allocdb_with_observer(core_config, &snapshot_file, &wal, |point| {
+        let recovered =
+            recover_allocdb_with_observer(core_config, &snapshot_file, &mut wal, |point| {
             if pending_crash.is_some_and(|plan| plan.matches_recovery_boundary(point)) {
                 let plan = pending_crash
                     .take()
@@ -433,11 +434,11 @@ impl SingleNodeEngine {
             }
 
             Ok(())
-        })
-        .map_err(|error| match error {
-            RecoveryObserverError::Recovery(error) => RecoverEngineError::Recovery(error),
-            RecoveryObserverError::Observer(plan) => RecoverEngineError::CrashInjected(plan),
-        })?;
+            })
+            .map_err(|error| match error {
+                RecoveryObserverError::Recovery(error) => RecoverEngineError::Recovery(error),
+                RecoveryObserverError::Observer(plan) => RecoverEngineError::CrashInjected(plan),
+            })?;
         Self::from_parts(
             recovered.db,
             engine_config,

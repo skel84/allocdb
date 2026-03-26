@@ -149,7 +149,7 @@ impl<E> From<ReplayError> for RecoveryObserverError<E> {
 pub fn recover_allocdb(
     config: Config,
     snapshot_file: &SnapshotFile,
-    wal_file: &WalFile,
+    wal_file: &mut WalFile,
 ) -> Result<RecoveryResult, RecoveryError> {
     recover_allocdb_with_observer(
         config,
@@ -173,7 +173,7 @@ pub fn recover_allocdb(
 pub fn recover_allocdb_with_observer<E, F>(
     config: Config,
     snapshot_file: &SnapshotFile,
-    wal_file: &WalFile,
+    wal_file: &mut WalFile,
     mut observer: F,
 ) -> Result<RecoveryResult, RecoveryObserverError<E>>
 where
@@ -203,7 +203,7 @@ where
 fn recover_allocdb_impl<E, F>(
     config: Config,
     snapshot_file: &SnapshotFile,
-    wal_file: &WalFile,
+    wal_file: &mut WalFile,
     observer: &mut F,
 ) -> Result<RecoveryResult, RecoveryObserverError<E>>
 where
