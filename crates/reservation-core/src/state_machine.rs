@@ -311,7 +311,10 @@ impl ReservationDb {
                 );
             }
             let popped = self.operation_retire_queue.pop_front();
-            assert!(popped.is_some(), "peeked operation retirement entry must pop");
+            assert!(
+                popped.is_some(),
+                "peeked operation retirement entry must pop"
+            );
         }
     }
 
@@ -410,11 +413,19 @@ mod tests {
 
         let snapshot = db.snapshot();
         assert_eq!(
-            snapshot.pools.iter().map(|record| record.pool_id.get()).collect::<Vec<_>>(),
+            snapshot
+                .pools
+                .iter()
+                .map(|record| record.pool_id.get())
+                .collect::<Vec<_>>(),
             vec![3, 9]
         );
         assert_eq!(
-            snapshot.holds.iter().map(|record| record.hold_id.get()).collect::<Vec<_>>(),
+            snapshot
+                .holds
+                .iter()
+                .map(|record| record.hold_id.get())
+                .collect::<Vec<_>>(),
             vec![4, 7]
         );
     }
