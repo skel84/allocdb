@@ -1,26 +1,26 @@
-use crate::ids::Slot;
+#![allow(clippy::missing_panics_doc)]
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RetireEntry<K> {
+pub struct RetireEntry<K, S> {
     pub key: K,
-    pub retire_after_slot: Slot,
+    pub retire_after_slot: S,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RetireQueueError {
+pub enum RetireQueueError {
     Full,
 }
 
 #[derive(Debug)]
-pub(crate) struct RetireQueue<K> {
-    entries: Vec<Option<RetireEntry<K>>>,
+pub struct RetireQueue<K, S> {
+    entries: Vec<Option<RetireEntry<K, S>>>,
     head: usize,
     len: usize,
 }
 
-impl<K: Copy> RetireQueue<K> {
+impl<K: Copy, S: Copy> RetireQueue<K, S> {
     #[must_use]
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         let mut entries = Vec::with_capacity(capacity.max(1));
         entries.resize_with(capacity.max(1), || None);
         Self {
@@ -30,7 +30,10 @@ impl<K: Copy> RetireQueue<K> {
         }
     }
 
-    pub(crate) fn push(&mut self, entry: RetireEntry<K>) -> Result<(), RetireQueueError> {
+    /// # Errors
+    ///
+    /// Returns [`RetireQueueError::Full`] when the queue has no free slot for another entry.
+    pub fn push(&mut self, entry: RetireEntry<K, S>) -> Result<(), RetireQueueError> {
         if self.len == self.entries.len() {
             return Err(RetireQueueError::Full);
         }
@@ -41,7 +44,8 @@ impl<K: Copy> RetireQueue<K> {
         Ok(())
     }
 
-    pub(crate) fn front(&self) -> Option<RetireEntry<K>> {
+    #[must_use]
+    pub fn front(&self) -> Option<RetireEntry<K, S>> {
         if self.len == 0 {
             None
         } else {
@@ -49,7 +53,7 @@ impl<K: Copy> RetireQueue<K> {
         }
     }
 
-    pub(crate) fn pop_front(&mut self) -> Option<RetireEntry<K>> {
+    pub fn pop_front(&mut self) -> Option<RetireEntry<K, S>> {
         if self.len == 0 {
             return None;
         }
@@ -63,8 +67,6 @@ impl<K: Copy> RetireQueue<K> {
 
 #[cfg(test)]
 mod tests {
-    use crate::ids::Slot;
-
     use super::{RetireEntry, RetireQueue, RetireQueueError};
 
     #[test]
@@ -73,7 +75,7 @@ mod tests {
         queue
             .push(RetireEntry {
                 key: 1_u64,
-                retire_after_slot: Slot(7),
+                retire_after_slot: 7_u64,
             })
             .unwrap();
 
@@ -81,14 +83,14 @@ mod tests {
             queue.front(),
             Some(RetireEntry {
                 key: 1,
-                retire_after_slot: Slot(7)
+                retire_after_slot: 7,
             })
         );
         assert_eq!(
             queue.pop_front(),
             Some(RetireEntry {
                 key: 1,
-                retire_after_slot: Slot(7)
+                retire_after_slot: 7,
             })
         );
         assert_eq!(queue.pop_front(), None);
@@ -100,19 +102,19 @@ mod tests {
         queue
             .push(RetireEntry {
                 key: 1_u64,
-                retire_after_slot: Slot(1),
+                retire_after_slot: 1_u64,
             })
             .unwrap();
         queue
             .push(RetireEntry {
                 key: 2_u64,
-                retire_after_slot: Slot(2),
+                retire_after_slot: 2_u64,
             })
             .unwrap();
         assert_eq!(
             queue.push(RetireEntry {
                 key: 3_u64,
-                retire_after_slot: Slot(3),
+                retire_after_slot: 3_u64,
             }),
             Err(RetireQueueError::Full)
         );
@@ -121,7 +123,7 @@ mod tests {
         queue
             .push(RetireEntry {
                 key: 3_u64,
-                retire_after_slot: Slot(3),
+                retire_after_slot: 3_u64,
             })
             .unwrap();
 
