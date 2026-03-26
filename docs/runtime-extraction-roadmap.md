@@ -90,9 +90,10 @@ Goal:
 
 Acceptable proof shapes:
 
-- build a fourth engine against the extracted substrate, or
-- retrofit one substantial new engine slice against the extracted substrate with clearly reduced
-  copy-paste and no correctness regression
+- preferred: retrofit one substantial new engine slice against the extracted substrate with clearly
+  reduced copy-paste and no correctness regression, or
+- build a fourth engine against the extracted substrate if the smaller proof cannot answer the
+  question cleanly
 
 Exit criteria:
 
@@ -146,7 +147,8 @@ Result:
 - `retire_queue`, `wal`, and `wal_file` were extracted successfully
 - `snapshot_file` was evaluated and deferred because the seam is still only clean inside the
   `quota-core` / `reservation-core` pair, not across all three engines
-- the next correct move is now `M13`
+- `M13` is the next correct move, followed by a reassessment of whether `M14` still needs a full
+  fourth-engine proof or can prefer a smaller reduced-copy slice
 
 Do not do this next:
 

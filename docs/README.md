@@ -19,6 +19,7 @@
 - [Architecture](./architecture.md)
 - [Engine Authoring Boundary](./engine-authoring-boundary.md)
 - [Fault Model](./fault-model.md)
+- [Fourth-Engine Proof Reassessment](./fourth-engine-proof-reassessment.md)
 - [Jepsen Refactor Plan](./jepsen-refactor-plan.md)
 - [Lease Kernel Design Decisions](./lease-kernel-design.md)
 - [Lease Kernel Follow-On](./lease-kernel-follow-on.md)
