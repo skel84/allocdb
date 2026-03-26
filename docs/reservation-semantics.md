@@ -86,7 +86,7 @@ Success requirements:
 
 - hold exists
 - hold state is `held`
-- hold is not overdue at the command slot
+- `request_slot < deadline_slot`
 
 Effect on success:
 
@@ -122,6 +122,16 @@ Effect on success:
 
 - `held_capacity -= quantity`
 - hold state becomes `expired`
+
+## Minimal Read Surface
+
+V1 does not define a broad API surface, but it does assume the minimum reads needed by tests,
+ recovery, and later runtime wrappers:
+
+- `GetPool(pool_id)` returns the current pool state
+- `GetHold(hold_id)` returns the current hold state
+
+These reads are informational. They do not widen the v1 mutation scope.
 
 ## Result Surface
 
@@ -189,7 +199,7 @@ V1 does not include:
 - transfer between pools
 - product inventory synchronization
 - customer workflow
-- read APIs beyond what tests and recovery need
+- read APIs beyond `GetPool` and `GetHold`
 
 ## Extraction Intent
 
