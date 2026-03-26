@@ -4,6 +4,7 @@ members = [
     "crates/allocdb-core",
     "crates/allocdb-node",
     "crates/quota-core",
+    "crates/reservation-core",
 ]
 resolver = "2"
 
