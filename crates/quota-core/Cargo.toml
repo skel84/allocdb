@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+allocdb-retire-queue = { path = "../allocdb-retire-queue" }
 crc32c = "0.6.8"
 log = "0.4.28"
 

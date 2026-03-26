@@ -3,7 +3,7 @@ use crate::config::{Config, ConfigError};
 use crate::fixed_map::{FixedMap, FixedMapError};
 use crate::ids::{HolderId, Lsn, OperationId, ReservationId, ResourceId, Slot};
 use crate::result::{CommandOutcome, ResultCode};
-use crate::retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
+use allocdb_retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
 
 #[path = "state_machine_apply.rs"]
 mod apply;
@@ -140,8 +140,8 @@ pub struct AllocDb {
     pub(crate) reservation_members: FixedMap<ReservationMemberKey, ReservationMemberRecord>,
     pub(crate) operations: FixedMap<OperationId, OperationRecord>,
     pub(crate) max_retired_reservation_id: Option<ReservationId>,
-    pub(crate) reservation_retire_queue: RetireQueue<ReservationId>,
-    pub(crate) operation_retire_queue: RetireQueue<OperationId>,
+    pub(crate) reservation_retire_queue: RetireQueue<ReservationId, Slot>,
+    pub(crate) operation_retire_queue: RetireQueue<OperationId, Slot>,
     pub(crate) wheel: Vec<Vec<ReservationId>>,
     pub(crate) last_applied_lsn: Option<Lsn>,
     pub(crate) last_request_slot: Option<Slot>,

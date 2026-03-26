@@ -5,7 +5,7 @@ use crate::config::{Config, ConfigError};
 use crate::fixed_map::{FixedMap, FixedMapError};
 use crate::ids::{BucketId, Lsn, OperationId, Slot};
 use crate::result::{CommandOutcome, ResultCode};
-use crate::retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
+use allocdb_retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BucketRecord {
@@ -52,7 +52,7 @@ pub struct QuotaDb {
     pub(crate) config: Config,
     pub(crate) buckets: FixedMap<BucketId, BucketRecord>,
     pub(crate) operations: FixedMap<OperationId, OperationRecord>,
-    pub(crate) operation_retire_queue: RetireQueue<OperationId>,
+    pub(crate) operation_retire_queue: RetireQueue<OperationId, Slot>,
     pub(crate) last_applied_lsn: Option<Lsn>,
     pub(crate) last_request_slot: Option<Slot>,
 }

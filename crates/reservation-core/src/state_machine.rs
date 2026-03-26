@@ -5,7 +5,7 @@ use crate::config::{Config, ConfigError};
 use crate::fixed_map::{FixedMap, FixedMapError};
 use crate::ids::{ClientId, ClientOperationKey, HoldId, Lsn, OperationId, PoolId, Slot};
 use crate::result::{CommandOutcome, ResultCode};
-use crate::retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
+use allocdb_retire_queue::{RetireEntry, RetireQueue, RetireQueueError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PoolRecord {
@@ -82,8 +82,8 @@ pub struct ReservationDb {
     pub(crate) pools: FixedMap<PoolId, PoolRecord>,
     pub(crate) holds: FixedMap<HoldId, HoldRecord>,
     pub(crate) operations: FixedMap<ClientOperationKey, OperationRecord>,
-    pub(crate) hold_retire_queue: RetireQueue<HoldId>,
-    pub(crate) operation_retire_queue: RetireQueue<ClientOperationKey>,
+    pub(crate) hold_retire_queue: RetireQueue<HoldId, Slot>,
+    pub(crate) operation_retire_queue: RetireQueue<ClientOperationKey, Slot>,
     pub(crate) last_applied_lsn: Option<Lsn>,
     pub(crate) last_request_slot: Option<Slot>,
 }
