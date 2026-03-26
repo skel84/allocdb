@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/allocdb-retire-queue",
+    "crates/allocdb-wal-frame",
     "crates/allocdb-bench",
     "crates/allocdb-core",
     "crates/allocdb-node",
