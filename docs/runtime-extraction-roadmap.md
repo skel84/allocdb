@@ -42,7 +42,8 @@ Scope:
 - `retire_queue`
 - `wal`
 - `wal_file`
-- `snapshot_file` only if the file-level discipline stays separable from snapshot schemas
+- evaluate `snapshot_file`, but extract it only if the file-level discipline stays separable from
+  snapshot schemas across the full engine family
 
 Non-goals:
 
@@ -139,6 +140,13 @@ Do this next:
 2. `M12-T02` shared `wal`
 3. `M12-T03` shared `wal_file`
 4. only then decide whether `snapshot_file` is still clean enough to extract
+
+Result:
+
+- `retire_queue`, `wal`, and `wal_file` were extracted successfully
+- `snapshot_file` was evaluated and deferred because the seam is still only clean inside the
+  `quota-core` / `reservation-core` pair, not across all three engines
+- the next correct move is now `M13`
 
 Do not do this next:
 
