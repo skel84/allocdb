@@ -293,6 +293,9 @@ Exit criteria:
 
 Only after both engines stabilize should extraction be considered.
 
+The first completed readout for this phase lives in
+[`quota-runtime-seam-evaluation.md`](./quota-runtime-seam-evaluation.md).
+
 ### Extraction rule
 
 Extract shared runtime code only when all of the following are true:

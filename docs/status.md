@@ -1,7 +1,6 @@
 # AllocDB Status
 ## Current State
-- Phase: replicated implementation with external Jepsen gate closed and M9 lease-kernel follow-on
-  implemented and live-validated
+- Phase: replicated implementation with external Jepsen gate closed, M9 lease-kernel follow-on live-validated, and M10 second-engine proof merged
 - Planning IDs: tasks use `M#-T#`; spikes use `M#-S#`
 - Current milestone status:
   - `M0` semantics freeze: complete enough for core work
@@ -15,6 +14,7 @@
   - `M7` replicated core prototype: in progress
   - `M8` external cluster validation: in progress
   - `M9` generic lease-kernel follow-on: implementation merged on `main`
+  - `M10` second-engine proof: merged on `main`; shared runtime extraction deferred
 - Latest completed implementation chunks:
   - `4156a80` `Bootstrap AllocDB core and docs`
   - `f84a641` `Add WAL file and snapshot recovery primitives`
@@ -215,6 +215,6 @@
   reserve, revoke/reclaim, and stale-holder lease paths, then closing the loop with live KubeVirt
   `lease_safety-control` and full `1800s` `lease_safety-crash-restart` evidence on `allocdb-a`,
   both with `blockers=0`
-- the next recommended step is downstream real-cluster e2e work such as `gpu_control_plane`, not more unplanned lease-kernel semantics work
-- the current deployment slice covers a first in-cluster `StatefulSet` shape, but bootstrap-primary routing, failover/rejoin orchestration, and background maintenance remain operator work, and the current staging unblock path is to publish `skel84/allocdb` from GitHub Actions rather than relying on the local Docker engine
-- `M10` is now in implementation and review on PR `#107`: `quota-core` has a bounded in-repo second-engine proof with deterministic `CreateBucket` / `Debit`, refill, snapshot/WAL recovery, and the next remaining readout is whether any shared-runtime seam is actually justified after the second engine exists
+- the next recommended step remains downstream real-cluster e2e work such as `gpu_control_plane`, not more unplanned lease-kernel semantics work; the current deployment slice covers a first in-cluster `StatefulSet` shape, but bootstrap-primary routing, failover/rejoin orchestration, and background maintenance remain operator work, and the current staging unblock path is to publish `skel84/allocdb` from GitHub Actions rather than relying on the local Docker engine
+- PR `#107` merged the `M10` quota-engine proof on `main`: `quota-core` now proves a second deterministic engine in-repo with bounded `CreateBucket` / `Debit`, logical-slot refill, and snapshot/WAL recovery
+- the `M10-T05` seam evaluation concludes that a shared runtime crate is still premature: `retire_queue` is the closest mechanical extraction candidate, but `fixed_map`, `wal`, `wal_file`, recovery, snapshot schema, and all state-machine layers should remain engine-local until repeated maintenance pressure justifies extraction
