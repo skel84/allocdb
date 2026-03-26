@@ -26,6 +26,7 @@
 - [Quota Runtime Seam Evaluation](./quota-runtime-seam-evaluation.md)
 - [Reservation Engine Plan](./reservation-engine-plan.md)
 - [Reservation Engine Semantics](./reservation-semantics.md)
+- [Reservation Runtime Seam Evaluation](./reservation-runtime-seam-evaluation.md)
 - [Revoke Safety Slice](./revoke-safety-slice.md)
 - [Operator Runbook](./operator-runbook.md)
 - [KubeVirt Jepsen Report](./kubevirt-jepsen-report.md)
