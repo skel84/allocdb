@@ -476,7 +476,7 @@ impl ReservationDb {
 
         hold.deadline_slot = deadline_slot;
         self.replace_hold(hold);
-        self.push_hold_expiry(hold_id, deadline_slot);
+        self.rebuild_live_hold_retire_queue();
         CommandOutcome::with_pool_and_hold(ResultCode::Ok, hold.pool_id, hold.hold_id)
     }
 
@@ -543,6 +543,31 @@ impl ReservationDb {
                 Ok(()) => {}
                 Err(RetireQueueError::Full) => {
                     panic!("hold retirement rebuild must respect configured capacity")
+                }
+            }
+        }
+    }
+
+    fn rebuild_live_hold_retire_queue(&mut self) {
+        let max_holds = usize::try_from(self.config.max_holds).expect("validated max_holds");
+        let mut entries: Vec<_> = self
+            .holds
+            .iter()
+            .filter(|record| record.state == HoldState::Held)
+            .map(|record| (record.hold_id, record.deadline_slot))
+            .collect();
+        entries
+            .sort_unstable_by_key(|(hold_id, deadline_slot)| (deadline_slot.get(), hold_id.get()));
+
+        self.hold_retire_queue = RetireQueue::with_capacity(max_holds);
+        for (hold_id, deadline_slot) in entries {
+            match self.hold_retire_queue.push(RetireEntry {
+                key: hold_id,
+                retire_after_slot: deadline_slot,
+            }) {
+                Ok(()) => {}
+                Err(RetireQueueError::Full) => {
+                    panic!("live hold retirement rebuild must respect configured capacity")
                 }
             }
         }
@@ -1342,6 +1367,57 @@ mod tests {
                 .deadline_slot,
             Slot(10)
         );
+    }
+
+    #[test]
+    fn extend_hold_reschedules_without_overfilling_single_hold_queue() {
+        let mut config = config();
+        config.max_holds = 1;
+        let mut db = ReservationDb::new(config).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 10,
+                },
+            ),
+        );
+        db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 3,
+                    deadline_slot: Slot(5),
+                },
+            ),
+        );
+
+        let outcome = db.apply_client(
+            context(3, 3),
+            request(
+                3,
+                Command::ExtendHold {
+                    hold_id: HoldId(21),
+                    deadline_slot: Slot(10),
+                },
+            ),
+        );
+
+        assert_eq!(outcome.result_code, ResultCode::Ok);
+        assert_eq!(
+            db.hold_retire_queue.front(),
+            Some(allocdb_retire_queue::RetireEntry {
+                key: HoldId(21),
+                retire_after_slot: Slot(10),
+            })
+        );
+        assert_eq!(db.hold_retire_queue.pop_front().unwrap().key, HoldId(21));
+        assert_eq!(db.hold_retire_queue.pop_front(), None);
     }
 
     #[test]
