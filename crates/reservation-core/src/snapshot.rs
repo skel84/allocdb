@@ -547,7 +547,7 @@ mod tests {
                 hold_id: HoldId(21),
                 pool_id: PoolId(11),
                 quantity: 2,
-                deadline_slot: Slot(5),
+                deadline_slot: Slot(7),
                 state: HoldState::Held,
             }],
             operations: vec![OperationRecord {

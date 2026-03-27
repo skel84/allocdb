@@ -196,13 +196,30 @@ mod tests {
 
     #[test]
     fn internal_command_round_trips() {
-        let command = Command::ExtendHold {
-            hold_id: HoldId(7),
-            deadline_slot: Slot(9),
-        };
+        let commands = [
+            Command::CreatePool {
+                pool_id: PoolId(5),
+                total_capacity: 9,
+            },
+            Command::PlaceHold {
+                pool_id: PoolId(5),
+                hold_id: HoldId(6),
+                quantity: 2,
+                deadline_slot: Slot(7),
+            },
+            Command::ConfirmHold { hold_id: HoldId(6) },
+            Command::ReleaseHold { hold_id: HoldId(6) },
+            Command::ExtendHold {
+                hold_id: HoldId(6),
+                deadline_slot: Slot(8),
+            },
+            Command::ExpireHold { hold_id: HoldId(6) },
+        ];
 
-        let decoded = decode_internal_command(&encode_internal_command(command)).unwrap();
-        assert_eq!(decoded, command);
+        for command in commands {
+            let decoded = decode_internal_command(&encode_internal_command(command)).unwrap();
+            assert_eq!(decoded, command);
+        }
     }
 
     #[test]
