@@ -248,6 +248,10 @@ impl ReservationDb {
                 self.apply_confirm_hold(context.request_slot, hold_id)
             }
             Command::ReleaseHold { hold_id } => self.apply_release_hold(hold_id),
+            Command::ExtendHold {
+                hold_id,
+                deadline_slot,
+            } => self.apply_extend_hold(context.request_slot, hold_id, deadline_slot),
             Command::ExpireHold { hold_id } => {
                 self.apply_expire_hold(context.request_slot, hold_id)
             }
@@ -421,6 +425,61 @@ impl ReservationDb {
         CommandOutcome::with_pool_and_hold(ResultCode::Ok, hold.pool_id, hold.hold_id)
     }
 
+    fn apply_extend_hold(
+        &mut self,
+        request_slot: Slot,
+        hold_id: HoldId,
+        deadline_slot: Slot,
+    ) -> CommandOutcome {
+        let Some(mut hold) = self.holds.get(hold_id).copied() else {
+            warn!(
+                "extend_hold rejected hold_not_found hold_id={}",
+                hold_id.get()
+            );
+            return CommandOutcome::with_hold(ResultCode::HoldNotFound, hold_id);
+        };
+
+        match hold.state {
+            HoldState::Confirmed | HoldState::Released => {
+                return CommandOutcome::with_hold(ResultCode::InvalidState, hold_id);
+            }
+            HoldState::Expired => {
+                return CommandOutcome::with_hold(ResultCode::HoldExpired, hold_id);
+            }
+            HoldState::Held => {}
+        }
+
+        if request_slot.get() >= hold.deadline_slot.get() {
+            let pool = self
+                .pools
+                .get_mut(hold.pool_id)
+                .expect("hold pool must remain present during expiration");
+            pool.held_capacity -= hold.quantity;
+            hold.state = HoldState::Expired;
+            self.replace_hold(hold);
+            return CommandOutcome::with_pool_and_hold(
+                ResultCode::HoldExpired,
+                hold.pool_id,
+                hold.hold_id,
+            );
+        }
+
+        if deadline_slot.get() <= request_slot.get()
+            || deadline_slot.get() <= hold.deadline_slot.get()
+        {
+            return CommandOutcome::with_pool_and_hold(
+                ResultCode::InvalidState,
+                hold.pool_id,
+                hold.hold_id,
+            );
+        }
+
+        hold.deadline_slot = deadline_slot;
+        self.replace_hold(hold);
+        self.rebuild_live_hold_retire_queue();
+        CommandOutcome::with_pool_and_hold(ResultCode::Ok, hold.pool_id, hold.hold_id)
+    }
+
     fn apply_expire_hold(&mut self, request_slot: Slot, hold_id: HoldId) -> CommandOutcome {
         let Some(mut hold) = self.holds.get(hold_id).copied() else {
             warn!(
@@ -484,6 +543,31 @@ impl ReservationDb {
                 Ok(()) => {}
                 Err(RetireQueueError::Full) => {
                     panic!("hold retirement rebuild must respect configured capacity")
+                }
+            }
+        }
+    }
+
+    fn rebuild_live_hold_retire_queue(&mut self) {
+        let max_holds = usize::try_from(self.config.max_holds).expect("validated max_holds");
+        let mut entries: Vec<_> = self
+            .holds
+            .iter()
+            .filter(|record| record.state == HoldState::Held)
+            .map(|record| (record.hold_id, record.deadline_slot))
+            .collect();
+        entries
+            .sort_unstable_by_key(|(hold_id, deadline_slot)| (deadline_slot.get(), hold_id.get()));
+
+        self.hold_retire_queue = RetireQueue::with_capacity(max_holds);
+        for (hold_id, deadline_slot) in entries {
+            match self.hold_retire_queue.push(RetireEntry {
+                key: hold_id,
+                retire_after_slot: deadline_slot,
+            }) {
+                Ok(()) => {}
+                Err(RetireQueueError::Full) => {
+                    panic!("live hold retirement rebuild must respect configured capacity")
                 }
             }
         }
@@ -667,6 +751,10 @@ impl ReservationDb {
             };
 
             if hold.state != HoldState::Held {
+                continue;
+            }
+
+            if request_slot.get() <= hold.deadline_slot.get() {
                 continue;
             }
 
@@ -1114,6 +1202,222 @@ mod tests {
         assert_eq!(db.snapshot().pools[0].held_capacity, 0);
         assert_eq!(db.snapshot().pools[0].consumed_capacity, 0);
         assert_eq!(db.snapshot().holds[0].state, HoldState::Released);
+    }
+
+    #[test]
+    fn extend_hold_moves_deadline_forward_without_changing_capacity() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 10,
+                },
+            ),
+        );
+        db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 3,
+                    deadline_slot: Slot(5),
+                },
+            ),
+        );
+
+        let outcome = db.apply_client(
+            context(3, 3),
+            request(
+                3,
+                Command::ExtendHold {
+                    hold_id: HoldId(21),
+                    deadline_slot: Slot(9),
+                },
+            ),
+        );
+
+        assert_eq!(outcome.result_code, ResultCode::Ok);
+        assert_eq!(db.snapshot().pools[0].held_capacity, 3);
+        assert_eq!(db.snapshot().pools[0].consumed_capacity, 0);
+        assert_eq!(db.snapshot().holds[0].deadline_slot, Slot(9));
+        assert_eq!(db.snapshot().holds[0].state, HoldState::Held);
+    }
+
+    #[test]
+    fn extend_hold_rejects_elapsed_or_non_increasing_deadline() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 10,
+                },
+            ),
+        );
+        db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 3,
+                    deadline_slot: Slot(8),
+                },
+            ),
+        );
+
+        let stale = db.apply_client(
+            context(3, 3),
+            request(
+                3,
+                Command::ExtendHold {
+                    hold_id: HoldId(21),
+                    deadline_slot: Slot(3),
+                },
+            ),
+        );
+        let non_increasing = db.apply_client(
+            context(4, 4),
+            request(
+                4,
+                Command::ExtendHold {
+                    hold_id: HoldId(21),
+                    deadline_slot: Slot(8),
+                },
+            ),
+        );
+
+        assert_eq!(stale.result_code, ResultCode::InvalidState);
+        assert_eq!(non_increasing.result_code, ResultCode::InvalidState);
+        assert_eq!(db.snapshot().holds[0].deadline_slot, Slot(8));
+        assert_eq!(db.snapshot().holds[0].state, HoldState::Held);
+    }
+
+    #[test]
+    fn extended_hold_does_not_auto_expire_at_old_deadline() {
+        let mut db = ReservationDb::new(config()).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 10,
+                },
+            ),
+        );
+        db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 3,
+                    deadline_slot: Slot(5),
+                },
+            ),
+        );
+        db.apply_client(
+            context(3, 3),
+            request(
+                3,
+                Command::ExtendHold {
+                    hold_id: HoldId(21),
+                    deadline_slot: Slot(10),
+                },
+            ),
+        );
+
+        let outcome = db.apply_client(
+            context(4, 8),
+            request(
+                4,
+                Command::CreatePool {
+                    pool_id: PoolId(12),
+                    total_capacity: 1,
+                },
+            ),
+        );
+
+        assert_eq!(outcome.result_code, ResultCode::Ok);
+        assert_eq!(
+            db.snapshot()
+                .holds
+                .iter()
+                .find(|record| record.hold_id == HoldId(21))
+                .unwrap()
+                .state,
+            HoldState::Held
+        );
+        assert_eq!(
+            db.snapshot()
+                .holds
+                .iter()
+                .find(|record| record.hold_id == HoldId(21))
+                .unwrap()
+                .deadline_slot,
+            Slot(10)
+        );
+    }
+
+    #[test]
+    fn extend_hold_reschedules_without_overfilling_single_hold_queue() {
+        let mut config = config();
+        config.max_holds = 1;
+        let mut db = ReservationDb::new(config).unwrap();
+        db.apply_client(
+            context(1, 1),
+            request(
+                1,
+                Command::CreatePool {
+                    pool_id: PoolId(11),
+                    total_capacity: 10,
+                },
+            ),
+        );
+        db.apply_client(
+            context(2, 2),
+            request(
+                2,
+                Command::PlaceHold {
+                    pool_id: PoolId(11),
+                    hold_id: HoldId(21),
+                    quantity: 3,
+                    deadline_slot: Slot(5),
+                },
+            ),
+        );
+
+        let outcome = db.apply_client(
+            context(3, 3),
+            request(
+                3,
+                Command::ExtendHold {
+                    hold_id: HoldId(21),
+                    deadline_slot: Slot(10),
+                },
+            ),
+        );
+
+        assert_eq!(outcome.result_code, ResultCode::Ok);
+        assert_eq!(
+            db.hold_retire_queue.front(),
+            Some(allocdb_retire_queue::RetireEntry {
+                key: HoldId(21),
+                retire_after_slot: Slot(10),
+            })
+        );
+        assert_eq!(db.hold_retire_queue.pop_front().unwrap().key, HoldId(21));
+        assert_eq!(db.hold_retire_queue.pop_front(), None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::Command;
 use crate::command::{
-    TAG_CONFIRM_HOLD, TAG_CREATE_POOL, TAG_EXPIRE_HOLD, TAG_PLACE_HOLD, TAG_RELEASE_HOLD,
+    TAG_CONFIRM_HOLD, TAG_CREATE_POOL, TAG_EXPIRE_HOLD, TAG_EXTEND_HOLD, TAG_PLACE_HOLD,
+    TAG_RELEASE_HOLD,
 };
 use crate::config::{Config, ConfigError};
 use crate::fixed_map::FixedMapError;
@@ -365,6 +366,14 @@ fn encode_command(bytes: &mut Vec<u8>, command: Command) {
             bytes.push(TAG_RELEASE_HOLD);
             bytes.extend_from_slice(&hold_id.get().to_le_bytes());
         }
+        Command::ExtendHold {
+            hold_id,
+            deadline_slot,
+        } => {
+            bytes.push(TAG_EXTEND_HOLD);
+            bytes.extend_from_slice(&hold_id.get().to_le_bytes());
+            bytes.extend_from_slice(&deadline_slot.get().to_le_bytes());
+        }
         Command::ExpireHold { hold_id } => {
             bytes.push(TAG_EXPIRE_HOLD);
             bytes.extend_from_slice(&hold_id.get().to_le_bytes());
@@ -389,6 +398,10 @@ fn decode_command(bytes: &[u8], cursor: &mut usize) -> Result<Command, SnapshotE
         }),
         TAG_RELEASE_HOLD => Ok(Command::ReleaseHold {
             hold_id: HoldId(decode_u128(bytes, cursor)?),
+        }),
+        TAG_EXTEND_HOLD => Ok(Command::ExtendHold {
+            hold_id: HoldId(decode_u128(bytes, cursor)?),
+            deadline_slot: Slot(decode_u64(bytes, cursor)?),
         }),
         TAG_EXPIRE_HOLD => Ok(Command::ExpireHold {
             hold_id: HoldId(decode_u128(bytes, cursor)?),
@@ -534,17 +547,15 @@ mod tests {
                 hold_id: HoldId(21),
                 pool_id: PoolId(11),
                 quantity: 2,
-                deadline_slot: Slot(5),
+                deadline_slot: Slot(7),
                 state: HoldState::Held,
             }],
             operations: vec![OperationRecord {
                 client_id: ClientId(1),
                 operation_id: OperationId(1),
-                command: Command::PlaceHold {
-                    pool_id: PoolId(11),
+                command: Command::ExtendHold {
                     hold_id: HoldId(21),
-                    quantity: 2,
-                    deadline_slot: Slot(5),
+                    deadline_slot: Slot(7),
                 },
                 result_code: ResultCode::Ok,
                 result_pool_id: Some(PoolId(11)),

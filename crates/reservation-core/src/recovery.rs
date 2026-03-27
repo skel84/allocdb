@@ -303,6 +303,41 @@ mod tests {
         }
     }
 
+    fn create_pool_request() -> ClientRequest {
+        ClientRequest {
+            operation_id: OperationId(1),
+            client_id: ClientId(1),
+            command: Command::CreatePool {
+                pool_id: PoolId(11),
+                total_capacity: 5,
+            },
+        }
+    }
+
+    fn place_hold_request(deadline_slot: Slot) -> ClientRequest {
+        ClientRequest {
+            operation_id: OperationId(2),
+            client_id: ClientId(1),
+            command: Command::PlaceHold {
+                pool_id: PoolId(11),
+                hold_id: HoldId(21),
+                quantity: 5,
+                deadline_slot,
+            },
+        }
+    }
+
+    fn extend_hold_request(deadline_slot: Slot) -> ClientRequest {
+        ClientRequest {
+            operation_id: OperationId(3),
+            client_id: ClientId(1),
+            command: Command::ExtendHold {
+                hold_id: HoldId(21),
+                deadline_slot,
+            },
+        }
+    }
+
     #[test]
     fn recovery_replays_from_empty_snapshot() {
         let snapshot_path = temp_path("snapshot-empty", "snapshot");
@@ -477,6 +512,107 @@ mod tests {
                 .unwrap()
                 .state,
             HoldState::Expired
+        );
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn recovery_preserves_extended_deadline_before_later_request() {
+        let snapshot_path = temp_path("snapshot-extend-live-match", "snapshot");
+        let wal_path = temp_path("wal-extend-live-match", "wal");
+        let snapshot_file = SnapshotFile::new(&snapshot_path, 4096);
+        let mut wal_file = WalFile::open(&wal_path, 1024).unwrap();
+
+        let prefix = [
+            Frame {
+                lsn: Lsn(1),
+                request_slot: Slot(1),
+                record_type: RecordType::ClientCommand,
+                payload: encode_client_request(create_pool_request()),
+            },
+            Frame {
+                lsn: Lsn(2),
+                request_slot: Slot(2),
+                record_type: RecordType::ClientCommand,
+                payload: encode_client_request(place_hold_request(Slot(5))),
+            },
+            Frame {
+                lsn: Lsn(3),
+                request_slot: Slot(3),
+                record_type: RecordType::ClientCommand,
+                payload: encode_client_request(extend_hold_request(Slot(10))),
+            },
+        ];
+        for frame in prefix {
+            wal_file.append_frame(&frame).unwrap();
+        }
+        wal_file.sync().unwrap();
+
+        let mut live = ReservationDb::new(config()).unwrap();
+        let _ = live.apply_client(
+            CommandContext {
+                lsn: Lsn(1),
+                request_slot: Slot(1),
+            },
+            create_pool_request(),
+        );
+        let _ = live.apply_client(
+            CommandContext {
+                lsn: Lsn(2),
+                request_slot: Slot(2),
+            },
+            place_hold_request(Slot(5)),
+        );
+        let _ = live.apply_client(
+            CommandContext {
+                lsn: Lsn(3),
+                request_slot: Slot(3),
+            },
+            extend_hold_request(Slot(10)),
+        );
+
+        let mut recovered = recover_reservation(config(), &snapshot_file, &mut wal_file).unwrap();
+        let request = ClientRequest {
+            operation_id: OperationId(4),
+            client_id: ClientId(1),
+            command: Command::CreatePool {
+                pool_id: PoolId(12),
+                total_capacity: 1,
+            },
+        };
+        let context = CommandContext {
+            lsn: Lsn(4),
+            request_slot: Slot(8),
+        };
+
+        let live_outcome = live.apply_client(context, request);
+        let recovered_outcome = recovered.db.apply_client(context, request);
+
+        assert_eq!(recovered_outcome, live_outcome);
+        assert_eq!(recovered.db.snapshot(), live.snapshot());
+        assert_eq!(
+            recovered
+                .db
+                .snapshot()
+                .holds
+                .iter()
+                .find(|record| record.hold_id == HoldId(21))
+                .unwrap()
+                .state,
+            HoldState::Held
+        );
+        assert_eq!(
+            recovered
+                .db
+                .snapshot()
+                .holds
+                .iter()
+                .find(|record| record.hold_id == HoldId(21))
+                .unwrap()
+                .deadline_slot,
+            Slot(10)
         );
 
         let _ = fs::remove_file(snapshot_path);

@@ -1,6 +1,6 @@
 use crate::command::{
-    ClientRequest, Command, TAG_CONFIRM_HOLD, TAG_CREATE_POOL, TAG_EXPIRE_HOLD, TAG_PLACE_HOLD,
-    TAG_RELEASE_HOLD,
+    ClientRequest, Command, TAG_CONFIRM_HOLD, TAG_CREATE_POOL, TAG_EXPIRE_HOLD, TAG_EXTEND_HOLD,
+    TAG_PLACE_HOLD, TAG_RELEASE_HOLD,
 };
 use crate::ids::{ClientId, HoldId, OperationId, PoolId, Slot};
 
@@ -79,6 +79,14 @@ fn encode_command(bytes: &mut Vec<u8>, command: &Command) {
             bytes.push(TAG_RELEASE_HOLD);
             bytes.extend_from_slice(&hold_id.get().to_le_bytes());
         }
+        Command::ExtendHold {
+            hold_id,
+            deadline_slot,
+        } => {
+            bytes.push(TAG_EXTEND_HOLD);
+            bytes.extend_from_slice(&hold_id.get().to_le_bytes());
+            bytes.extend_from_slice(&deadline_slot.get().to_le_bytes());
+        }
         Command::ExpireHold { hold_id } => {
             bytes.push(TAG_EXPIRE_HOLD);
             bytes.extend_from_slice(&hold_id.get().to_le_bytes());
@@ -103,6 +111,10 @@ fn decode_command(cursor: &mut Cursor<'_>) -> Result<Command, CommandCodecError>
         }),
         TAG_RELEASE_HOLD => Ok(Command::ReleaseHold {
             hold_id: HoldId(cursor.read_u128()?),
+        }),
+        TAG_EXTEND_HOLD => Ok(Command::ExtendHold {
+            hold_id: HoldId(cursor.read_u128()?),
+            deadline_slot: Slot(cursor.read_u64()?),
         }),
         TAG_EXPIRE_HOLD => Ok(Command::ExpireHold {
             hold_id: HoldId(cursor.read_u128()?),
@@ -184,13 +196,30 @@ mod tests {
 
     #[test]
     fn internal_command_round_trips() {
-        let command = Command::CreatePool {
-            pool_id: PoolId(7),
-            total_capacity: 9,
-        };
+        let commands = [
+            Command::CreatePool {
+                pool_id: PoolId(5),
+                total_capacity: 9,
+            },
+            Command::PlaceHold {
+                pool_id: PoolId(5),
+                hold_id: HoldId(6),
+                quantity: 2,
+                deadline_slot: Slot(7),
+            },
+            Command::ConfirmHold { hold_id: HoldId(6) },
+            Command::ReleaseHold { hold_id: HoldId(6) },
+            Command::ExtendHold {
+                hold_id: HoldId(6),
+                deadline_slot: Slot(8),
+            },
+            Command::ExpireHold { hold_id: HoldId(6) },
+        ];
 
-        let decoded = decode_internal_command(&encode_internal_command(command)).unwrap();
-        assert_eq!(decoded, command);
+        for command in commands {
+            let decoded = decode_internal_command(&encode_internal_command(command)).unwrap();
+            assert_eq!(decoded, command);
+        }
     }
 
     #[test]
